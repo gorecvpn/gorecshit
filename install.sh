@@ -429,7 +429,7 @@ install_packages() {
   fi
   export DEBIAN_FRONTEND=noninteractive
   local w=0
-  while fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock >/dev/null 2>&1 || pgrep -x unattended-upgr >/dev/null 2>&1; do
+  while fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock >/dev/null 2>&1; do
     [ $w -eq 0 ] && warn "Waiting for apt/dpkg lock (unattended-upgrades)..."
     w=$((w+5)); [ $w -ge 900 ] && { err "apt lock held >15 min"; return 1; }; sleep 5
   done
