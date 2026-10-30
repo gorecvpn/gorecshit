@@ -1,30 +1,40 @@
 #!/usr/bin/env bash
-# gorecshit — one-command hardening for Remnawave VPN node servers (Debian 11+/Ubuntu 20.04+)
+# gorecshit v2 — one-command hardening for Remnawave VPN node servers (Debian 11+/Ubuntu 20.04+)
 # Usage:
-#   bash <(curl -Ls https://raw.githubusercontent.com/gorecvpn/gorecshit/main/install.sh) --panel-ip X.X.X.X
-# Idempotent. No secrets. Panel IP is a required runtime parameter (never hardcoded).
+#   bash install.sh --panel-ip X.X.X.X [--node-port 2222] [--yes]
+#   bash install.sh --check --panel-ip X.X.X.X
+# Idempotent. No secrets. Panel IP / NODE_PORT via flags or GORECSHIT_* env.
+# Does NOT restart Docker while remnanode/xray is live. Does NOT deploy itself.
 set -Eeuo pipefail
 
-VERSION="1.0.0"
+VERSION="2.0.0"
 SCRIPT_NAME="gorecshit"
 BACKUP_ROOT="/root/hardening-backups"
 TS="$(date +%Y%m%d-%H%M%S)"
 BACKUP_DIR="${BACKUP_ROOT}/${TS}"
 MARKER_DIR="/var/lib/gorecshit"
 
-# Defaults
+# Defaults (override via flags or GORECSHIT_* env)
 PANEL_IP=""
 NODE_PORT="auto"
 CLIENT_PORTS="auto"
 MODE="direct"          # direct | cdn
 ALLOW_SSH_FROM=""
+# HAProxy relays — never block (scanner ipset / fail2ban / UFW ACCEPT before DROP)
+RELAY_IPS="188.225.24.250,188.225.27.46"
 IPV6_OFF=1
 DO_BLOCKLIST=1
 DO_HOSTNAME=1
+DO_DOCKER_USER=1
+DO_NOFILE=1
+DO_RESOLV_V4=1
+DO_CERTBOT_HOOKS=1
 TZ_OPT=""              # empty = leave; "auto" = geo; or IANA name
 ASSUME_YES=0
 DRY_RUN=0
+CHECK_ONLY=0
 DO_ROLLBACK=0
+LOG_FILE="/var/log/gorecshit.log"
 
 # Runtime detected
 OS_ID=""
@@ -34,7 +44,9 @@ DETECTED_CLIENT_PORTS=()
 SSH_CLIENT_IP=""
 CADDY_PRESENT=0
 CHANGED_DOCKER=0
+SKIPPED_DOCKER_RESTART=0
 QDISC="fq"
+NGINX_PRESENT=0
 
 # Colors
 if [[ -t 1 ]] || [[ "${FORCE_COLOR:-0}" == "1" ]]; then
@@ -44,11 +56,21 @@ else
   C_RESET=''; C_RED=''; C_GRN=''; C_YEL=''; C_BLU=''; C_CYN=''; C_BOLD=''
 fi
 
-log()  { printf '%b[%s]%b %s\n' "${C_BLU}" "INFO" "${C_RESET}" "$*"; }
-ok()   { printf '%b[%s]%b %s\n' "${C_GRN}" " OK " "${C_RESET}" "$*"; }
-warn() { printf '%b[%s]%b %s\n' "${C_YEL}" "WARN" "${C_RESET}" "$*"; }
-err()  { printf '%b[%s]%b %s\n' "${C_RED}" "ERR " "${C_RESET}" "$*" >&2; }
-step() { printf '\n%b==>%b %b%s%b\n' "${C_CYN}" "${C_RESET}" "${C_BOLD}" "$*" "${C_RESET}"; }
+_log_ts() { date '+%Y-%m-%d %H:%M:%S %z'; }
+_log_line() {
+  local level="$1"; shift
+  local msg="$*"
+  local plain="[$(_log_ts)] [$level] $msg"
+  if [[ -n "${LOG_FILE:-}" && "$DRY_RUN" -eq 0 && "$(id -u 2>/dev/null || echo 1)" -eq 0 ]]; then
+    mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+    printf '%s\n' "$plain" >>"$LOG_FILE" 2>/dev/null || true
+  fi
+}
+log()  { _log_line INFO "$*"; printf '%b[%s]%b %s\n' "${C_BLU}" "INFO" "${C_RESET}" "$*"; }
+ok()   { _log_line OK "$*";   printf '%b[%s]%b %s\n' "${C_GRN}" " OK " "${C_RESET}" "$*"; }
+warn() { _log_line WARN "$*"; printf '%b[%s]%b %s\n' "${C_YEL}" "WARN" "${C_RESET}" "$*"; }
+err()  { _log_line ERR "$*";  printf '%b[%s]%b %s\n' "${C_RED}" "ERR " "${C_RESET}" "$*" >&2; }
+step() { _log_line STEP "$*"; printf '\n%b==>%b %b%s%b\n' "${C_CYN}" "${C_RESET}" "${C_BOLD}" "$*" "${C_RESET}"; }
 
 on_error() {
   local ec=$?
@@ -80,9 +102,16 @@ Options:
   --no-hostname              Do not change hostname
   --tz ZONE|auto             Set timezone (default: leave as-is). auto = IP geolocation
   --yes                      Non-interactive (still requires --panel-ip or GORECSHIT_PANEL_IP)
-  --dry-run                  Print actions only; make no changes
+  --relay-ips IP,...         Extra never-block / ACCEPT IPs (default: HAProxy relays 188.225.24.250,188.225.27.46)
+  --no-docker-user           Skip DOCKER-USER NODE_PORT restriction (bridge publish)
+  --no-nofile                Skip nofile 1048576 limits
+  --no-resolv-v4             Keep IPv6 nameservers in resolv.conf even when IPv6 off
+  --no-certbot-hooks         Skip certbot renew reload hooks for caddy/nginx
+  --dry-run, --check         Print actions / verify plan only; make no changes
   --rollback / --uninstall   Restore latest backup under /root/hardening-backups/
   -h, --help                 Show this help
+
+Env overrides: GORECSHIT_PANEL_IP, GORECSHIT_NODE_PORT, GORECSHIT_RELAY_IPS, GORECSHIT_LOG_FILE
 
 One-liner:
   bash <(curl -Ls https://raw.githubusercontent.com/gorecvpn/gorecshit/main/install.sh) --panel-ip X.X.X.X --yes
@@ -164,8 +193,13 @@ parse_args() {
       --no-blocklist) DO_BLOCKLIST=0; shift ;;
       --no-hostname) DO_HOSTNAME=0; shift ;;
       --tz) TZ_OPT="${2:-}"; shift 2 ;;
+      --relay-ips) RELAY_IPS="${2:-}"; shift 2 ;;
+      --no-docker-user) DO_DOCKER_USER=0; shift ;;
+      --no-nofile) DO_NOFILE=0; shift ;;
+      --no-resolv-v4) DO_RESOLV_V4=0; shift ;;
+      --no-certbot-hooks) DO_CERTBOT_HOOKS=0; shift ;;
       --yes|-y) ASSUME_YES=1; shift ;;
-      --dry-run) DRY_RUN=1; shift ;;
+      --dry-run|--check) DRY_RUN=1; CHECK_ONLY=1; shift ;;
       --rollback|--uninstall) DO_ROLLBACK=1; shift ;;
       -h|--help) usage; exit 0 ;;
       *) err "Unknown option: $1"; usage; exit 2 ;;
@@ -173,6 +207,15 @@ parse_args() {
   done
   if [[ -z "$PANEL_IP" && -n "${GORECSHIT_PANEL_IP:-}" ]]; then
     PANEL_IP="$GORECSHIT_PANEL_IP"
+  fi
+  if [[ "$NODE_PORT" == "auto" && -n "${GORECSHIT_NODE_PORT:-}" ]]; then
+    NODE_PORT="$GORECSHIT_NODE_PORT"
+  fi
+  if [[ -n "${GORECSHIT_RELAY_IPS:-}" ]]; then
+    RELAY_IPS="$GORECSHIT_RELAY_IPS"
+  fi
+  if [[ -n "${GORECSHIT_LOG_FILE:-}" ]]; then
+    LOG_FILE="$GORECSHIT_LOG_FILE"
   fi
 }
 
@@ -279,13 +322,31 @@ detect_remnanode() {
   fi
 
   CADDY_PRESENT=0
+  NGINX_PRESENT=0
   if command -v caddy >/dev/null 2>&1 || [[ -d /etc/caddy ]]; then
     CADDY_PRESENT=1
   elif command -v docker >/dev/null 2>&1 && docker ps --format '{{.Names}}' 2>/dev/null | grep -qi caddy; then
     CADDY_PRESENT=1
   fi
-  if [[ "$CADDY_PRESENT" -eq 1 ]]; then
-    ok "Caddy detected"
+  if command -v nginx >/dev/null 2>&1 || [[ -d /etc/nginx ]]; then
+    NGINX_PRESENT=1
+  elif command -v docker >/dev/null 2>&1 && docker ps --format '{{.Names}}' 2>/dev/null | grep -qiE 'nginx|remnawave-nginx'; then
+    NGINX_PRESENT=1
+  fi
+  [[ "$CADDY_PRESENT" -eq 1 ]] && ok "Caddy detected"
+  [[ "$NGINX_PRESENT" -eq 1 ]] && ok "nginx detected"
+
+  if [[ -z "$DETECTED_NODE_PORT" ]]; then
+    local alt np2
+    for alt in /opt/remnanode-*/.env; do
+      [[ -f "$alt" ]] || continue
+      np2="$(grep -E '^(NODE_PORT|APP_PORT)=' "$alt" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '\"\r' || true)"
+      if [[ "$np2" =~ ^[0-9]+$ ]]; then
+        DETECTED_NODE_PORT="$np2"
+        ok "Found $alt port=${DETECTED_NODE_PORT}"
+        break
+      fi
+    done
   fi
 
   # Detect client TCP ports: prefer xray/rw-core/remnanode listeners; else common VPN ports.
@@ -406,6 +467,7 @@ EOF
     echo "node_port=${NODE_PORT}"
     echo "client_ports=${CLIENT_PORTS}"
     echo "mode=${MODE}"
+    echo "relay_ips=${RELAY_IPS}"
     echo "version=${VERSION}"
   } >"${BACKUP_DIR}/MANIFEST.txt"
 }
@@ -571,20 +633,31 @@ configure_ssh() {
   fi
 }
 
+foreach_csv_ip() {
+  # foreach_csv_ip <csv> — prints one trimmed IPv4/CIDR per line
+  local csv="$1" a
+  local IFS=,
+  for a in $csv; do
+    a="$(echo "$a" | tr -d ' ')"
+    [[ -n "$a" ]] && printf '%s\n' "$a"
+  done
+}
+
 whitelist_ips_csv() {
-  # Build comma/space list of IPs for ignoreip / never-block
+  # Build space-separated list for fail2ban ignoreip / never-block
   local out=("127.0.0.1/8" "::1")
   if [[ -n "$PANEL_IP" ]]; then out+=("$PANEL_IP"); fi
   if [[ -n "$SSH_CLIENT_IP" ]]; then out+=("$SSH_CLIENT_IP"); fi
-  if [[ -n "$ALLOW_SSH_FROM" ]]; then
-    local IFS=,
-    local a
-    for a in $ALLOW_SSH_FROM; do
-      a="$(echo "$a" | tr -d ' ')"
-      if [[ -n "$a" ]]; then out+=("$a"); fi
-    done
-  fi
+  local a
+  while IFS= read -r a; do out+=("$a"); done < <(foreach_csv_ip "$ALLOW_SSH_FROM")
+  while IFS= read -r a; do out+=("$a"); done < <(foreach_csv_ip "$RELAY_IPS")
   printf '%s\n' "${out[@]}" | awk 'NF' | sort -u | tr '\n' ' ' | sed 's/ *$//'
+}
+
+remnanode_running() {
+  command -v docker >/dev/null 2>&1 || return 1
+  docker ps --format '{{.Names}}' 2>/dev/null | grep -qiE 'remnanode|rw-core|xray' && return 0
+  return 1
 }
 
 configure_fail2ban() {
@@ -633,6 +706,7 @@ configure_ufw() {
     printf '%b[DRY]%b ufw limit 22/tcp\n' "${C_YEL}" "${C_RESET}"
     printf '%b[DRY]%b ufw allow %s/tcp (client)\n' "${C_YEL}" "${C_RESET}" "$CLIENT_PORTS"
     printf '%b[DRY]%b ufw allow from %s to any port %s proto tcp (node)\n' "${C_YEL}" "${C_RESET}" "$PANEL_IP" "$NODE_PORT"
+    printf '%b[DRY]%b ufw deny 4443/tcp (internal xray)\n' "${C_YEL}" "${C_RESET}"
     if [[ "$MODE" == "cdn" ]]; then
       printf '%b[DRY]%b cdn mode: allow 80,443; deny external access to internal xray ports\n' "${C_YEL}" "${C_RESET}"
     fi
@@ -675,22 +749,32 @@ configure_ufw() {
   done
   IFS=$' \t\n'
 
-  # NODE_PORT only from panel
+  # NODE_PORT only from panel (DOCKER-USER also enforces for bridge-published ports)
   ufw allow from "$PANEL_IP" to any port "$NODE_PORT" proto tcp comment 'remnanode from panel'
 
   # In cdn mode, also ensure 80/443 open (already in CLIENT_PORTS if auto)
   if [[ "$MODE" == "cdn" ]]; then
     ufw allow 80/tcp comment 'cdn-http' || true
     ufw allow 443/tcp comment 'cdn-https' || true
-    # Do not open internal xray ports detected on high ports like 4443
     for p in "${DETECTED_CLIENT_PORTS[@]:-}"; do
       if [[ "$p" == "80" || "$p" == "443" ]]; then continue; fi
       log "cdn mode: not opening internal port ${p}"
     done
   fi
 
+  # Explicit deny of internal xray origin (common CDN setup proxies 127.0.0.1:4443)
+  ufw deny 4443/tcp comment 'deny-public-xray-4443' || true
+  if [[ "$MODE" == "cdn" ]]; then
+    local p
+    for p in "${DETECTED_CLIENT_PORTS[@]:-}"; do
+      if [[ "$p" == "80" || "$p" == "443" || "$p" == "$NODE_PORT" || "$p" == "22" || "$p" == "4443" ]]; then continue; fi
+      [[ "$p" =~ ^[0-9]+$ ]] || continue
+      ufw deny "${p}/tcp" comment "deny-internal-xray-${p}" || true
+    done
+  fi
+
   ufw --force enable
-  ok "UFW enabled (SSH limited; NODE_PORT=${NODE_PORT}←panel; clients=${CLIENT_PORTS})"
+  ok "UFW enabled (SSH limited; NODE_PORT=${NODE_PORT}←panel; clients=${CLIENT_PORTS}; deny 4443)"
 }
 
 hook_ufw_before_rules() {
@@ -698,7 +782,7 @@ hook_ufw_before_rules() {
   [[ -f "$rules" ]] || return 0
   backup_file "$rules"
   if [[ "$DRY_RUN" -eq 1 ]]; then
-    printf '%b[DRY]%b inject scanner-block + panel ACCEPT into %s\n' "${C_YEL}" "${C_RESET}" "$rules"
+    printf '%b[DRY]%b inject scanner-block + panel/relay ACCEPT into %s\n' "${C_YEL}" "${C_RESET}" "$rules"
     return 0
   fi
 
@@ -706,32 +790,25 @@ hook_ufw_before_rules() {
   if grep -q 'BEGIN gorecshit scanner-block' "$rules"; then
     sed -i '/# BEGIN gorecshit scanner-block/,/# END gorecshit scanner-block/d' "$rules"
   fi
-  # Also remove older unmarked scanner-block lines from previous manual installs (safe-ish)
-  # Do not touch unrelated rules.
 
-  local insert=""
+  local insert="" a
   insert+="# BEGIN gorecshit scanner-block"$'\n'
-  insert+="# Accept management / anti-lockout hosts before blocklist DROP"$'\n'
+  insert+="# Accept management / anti-lockout / HAProxy relays before blocklist DROP"$'\n'
   insert+="-A ufw-before-input -s ${PANEL_IP} -j ACCEPT"$'\n'
   if [[ -n "$SSH_CLIENT_IP" ]]; then
     insert+="-A ufw-before-input -s ${SSH_CLIENT_IP} -j ACCEPT"$'\n'
   fi
-  if [[ -n "$ALLOW_SSH_FROM" ]]; then
-    local IFS=,
-    local a
-    for a in $ALLOW_SSH_FROM; do
-      a="$(echo "$a" | tr -d ' ')"
-      if [[ -n "$a" ]]; then insert+="-A ufw-before-input -s ${a} -j ACCEPT"$'
-'; fi
-    done
-    IFS=$' \t\n'
-  fi
+  while IFS= read -r a; do
+    insert+="-A ufw-before-input -s ${a} -j ACCEPT"$'\n'
+  done < <(foreach_csv_ip "$ALLOW_SSH_FROM")
+  while IFS= read -r a; do
+    insert+="-A ufw-before-input -s ${a} -j ACCEPT"$'\n'
+  done < <(foreach_csv_ip "$RELAY_IPS")
   if [[ "$DO_BLOCKLIST" -eq 1 ]]; then
     insert+="-A ufw-before-input -m set --match-set scanner-block src -j DROP"$'\n'
   fi
   insert+="# END gorecshit scanner-block"$'\n'
 
-  # Insert after RELATED,ESTABLISHED accept on input if present, else after End required lines
   if grep -q 'ufw-before-input -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT' "$rules"; then
     local tmp
     tmp="$(mktemp)"
@@ -744,7 +821,6 @@ hook_ufw_before_rules() {
     ' "$rules" >"$tmp"
     mv "$tmp" "$rules"
   else
-    # after "# End required lines"
     local tmp
     tmp="$(mktemp)"
     awk -v block="$insert" '
@@ -756,9 +832,8 @@ hook_ufw_before_rules() {
     ' "$rules" >"$tmp"
     mv "$tmp" "$rules"
   fi
-  ok "UFW before.rules hooked"
+  ok "UFW before.rules hooked (panel + relays ACCEPT before scanner DROP)"
 }
-
 install_blocklist() {
   if [[ "$DO_BLOCKLIST" -eq 0 ]]; then
     warn "Skipping scanner blocklist (--no-blocklist)"
@@ -780,19 +855,14 @@ install_blocklist() {
   backup_file /etc/systemd/system/scanner-block-refresh.timer
   backup_file /etc/scanner-block/never-block.txt
 
-  # never-block: panel, ssh client, allow list, private, optional CDN ranges (Yandex-like public CDN)
+  # never-block: panel, ssh client, allow list, HAProxy relays, private, CDN ranges
   {
     echo "# Managed by ${SCRIPT_NAME} — never include these in scanner-block"
     echo "$PANEL_IP"
     if [[ -n "$SSH_CLIENT_IP" ]]; then echo "$SSH_CLIENT_IP"; fi
-    if [[ -n "$ALLOW_SSH_FROM" ]]; then
-      local IFS=,
-      local a
-      for a in $ALLOW_SSH_FROM; do
-        a="$(echo "$a" | tr -d ' ')"
-        if [[ -n "$a" ]]; then echo "$a"; fi
-      done
-    fi
+    local a
+    while IFS= read -r a; do echo "$a"; done < <(foreach_csv_ip "$ALLOW_SSH_FROM")
+    while IFS= read -r a; do echo "$a"; done < <(foreach_csv_ip "$RELAY_IPS")
     # Private / link-local
     echo "10.0.0.0/8"
     echo "172.16.0.0/12"
@@ -1103,8 +1173,11 @@ PY
     printf '%s\n' "$newjson" >/etc/docker/daemon.json
     if [[ "$old" != "$(cat /etc/docker/daemon.json)" ]]; then
       CHANGED_DOCKER=1
-      if systemctl is-active --quiet docker 2>/dev/null; then
-        warn "Docker daemon.json changed — restarting docker (clients may briefly reconnect)"
+      if remnanode_running; then
+        SKIPPED_DOCKER_RESTART=1
+        warn "Docker daemon.json changed but remnanode/xray is live — NOT restarting docker (would kill xray :4443). Changes apply on next docker restart."
+      elif systemctl is-active --quiet docker 2>/dev/null; then
+        warn "Docker daemon.json changed and no remnanode running — restarting docker"
         systemctl restart docker || warn "docker restart failed"
       fi
     else
@@ -1119,6 +1192,208 @@ PY
     chmod 600 /opt/remnanode/docker-compose.yml 2>/dev/null || true
     chmod 600 /opt/remnanode/compose.yml 2>/dev/null || true
     ok "Locked down /opt/remnanode env/compose permissions (600)"
+  fi
+}
+
+
+configure_nofile() {
+  if [[ "$DO_NOFILE" -eq 0 ]]; then
+    log "nofile limits skipped (--no-nofile)"
+    return 0
+  fi
+  step "nofile 1048576 (limits + systemd)"
+  backup_file /etc/security/limits.d/99-gorecshit-nofile.conf
+  backup_file /etc/systemd/system.conf.d/99-gorecshit-nofile.conf
+
+  local limits="# Managed by ${SCRIPT_NAME} ${VERSION}
+* soft nofile 1048576
+* hard nofile 1048576
+root soft nofile 1048576
+root hard nofile 1048576
+"
+  local sysd="# Managed by ${SCRIPT_NAME} ${VERSION}
+[Manager]
+DefaultLimitNOFILE=1048576:1048576
+"
+  write_content /etc/security/limits.d/99-gorecshit-nofile.conf "$limits"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    printf '%b[DRY]%b write systemd DefaultLimitNOFILE=1048576\n' "${C_YEL}" "${C_RESET}"
+  else
+    mkdir -p /etc/systemd/system.conf.d
+    write_content /etc/systemd/system.conf.d/99-gorecshit-nofile.conf "$sysd"
+    # Avoid daemon-reexec (can disrupt live remnanode). New logins/services pick up limits;
+    # for docker/xray containers, recreate or reboot in a maintenance window if needed.
+    systemctl daemon-reload 2>/dev/null || true
+    ok "nofile soft/hard 1048576 written (applies to new sessions/services)"
+  fi
+}
+
+configure_resolv_v4() {
+  if [[ "$IPV6_OFF" -eq 0 || "$DO_RESOLV_V4" -eq 0 ]]; then
+    log "resolv.conf IPv4-only skipped"
+    return 0
+  fi
+  step "resolv.conf IPv4-only (IPv6 disabled)"
+  backup_file /etc/resolv.conf
+  backup_file /etc/systemd/resolved.conf
+  backup_file /etc/systemd/resolved.conf.d/99-gorecshit-dns.conf
+
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    printf '%b[DRY]%b force IPv4 DNS (1.1.1.1/1.0.0.1), drop AAAA nameservers\n' "${C_YEL}" "${C_RESET}"
+    return 0
+  fi
+
+  # Prefer systemd-resolved drop-in when active; also write static resolv if not a stub symlink we should replace carefully
+  mkdir -p /etc/systemd/resolved.conf.d
+  write_content /etc/systemd/resolved.conf.d/99-gorecshit-dns.conf \
+"# Managed by ${SCRIPT_NAME} ${VERSION}
+[Resolve]
+DNS=1.1.1.1 1.0.0.1
+FallbackDNS=8.8.8.8 8.8.4.4
+DNSOverTLS=no
+# Prefer IPv4 resolution
+DNSStubListener=yes
+"
+
+  if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+    # Ensure resolv.conf points at stub or is filtered
+    systemctl restart systemd-resolved 2>/dev/null || true
+    # Filter any static resolv.conf that lists IPv6 nameservers
+    if [[ -f /etc/resolv.conf ]] && ! [[ -L /etc/resolv.conf ]]; then
+        # Keep only IPv4 nameserver lines + options/search
+      {
+        grep -E '^\s*(search|domain|options)\b' /etc/resolv.conf 2>/dev/null || true
+        grep -E '^\s*nameserver\s+[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' /etc/resolv.conf 2>/dev/null || true
+        # ensure at least Cloudflare v4
+        if ! grep -qE '^\s*nameserver\s+1\.1\.1\.1' /etc/resolv.conf 2>/dev/null; then
+          echo 'nameserver 1.1.1.1'
+          echo 'nameserver 1.0.0.1'
+        fi
+      } > /etc/resolv.conf.tmp
+      # Deduplicate preserving order
+      awk 'NF && !seen[$0]++' /etc/resolv.conf.tmp > /etc/resolv.conf
+      rm -f /etc/resolv.conf.tmp
+    fi
+    ok "systemd-resolved DNS set to IPv4-only upstreams"
+  else
+    # Static resolv.conf
+    write_content /etc/resolv.conf \
+"nameserver 1.1.1.1
+nameserver 1.0.0.1
+nameserver 8.8.8.8
+options timeout:2 attempts:2
+"
+    ok "Wrote IPv4-only /etc/resolv.conf"
+  fi
+}
+
+configure_docker_user() {
+  if [[ "$DO_DOCKER_USER" -eq 0 ]]; then
+    log "DOCKER-USER NODE_PORT rule skipped (--no-docker-user)"
+    return 0
+  fi
+  if ! command -v docker >/dev/null 2>&1 && [[ ! -d /etc/docker ]]; then
+    log "Docker not present — skip DOCKER-USER rule"
+    return 0
+  fi
+  step "DOCKER-USER: NODE_PORT ${NODE_PORT} only from panel (ctdir REPLY RETURN first)"
+
+  local script="/usr/local/sbin/docker-user-${NODE_PORT}.sh"
+  local unit="/etc/systemd/system/docker-user-${NODE_PORT}.service"
+  backup_file "$script"
+  backup_file "$unit"
+
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    printf '%b[DRY]%b install %s + %s\n' "${C_YEL}" "${C_RESET}" "$script" "$unit"
+    printf '%b[DRY]%b iptables -I DOCKER-USER 1 -m conntrack --ctdir REPLY -j RETURN\n' "${C_YEL}" "${C_RESET}"
+    printf '%b[DRY]%b iptables -A DOCKER-USER ! -s %s/32 -p tcp -m conntrack --ctorigdstport %s -j DROP\n' \
+      "${C_YEL}" "${C_RESET}" "$PANEL_IP" "$NODE_PORT"
+    return 0
+  fi
+
+  # Idempotent apply script (bridge-network published ports bypass UFW INPUT)
+  cat >"$script" <<EOF
+#!/bin/sh
+# Managed by ${SCRIPT_NAME} ${VERSION} — DOCKER-USER guard for NODE_PORT=${NODE_PORT}
+# ctdir REPLY first: allow established reply traffic for bridge-network containers
+PANEL_IP="${PANEL_IP}"
+NODE_PORT="${NODE_PORT}"
+iptables -C DOCKER-USER -m conntrack --ctdir REPLY -j RETURN 2>/dev/null \\
+  || iptables -I DOCKER-USER 1 -m conntrack --ctdir REPLY -j RETURN
+iptables -C DOCKER-USER ! -s "\${PANEL_IP}/32" -p tcp -m conntrack --ctorigdstport "\$NODE_PORT" -j DROP 2>/dev/null \\
+  || iptables -A DOCKER-USER ! -s "\${PANEL_IP}/32" -p tcp -m conntrack --ctorigdstport "\$NODE_PORT" -j DROP
+EOF
+  chmod 755 "$script"
+
+  cat >"$unit" <<EOF
+[Unit]
+Description=Restrict docker-published NODE_PORT ${NODE_PORT} to panel ${PANEL_IP}
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=${script}
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable "docker-user-${NODE_PORT}.service" >/dev/null 2>&1 || true
+  # Apply now without restarting docker
+  if systemctl is-active --quiet docker 2>/dev/null || iptables -L DOCKER-USER -n >/dev/null 2>&1; then
+    "$script" || warn "DOCKER-USER apply returned non-zero (chain may appear after first container publish)"
+  else
+    log "DOCKER-USER chain not ready yet; unit will apply after docker starts"
+  fi
+  ok "DOCKER-USER rule persisted (panel=${PANEL_IP} port=${NODE_PORT}; no docker restart)"
+}
+
+configure_certbot_hooks() {
+  if [[ "$DO_CERTBOT_HOOKS" -eq 0 ]]; then
+    log "certbot hooks skipped"
+    return 0
+  fi
+  # Only if certbot exists AND caddy/nginx present (host or container)
+  if ! command -v certbot >/dev/null 2>&1 && [[ ! -d /etc/letsencrypt ]]; then
+    log "certbot/letsencrypt not present — skip renew hooks"
+    return 0
+  fi
+  if [[ "$CADDY_PRESENT" -eq 0 && "$NGINX_PRESENT" -eq 0 ]]; then
+    log "No caddy/nginx detected — skip certbot renew hooks"
+    return 0
+  fi
+  step "certbot renew hooks (reload caddy/nginx)"
+  local hook="/etc/letsencrypt/renewal-hooks/deploy/99-gorecshit-reload.sh"
+  backup_file "$hook"
+
+  local body
+  body="#!/bin/bash
+# Managed by ${SCRIPT_NAME} ${VERSION} — reload reverse proxies after cert renew
+set -euo pipefail
+if systemctl is-active --quiet caddy 2>/dev/null; then
+  systemctl reload caddy || systemctl restart caddy || true
+fi
+if systemctl is-active --quiet nginx 2>/dev/null; then
+  nginx -t 2>/dev/null && systemctl reload nginx || true
+fi
+# Dockerized proxies common on Remnawave nodes
+if command -v docker >/dev/null 2>&1; then
+  for c in \$(docker ps --format '{{.Names}}' 2>/dev/null | grep -iE 'caddy|nginx' || true); do
+    docker exec \"\$c\" caddy reload --config /etc/caddy/Caddyfile 2>/dev/null \\
+      || docker exec \"\$c\" nginx -s reload 2>/dev/null \\
+      || docker restart \"\$c\" 2>/dev/null \\
+      || true
+  done
+fi
+"
+  write_content "$hook" "$body"
+  if [[ "$DRY_RUN" -eq 0 ]]; then
+    mkdir -p "$(dirname "$hook")"
+    chmod 755 "$hook"
+    ok "Installed $hook"
   fi
 }
 
@@ -1140,14 +1415,22 @@ final_verify() {
   if command -v ipset >/dev/null; then
     ipset list scanner-block 2>/dev/null | head -5 || echo "ipset scanner-block not loaded"
     echo "blocklist lines: $(wc -l </etc/scanner-block/blocklist.txt 2>/dev/null || echo 0)"
+    echo "never-block (head):"; head -15 /etc/scanner-block/never-block.txt 2>/dev/null || true
   fi
+  echo "---- DOCKER-USER ----"
+  iptables -L DOCKER-USER -n --line-numbers 2>/dev/null | head -15 || echo "(no DOCKER-USER chain)"
+  echo "---- nofile ----"
+  ulimit -n 2>/dev/null || true
+  grep -H . /etc/security/limits.d/99-gorecshit-nofile.conf 2>/dev/null || true
   echo "---- remnanode container ----"
   if command -v docker >/dev/null; then
     docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' 2>/dev/null | head -20 || true
   fi
   echo "---- hostname / tz ----"
   hostname; timedatectl 2>/dev/null | head -6 || true
-  if [[ "$CHANGED_DOCKER" -eq 1 ]]; then
+  if [[ "$SKIPPED_DOCKER_RESTART" -eq 1 ]]; then
+    warn "daemon.json updated without docker restart (remnanode live). Restart docker yourself in a maintenance window if needed."
+  elif [[ "$CHANGED_DOCKER" -eq 1 ]]; then
     warn "Docker was restarted due to daemon.json change — VPN clients may have briefly reconnected"
   fi
   ok "Hardening complete. Backups: ${BACKUP_DIR}"
@@ -1175,7 +1458,7 @@ main() {
 
   if [[ "$ASSUME_YES" -eq 0 && "$DRY_RUN" -eq 0 && -t 0 ]]; then
     echo
-    log "Will harden this node: panel=${PANEL_IP} node_port=${NODE_PORT} clients=${CLIENT_PORTS} mode=${MODE}"
+    log "Will harden this node: panel=${PANEL_IP} node_port=${NODE_PORT} clients=${CLIENT_PORTS} mode=${MODE} relays=${RELAY_IPS}"
     printf 'Proceed? [y/N] '
     local ans
     read -r ans || true
@@ -1184,12 +1467,16 @@ main() {
 
   install_packages
   configure_sysctl
+  configure_nofile
+  configure_resolv_v4
   configure_ssh
   configure_fail2ban
   install_blocklist
   configure_ufw
+  configure_docker_user
   configure_hostname_tz
   configure_docker_journal
+  configure_certbot_hooks
   final_verify
 }
 
