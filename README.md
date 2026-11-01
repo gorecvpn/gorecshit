@@ -2,7 +2,7 @@
 
 Однокомандное hardening-окружение для **нод Remnawave** (Debian 11+ / Ubuntu 20.04+).
 
-**Версия: 2.2.1**
+**Версия: 2.2.2**
 
 Скрипт идемпотентен: его можно запускать повторно. IP панели **не зашит** в репозиторий — его нужно передать параметром `--panel-ip` (или выбрать в интерактивном меню).
 
@@ -36,10 +36,11 @@
   4) 📊 Показать статус
   5) 🔍 Проверка DPI/блокировок
   6) ↩️  Откат
+  7) ⬆️  Обновить gorecshit (GitHub)
 ────────────────────────────────────────
   0) 🚪 Выход
-CLI: gorecshit.sh --yes|--modules|--status|--dpi-check …
-Выберите пункт [0-6]:
+CLI: gorecshit [--status|--update|--yes|--modules …]
+Выберите пункт [0-7]:
 ```
 
 ## Проверка DPI/блокировок
@@ -61,6 +62,12 @@ sudo bash gorecshit.sh --dpi-check
 На зарубежной VPS обычно всё OK — это нормально (российский DPI на пути ноды нет). Модуль полезен как диагностика egress/DNS ноды.
 
 ## Changelog
+
+### v2.2.2
+
+- Команда **`gorecshit`**: при любом запуске ставится `/usr/local/sbin/gorecshit` + symlink `/usr/local/bin/gorecshit`
+- Без аргументов открывается меню; аргументы (`--status`, `--yes`, …) пробрасываются как раньше
+- `--update` / пункт меню «Обновить gorecshit» — самообновление с GitHub (fallback jsDelivr/fastly)
 
 ### v2.2.1
 
@@ -106,10 +113,19 @@ sudo bash gorecshit.sh --dpi-check
 bash <(curl -Ls https://raw.githubusercontent.com/gorecvpn/gorecshit/main/install.sh) --panel-ip X.X.X.X --yes
 ```
 
+После первого запуска (или просто `bash install.sh --status`) на сервере доступна команда:
+
+```bash
+gorecshit              # меню
+gorecshit --status
+gorecshit --update     # обновить скрипт с GitHub / jsDelivr
+```
+
 Интерактивно (меню на русском, спросит IP панели):
 
 ```bash
 bash <(curl -Ls https://raw.githubusercontent.com/gorecvpn/gorecshit/main/install.sh)
+# дальше: gorecshit
 ```
 
 Проверка без изменений:
@@ -147,6 +163,7 @@ sudo bash install.sh --panel-ip X.X.X.X --modules ufw,blocklist,hide_ports,anti_
 | `--refresh-lists` | Только обновить ipset-списки. |
 | `--status` | Показать статус. |
 | `--dpi-check` | DNS/TLS/SNI/TCP16 egress-проверка с ноды. |
+| `--update` | Самообновление `install.sh` → `/usr/local/sbin/gorecshit` (GitHub, fallback jsDelivr). |
 | `--rollback` / `--uninstall` | Откат из бэкапа. |
 
 ## Откат

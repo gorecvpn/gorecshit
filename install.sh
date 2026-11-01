@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# gorecshit v2.2.1 — one-command hardening for Remnawave VPN node servers (Debian 11+/Ubuntu 20.04+)
+# gorecshit v2.2.2 — one-command hardening for Remnawave VPN node servers (Debian 11+/Ubuntu 20.04+)
 # Usage:
 #   bash install.sh --panel-ip X.X.X.X [--node-port 2222] [--yes]
 #   bash install.sh --check --panel-ip X.X.X.X
@@ -8,7 +8,7 @@
 # Does NOT restart Docker while remnanode/xray is live. Does NOT deploy itself.
 set -Eeuo pipefail
 
-VERSION="2.2.1"
+VERSION="2.2.2"
 SCRIPT_NAME="gorecshit"
 BACKUP_ROOT="/root/hardening-backups"
 TS="$(date +%Y%m%d-%H%M%S)"
@@ -51,6 +51,7 @@ DO_ROLLBACK=0
 DO_REFRESH_LISTS_ONLY=0
 DO_STATUS_ONLY=0
 DO_DPI_CHECK=0
+DO_UPDATE_ONLY=0
 INTERACTIVE=0
 LOG_FILE="/var/log/gorecshit.log"
 
@@ -109,6 +110,8 @@ gorecshit — Remnawave VPN node hardening (Debian 11+ / Ubuntu 20.04+)
 Usage:
   install.sh --panel-ip X.X.X.X [options]
   install.sh                         # interactive menu (Russian UI, TTY)
+  gorecshit                          # same menu after install (/usr/local/bin/gorecshit)
+  gorecshit --update                 # self-update from GitHub / jsDelivr
   install.sh --rollback | --uninstall
   install.sh --dry-run --panel-ip X.X.X.X [options]
   install.sh --refresh-lists         # only refresh scanner blocklist
@@ -146,6 +149,7 @@ Options:
   --dry-run, --check         Print actions / verify plan only; make no changes
   --refresh-lists            Only run scanner-block refresh
   --status                   Show current hardening status
+  --update                   Self-update from GitHub (jsDelivr fallback); installs gorecshit command
   --dpi-check                Check DPI/DNS/TLS from this node (egress diagnostics)
   --rollback / --uninstall   Restore latest backup under /root/hardening-backups/
   -h, --help                 Show this help
@@ -307,6 +311,7 @@ parse_args() {
       --dry-run|--check) DRY_RUN=1; CHECK_ONLY=1; shift ;;
       --refresh-lists) DO_REFRESH_LISTS_ONLY=1; shift ;;
       --status) DO_STATUS_ONLY=1; shift ;;
+      --update) DO_UPDATE_ONLY=1; shift ;;
       --dpi-check) DO_DPI_CHECK=1; shift ;;
       --rollback|--uninstall) DO_ROLLBACK=1; shift ;;
       -h|--help) usage; exit 0 ;;
@@ -342,7 +347,7 @@ parse_args() {
 
 prompt_panel_ip() {
   if [[ -n "$PANEL_IP" ]]; then return 0; fi
-  if [[ "$DO_ROLLBACK" -eq 1 || "$DO_STATUS_ONLY" -eq 1 || "$DO_REFRESH_LISTS_ONLY" -eq 1 || "$DO_DPI_CHECK" -eq 1 ]]; then return 0; fi
+  if [[ "$DO_ROLLBACK" -eq 1 || "$DO_STATUS_ONLY" -eq 1 || "$DO_REFRESH_LISTS_ONLY" -eq 1 || "$DO_DPI_CHECK" -eq 1 || "$DO_UPDATE_ONLY" -eq 1 ]]; then return 0; fi
   if [[ "$ASSUME_YES" -eq 1 ]]; then
     err "--panel-ip is required (or set GORECSHIT_PANEL_IP). Refusing non-interactive without it."
     exit 2
@@ -750,6 +755,96 @@ run_dpi_check() {
   echo "Если DETECTED/TLS DROP на EU-ноде — смотрите firewall/маршрут хостера, не «российский DPI»."
 }
 
+install_cli_command() {
+  # Install/refresh /usr/local/sbin/gorecshit + /usr/local/bin/gorecshit symlink (no hardening).
+  # Safe to call on every run when root.
+  if [[ "$(id -u 2>/dev/null || echo 1)" -ne 0 ]]; then
+    return 0
+  fi
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    printf '%b[DRY]%b install CLI -> /usr/local/sbin/gorecshit (+ /usr/local/bin/gorecshit)\n' "${C_YEL}" "${C_RESET}"
+    return 0
+  fi
+  local src dest link
+  src="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || realpath "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
+  dest="/usr/local/sbin/gorecshit"
+  link="/usr/local/bin/gorecshit"
+  mkdir -p /usr/local/sbin /usr/local/bin
+  if [[ ! -f "$src" ]]; then
+    warn "Не удалось определить путь скрипта для установки CLI"
+    return 0
+  fi
+  # Avoid no-op copy noise when already identical
+  if ! cmp -s "$src" "$dest" 2>/dev/null; then
+    local tmp
+    tmp="$(mktemp "${dest}.XXXXXX")"
+    cp -f "$src" "$tmp"
+    chmod 755 "$tmp"
+    mv -f "$tmp" "$dest"
+    ok "CLI установлен: $dest (v${VERSION})"
+  fi
+  ln -sfn "$dest" "$link"
+  # Ensure sbin is preferred; bin symlink for PATH convenience
+  if [[ ! -x "$dest" ]]; then
+    chmod 755 "$dest" || true
+  fi
+}
+
+self_update_from_github() {
+  step "Обновление gorecshit с GitHub"
+  if [[ "$(id -u)" -ne 0 ]]; then
+    err "Обновление требует root"; exit 1
+  fi
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    printf '%b[DRY]%b curl GitHub/jsDelivr -> /usr/local/sbin/gorecshit\n' "${C_YEL}" "${C_RESET}"
+    return 0
+  fi
+  local urls=(
+    "https://raw.githubusercontent.com/gorecvpn/gorecshit/main/install.sh"
+    "https://cdn.jsdelivr.net/gh/gorecvpn/gorecshit@main/install.sh"
+    "https://fastly.jsdelivr.net/gh/gorecvpn/gorecshit@main/install.sh"
+  )
+  local tmp dest="/usr/local/sbin/gorecshit" link="/usr/local/bin/gorecshit" ok_url=""
+  tmp="$(mktemp /tmp/gorecshit-update.XXXXXX)"
+  local u
+  for u in "${urls[@]}"; do
+    log "Пробую: $u"
+    if command -v curl >/dev/null 2>&1; then
+      if curl -fsSL --connect-timeout 8 --max-time 60 "$u" -o "$tmp"; then
+        ok_url="$u"; break
+      fi
+    elif command -v wget >/dev/null 2>&1; then
+      if wget -q -T 60 -O "$tmp" "$u"; then
+        ok_url="$u"; break
+      fi
+    fi
+  done
+  if [[ -z "$ok_url" ]]; then
+    rm -f "$tmp"
+    err "Не удалось скачать install.sh (GitHub и jsDelivr недоступны). Скопируйте файл вручную."
+    exit 1
+  fi
+  if ! head -1 "$tmp" | grep -qE '^#!.*bash'; then
+    rm -f "$tmp"
+    err "Скачанный файл не похож на bash-скрипт ($ok_url)"
+    exit 1
+  fi
+  if ! bash -n "$tmp" 2>/tmp/gorecshit-bashn.err; then
+    err "bash -n не прошёл для скачанного скрипта"
+    cat /tmp/gorecshit-bashn.err 2>/dev/null || true
+    rm -f "$tmp"
+    exit 1
+  fi
+  mkdir -p /usr/local/sbin /usr/local/bin
+  chmod 755 "$tmp"
+  mv -f "$tmp" "$dest"
+  ln -sfn "$dest" "$link"
+  local newv
+  newv="$(grep -E '^VERSION=' "$dest" | head -1 | cut -d= -f2 | tr -d '"')"
+  ok "Обновлено из $ok_url → $dest (VERSION=${newv:-?})"
+  ok "Запуск: gorecshit   |   gorecshit --status   |   gorecshit --update"
+}
+
 interactive_menu() {
   local choice=""
   while true; do
@@ -763,10 +858,11 @@ interactive_menu() {
     printf '  %b4)%b 📊 Показать статус\n' "${C_BOLD}" "${C_RESET}"
     printf '  %b5)%b 🔍 Проверка DPI/блокировок\n' "${C_BOLD}" "${C_RESET}"
     printf '  %b6)%b ↩️  Откат\n' "${C_BOLD}" "${C_RESET}"
+    printf '  %b7)%b ⬆️  Обновить gorecshit (GitHub)\n' "${C_BOLD}" "${C_RESET}"
     menu_sep
     printf '  %b0)%b 🚪 Выход\n' "${C_BOLD}" "${C_RESET}"
-    printf '%bCLI: gorecshit.sh --yes|--modules|--status|--dpi-check …%b\n' "${C_GREY}" "${C_RESET}"
-    printf '%bВыберите пункт [0-6]:%b ' "${C_BOLD}" "${C_RESET}"
+    printf '%bCLI: gorecshit [--status|--update|--yes|--modules …]%b\n' "${C_GREY}" "${C_RESET}"
+    printf '%bВыберите пункт [0-7]:%b ' "${C_BOLD}" "${C_RESET}"
     read -r choice || true
     case "$choice" in
       1)
@@ -794,6 +890,13 @@ interactive_menu() {
       6)
         DO_ROLLBACK=1
         return 0
+        ;;
+      7)
+        self_update_from_github
+        # re-exec updated binary into menu
+        if [[ -x /usr/local/sbin/gorecshit ]]; then
+          exec /usr/local/sbin/gorecshit
+        fi
         ;;
       0|q|Q)
         exit 0
@@ -2516,9 +2619,19 @@ main() {
 
   printf '%b%s%b v%s\n' "${C_BOLD}" "$SCRIPT_NAME" "${C_RESET}" "$VERSION"
 
+  # Always refresh CLI entrypoint when root (does not re-run hardening)
+  install_cli_command
+
+  if [[ "$DO_UPDATE_ONLY" -eq 1 ]]; then
+    self_update_from_github
+    exit 0
+  fi
+
   # Interactive menu when TTY and no --yes and not a one-shot action flag
+  # Also open menu when invoked as `gorecshit` with zero args (even if not a TTY? require TTY)
   if [[ "$ASSUME_YES" -eq 0 && "$DO_ROLLBACK" -eq 0 && "$CHECK_ONLY" -eq 0 \
         && "$DO_REFRESH_LISTS_ONLY" -eq 0 && "$DO_STATUS_ONLY" -eq 0 && "$DO_DPI_CHECK" -eq 0 \
+        && "$DO_UPDATE_ONLY" -eq 0 \
         && -t 0 && -t 1 ]]; then
     interactive_menu
   fi
