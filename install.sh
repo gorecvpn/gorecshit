@@ -166,6 +166,26 @@ is_port() {
   [[ "$p" =~ ^[0-9]+$ ]] && (( p >= 1 && p <= 65535 ))
 }
 
+ss_local_addr() {
+  # First Local Address:Port token from an ss line (column layout varies by ss version)
+  local line="$1"
+  awk '{
+    for (i=1; i<=NF; i++) {
+      if ($i ~ /^\*:([0-9]+)$/) { print $i; exit }
+      if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+%[A-Za-z0-9._-]+:[0-9]+$/) { print $i; exit }
+      if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+$/) { print $i; exit }
+      if ($i ~ /^\[[0-9a-fA-F:]+\]:[0-9]+$/) { print $i; exit }
+      if ($i ~ /^::1:[0-9]+$/) { print $i; exit }
+    }
+  }' <<<"$line"
+}
+
+ss_is_loopback_addr() {
+  local addr="$1"
+  [[ "$addr" == 127.* || "$addr" == \[::1\]:* || "$addr" == ::1:* || "$addr" == *%lo:* ]]
+}
+
+
 run() {
   if [[ "$DRY_RUN" -eq 1 ]]; then
     printf '%b[DRY]%b %s\n' "${C_YEL}" "${C_RESET}" "$*"
@@ -594,14 +614,12 @@ detect_remnanode() {
   if command -v ss >/dev/null 2>&1; then
     local line addr port proc
     while IFS= read -r line; do
-      addr="$(awk '{print $5}' <<<"$line")"
-      # ss -lntp columns vary; prefer Local Address:Port field (usually $4 for -ltnp)
-      addr="$(awk '{print $4}' <<<"$line")"
+      addr="$(ss_local_addr "$line")"
       port="${addr##*:}"
       port="${port%%]*}"
       if [[ ! "$port" =~ ^[0-9]+$ ]]; then continue; fi
       if [[ "$port" == "22" || "$port" == "$exclude_port" || "$port" == "${SSH_PORT_NEW:-}" ]]; then continue; fi
-      if [[ "$addr" == 127.* || "$addr" == \[::1\]* ]]; then continue; fi
+      if ss_is_loopback_addr "$addr"; then continue; fi
       proc=""
       if [[ "$line" == *'users:(('* ]]; then
         proc="$(sed -n 's/.*users:(("\([^"]*\).*/\1/p' <<<"$line" | head -1 || true)"
@@ -614,12 +632,12 @@ detect_remnanode() {
     done < <(ss -lntp 2>/dev/null | awk 'NR>1' || true)
 
     while IFS= read -r line; do
-      addr="$(awk '{print $4}' <<<"$line")"
+      addr="$(ss_local_addr "$line")"
       port="${addr##*:}"
       port="${port%%]*}"
       if [[ ! "$port" =~ ^[0-9]+$ ]]; then continue; fi
       if [[ "$port" == "53" || "$port" == "68" || "$port" == "323" ]]; then continue; fi
-      if [[ "$addr" == 127.* || "$addr" == \[::1\]* ]]; then continue; fi
+      if ss_is_loopback_addr "$addr"; then continue; fi
       proc=""
       if [[ "$line" == *'users:(('* ]]; then
         proc="$(sed -n 's/.*users:(("\([^"]*\).*/\1/p' <<<"$line" | head -1 || true)"
@@ -1719,10 +1737,10 @@ configure_stealth() {
   if command -v ss >/dev/null 2>&1; then
     local line addr port
     while IFS= read -r line; do
-      addr="$(awk '{print $4}' <<<"$line")"
+      addr="$(ss_local_addr "$line")"
       port="${addr##*:}"; port="${port%%]*}"
       [[ "$port" =~ ^[0-9]+$ ]] || continue
-      [[ "$addr" == 127.* || "$addr" == \[::1\]* ]] && continue
+      ss_is_loopback_addr "$addr" && continue
       local okp=0 ap
       for ap in "${allow_ports[@]}"; do
         [[ "$port" == "$ap" ]] && okp=1 && break
