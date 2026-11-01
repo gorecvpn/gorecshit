@@ -513,9 +513,12 @@ preflight() {
   detect_ssh_client
   if [[ -f /etc/os-release ]]; then
     # shellcheck disable=SC1091
+    # Save script VERSION — /etc/os-release defines VERSION= and would clobber it
+    local _gs_ver="$VERSION"
     . /etc/os-release
     OS_ID="${ID:-unknown}"
     OS_VERSION="${VERSION_ID:-unknown}"
+    VERSION="$_gs_ver"
   else
     OS_ID="unknown"; OS_VERSION="unknown"
   fi
