@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# gorecshit v2.2.4 — one-command hardening for Remnawave VPN node servers (Debian 11+/Ubuntu 20.04+)
+# gorecshit v2.2.5 — one-command hardening for Remnawave VPN node servers (Debian 11+/Ubuntu 20.04+)
 # Usage:
 #   bash install.sh --panel-ip X.X.X.X [--node-port 2222] [--yes]
 #   bash install.sh --check --panel-ip X.X.X.X
@@ -8,7 +8,7 @@
 # Does NOT restart Docker while remnanode/xray is live. Does NOT deploy itself.
 set -Eeuo pipefail
 
-VERSION="2.2.4"
+VERSION="2.2.5"
 SCRIPT_NAME="gorecshit"
 BACKUP_ROOT="/root/hardening-backups"
 
@@ -64,6 +64,8 @@ DO_HIDE_PORTS=1
 DO_ANTI_PROBE=1
 DO_STEALTH=1
 DO_DOCKER_JOURNAL=1
+FORCE_DOCKER_RESTART=0   # --docker-restart: restart even with --yes / non-interactive
+NO_DOCKER_RESTART=0      # --no-docker-restart: never restart
 DO_TCP_TIMESTAMPS_OFF=0
 SSH_PORT_NEW=""           # empty = keep 22 only; --ssh-port N adds N
 BLOCKLIST_FROM=""         # ssh host or URL or local path
@@ -168,6 +170,8 @@ Options:
   --yes                      Non-interactive (still requires --panel-ip or GORECSHIT_PANEL_IP)
   --relay-ips IP,...         Extra never-block / ACCEPT IPs (default: HAProxy relays)
   --no-docker-user           Skip DOCKER-USER NODE_PORT restriction (bridge publish)
+  --docker-restart          After daemon.json change, restart Docker even with --yes (non-interactive)
+  --no-docker-restart       Never restart Docker for daemon.json (skip apply)
   --no-nofile                Skip nofile 1048576 limits
   --no-resolv-v4             Keep IPv6 nameservers in resolv.conf even when IPv6 off
   --no-certbot-hooks         Skip certbot renew reload hooks for caddy/nginx
@@ -329,6 +333,8 @@ parse_args() {
       --tz) TZ_OPT="${2:-}"; shift 2 ;;
       --relay-ips) RELAY_IPS="${2:-}"; shift 2 ;;
       --no-docker-user) DO_DOCKER_USER=0; shift ;;
+      --docker-restart) FORCE_DOCKER_RESTART=1; shift ;;
+      --no-docker-restart) NO_DOCKER_RESTART=1; shift ;;
       --no-nofile) DO_NOFILE=0; shift ;;
       --no-resolv-v4) DO_RESOLV_V4=0; shift ;;
       --no-certbot-hooks) DO_CERTBOT_HOOKS=0; shift ;;
@@ -2414,6 +2420,155 @@ configure_hostname_tz() {
   fi
 }
 
+validate_docker_daemon_json() {
+  local f="$1"
+  [[ -f "$f" ]] || return 1
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -m json.tool "$f" >/dev/null 2>&1 || return 1
+  elif command -v jq >/dev/null 2>&1; then
+    jq -e . "$f" >/dev/null 2>&1 || return 1
+  else
+    # minimal brace check
+    grep -q '{' "$f" || return 1
+  fi
+  if command -v dockerd >/dev/null 2>&1; then
+    # dockerd --validate exists on newer docker; ignore if unsupported
+    if dockerd --help 2>&1 | grep -q -- '--validate'; then
+      dockerd --validate --config-file="$f" >/dev/null 2>&1 || return 1
+    fi
+  fi
+  return 0
+}
+
+xray_listening() {
+  ss -lntup 2>/dev/null | grep -qiE 'xray|rw-core|sing-box|hysteria' && return 0
+  # fallback: any non-loopback listen by remnanode processes
+  ss -lntup 2>/dev/null | grep -qiE 'remnanode' && return 0
+  return 1
+}
+
+reapply_firewall_after_docker() {
+  log "Переприменяю iptables/UFW/DOCKER-USER после рестарта Docker"
+  if command -v ufw >/dev/null 2>&1; then
+    ufw --force reload 2>/dev/null || true
+  fi
+  if [[ -x /usr/local/sbin/gorecshit-anti-probe.sh ]]; then
+    /usr/local/sbin/gorecshit-anti-probe.sh 2>/dev/null || warn "anti-probe re-apply failed"
+  elif systemctl list-unit-files gorecshit-anti-probe.service >/dev/null 2>&1; then
+    systemctl start gorecshit-anti-probe.service 2>/dev/null || true
+  fi
+  if [[ -n "${NODE_PORT:-}" && -x "/usr/local/sbin/docker-user-${NODE_PORT}.sh" ]]; then
+    "/usr/local/sbin/docker-user-${NODE_PORT}.sh" 2>/dev/null || warn "DOCKER-USER re-apply failed"
+  fi
+  if [[ -x /usr/local/sbin/gorecshit-hotpath.sh ]]; then
+    /usr/local/sbin/gorecshit-hotpath.sh 2>/dev/null || true
+  fi
+  if [[ -x /usr/local/sbin/gorecshit-nic-tune.sh ]]; then
+    /usr/local/sbin/gorecshit-nic-tune.sh 2>/dev/null || true
+  fi
+}
+
+wait_remnanode_after_docker() {
+  local i name
+  # Prefer known container name; also accept remnanode_running
+  for i in $(seq 1 60); do
+    if docker info >/dev/null 2>&1; then
+      break
+    fi
+    sleep 1
+  done
+  if ! docker info >/dev/null 2>&1; then
+    warn "Docker не ответил за 60с после restart"
+    return 1
+  fi
+  # Try start remnanode if present but stopped
+  if command -v docker >/dev/null 2>&1; then
+    name="$(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -iE '^remnanode$|remnanode' | head -1 || true)"
+    if [[ -n "$name" ]]; then
+      docker start "$name" >/dev/null 2>&1 || true
+    fi
+  fi
+  for i in $(seq 1 60); do
+    if remnanode_running && xray_listening; then
+      ok "remnanode/xray снова живы (через ${i}с)"
+      return 0
+    fi
+    if remnanode_running && [[ "$i" -ge 15 ]]; then
+      # container up; xray may still be binding
+      if xray_listening; then
+        ok "remnanode/xray снова живы (через ${i}с)"
+        return 0
+      fi
+    fi
+    sleep 1
+  done
+  if remnanode_running; then
+    warn "remnanode контейнер up, но xray listen не подтверждён за 60с"
+    return 1
+  fi
+  warn "remnanode не поднялся за 60с после restart Docker"
+  return 1
+}
+
+maybe_apply_docker_daemon_restart() {
+  # Called after hardening writes daemon.json (CHANGED_DOCKER=1)
+  if [[ "$CHANGED_DOCKER" -ne 1 ]]; then
+    return 0
+  fi
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    printf '%b[DRY]%b maybe systemctl restart docker (daemon.json changed)\n' "${C_YEL}" "${C_RESET}"
+    return 0
+  fi
+  if [[ "$NO_DOCKER_RESTART" -eq 1 ]]; then
+    SKIPPED_DOCKER_RESTART=1
+    warn "daemon.json изменён; Docker НЕ перезапущен (--no-docker-restart). Примените позже: systemctl restart docker"
+    return 0
+  fi
+
+  local do_it=0
+  if [[ "$FORCE_DOCKER_RESTART" -eq 1 ]]; then
+    do_it=1
+    log "Перезапуск Docker (--docker-restart)"
+  elif [[ -t 0 && -t 1 && "$ASSUME_YES" -eq 0 ]]; then
+    printf '%bПерезапустить Docker сейчас? Нода отключится на ~10-30 сек [y/N]:%b ' "${C_BOLD}" "${C_RESET}"
+    local ans=""
+    read -r ans || true
+    if [[ "$ans" =~ ^[Yy]$ ]]; then
+      do_it=1
+    else
+      SKIPPED_DOCKER_RESTART=1
+      warn "daemon.json изменён; перезапуск Docker пропущен (ответ пользователя). Позже: systemctl restart docker или gorecshit --docker-restart"
+      return 0
+    fi
+  else
+    # Non-interactive (--yes / no TTY): do not restart unless --docker-restart
+    SKIPPED_DOCKER_RESTART=1
+    warn "daemon.json изменён; Docker НЕ перезапущен (non-interactive без --docker-restart). Добавьте --docker-restart или запустите интерактивно."
+    return 0
+  fi
+
+  if [[ "$do_it" -ne 1 ]]; then
+    return 0
+  fi
+
+  step "Перезапуск Docker для применения daemon.json"
+  if ! systemctl restart docker; then
+    warn "systemctl restart docker не удался"
+    SKIPPED_DOCKER_RESTART=1
+    return 1
+  fi
+  ok "Docker перезапущен"
+  wait_remnanode_after_docker || true
+  reapply_firewall_after_docker
+  if remnanode_running && xray_listening; then
+    ok "daemon.json применён; remnanode/xray OK; firewall rules re-applied"
+  elif remnanode_running; then
+    warn "daemon.json применён; remnanode up, проверьте listen порты xray вручную"
+  else
+    warn "daemon.json применён (docker restart OK), но remnanode/xray не подтверждены — проверьте docker ps / ss"
+  fi
+}
+
 configure_docker_journal() {
   if [[ "$DO_DOCKER_JOURNAL" -eq 0 ]]; then
     log "Docker/journald пропущен"
@@ -2465,15 +2620,23 @@ PY
     local old=""
     if [[ -f /etc/docker/daemon.json ]]; then old="$(cat /etc/docker/daemon.json)"; fi
     printf '%s\n' "$newjson" >/etc/docker/daemon.json
-    if [[ "$old" != "$(cat /etc/docker/daemon.json)" ]]; then
-      CHANGED_DOCKER=1
-      if remnanode_running; then
-        SKIPPED_DOCKER_RESTART=1
-        warn "Docker daemon.json changed but remnanode/xray is live — NOT restarting docker"
-      elif systemctl is-active --quiet docker 2>/dev/null; then
-        warn "Docker daemon.json changed and no remnanode running — restarting docker"
-        systemctl restart docker || warn "docker restart failed"
+    # Validate JSON; restore backup on failure
+    if ! validate_docker_daemon_json /etc/docker/daemon.json; then
+      warn "daemon.json невалиден после записи — восстанавливаю бэкап"
+      if [[ -f "${BACKUP_DIR}/etc/docker/daemon.json" ]]; then
+        cp -a "${BACKUP_DIR}/etc/docker/daemon.json" /etc/docker/daemon.json
+        ok "Восстановлен ${BACKUP_DIR}/etc/docker/daemon.json"
+      elif [[ -n "$old" ]]; then
+        printf '%s\n' "$old" >/etc/docker/daemon.json
+        ok "Восстановлен предыдущий daemon.json из памяти"
+      else
+        rm -f /etc/docker/daemon.json
+        warn "Бэкапа не было — daemon.json удалён"
       fi
+      CHANGED_DOCKER=0
+    elif [[ "$old" != "$(cat /etc/docker/daemon.json)" ]]; then
+      CHANGED_DOCKER=1
+      ok "daemon.json обновлён (ожидает применения через restart Docker)"
     else
       ok "Docker daemon.json already OK"
     fi
@@ -2699,10 +2862,10 @@ final_verify() {
   echo "---- remnanode ----"
   if remnanode_running; then ok "remnanode/xray жив"; else warn "remnanode не виден в docker ps"; fi
   hostname; timedatectl 2>/dev/null | head -6 || true
-  if [[ "$SKIPPED_DOCKER_RESTART" -eq 1 ]]; then
-    warn "daemon.json updated without docker restart (remnanode live)."
+  if [[ "$CHANGED_DOCKER" -eq 1 && "$SKIPPED_DOCKER_RESTART" -eq 1 ]]; then
+    warn "daemon.json изменён без restart Docker — логи rotation не активны до: systemctl restart docker (или перезапуск с --docker-restart)"
   elif [[ "$CHANGED_DOCKER" -eq 1 ]]; then
-    warn "Docker was restarted due to daemon.json change"
+    ok "daemon.json изменён и Docker был перезапущен для применения"
   fi
   ok "Hardening complete. Backups: ${BACKUP_DIR}"
   ok "Rollback: bash install.sh --rollback   OR   ${BACKUP_DIR}/rollback.sh"
@@ -2722,6 +2885,7 @@ run_hardening() {
   configure_stealth
   configure_hostname_tz
   configure_docker_journal
+  maybe_apply_docker_daemon_restart
   configure_certbot_hooks
   final_verify
   install_cli_command  # ensure CLI after hardening
