@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# gorecshit v2.2.6 — one-command hardening for Remnawave VPN node servers (Debian 11+/Ubuntu 20.04+)
+# gorecshit v2.2.7 — one-command hardening for Remnawave VPN node servers (Debian 11+/Ubuntu 20.04+)
 # Usage:
 #   bash install.sh --panel-ip X.X.X.X [--node-port 2222] [--yes]
 #   bash install.sh --check --panel-ip X.X.X.X
@@ -8,7 +8,7 @@
 # Does NOT restart Docker while remnanode/xray is live. Does NOT deploy itself.
 set -Eeuo pipefail
 
-VERSION="2.2.6"
+VERSION="2.2.7"
 SCRIPT_NAME="gorecshit"
 BACKUP_ROOT="/root/hardening-backups"
 
@@ -72,6 +72,8 @@ BLOCKLIST_FROM=""         # ssh host or URL or local path
 MODULES_CSV=""            # --modules ufw,blocklist,...
 TZ_OPT=""                 # empty = leave; "auto" = geo; or IANA name
 ASSUME_YES=0
+CLI_ASSUME_YES=0          # set only by --yes / -y (not by menu)
+FROM_MENU=0               # set when menu item 1/2 starts install
 DRY_RUN=0
 CHECK_ONLY=0
 DO_ROLLBACK=0
@@ -367,7 +369,7 @@ parse_args() {
       --no-nofile) DO_NOFILE=0; shift ;;
       --no-resolv-v4) DO_RESOLV_V4=0; shift ;;
       --no-certbot-hooks) DO_CERTBOT_HOOKS=0; shift ;;
-      --yes|-y) ASSUME_YES=1; shift ;;
+      --yes|-y) ASSUME_YES=1; CLI_ASSUME_YES=1; shift ;;
       --dry-run|--check) DRY_RUN=1; CHECK_ONLY=1; shift ;;
       --refresh-lists) DO_REFRESH_LISTS_ONLY=1; shift ;;
       --status) DO_STATUS_ONLY=1; shift ;;
@@ -1021,12 +1023,14 @@ interactive_menu() {
       1)
         apply_modules_csv "all"
         prompt_panel_ip
-        ASSUME_YES=1
+        FROM_MENU=1
+        ASSUME_YES=1   # skip "Продолжить?"; does NOT imply CLI --yes
         return 0
         ;;
       2)
         interactive_select_modules
         prompt_panel_ip
+        FROM_MENU=1
         ASSUME_YES=1
         return 0
         ;;
@@ -2767,7 +2771,9 @@ maybe_apply_docker_daemon_restart() {
   if [[ "$FORCE_DOCKER_RESTART" -eq 1 ]]; then
     do_it=1
     log "Перезапуск Docker (--docker-restart)"
-  elif can_prompt_user; then
+  elif [[ -r /dev/tty ]]; then
+    # ALWAYS prompt when a real TTY exists — including menu install (FROM_MENU + ASSUME_YES=1).
+    # Menu sets ASSUME_YES only to skip "Продолжить?"; docker restart must still ask.
     local ans=""
     prompt_user $'Перезапустить Docker сейчас? Нода отключится на ~10-30 сек [y/N]: ' ans
     if [[ "$ans" =~ ^[Yy]$ ]]; then
@@ -2777,10 +2783,14 @@ maybe_apply_docker_daemon_restart() {
       warn "daemon.json изменён; перезапуск Docker пропущен (ответ пользователя). Позже: systemctl restart docker или gorecshit --docker-restart"
       return 0
     fi
-  else
-    # Non-interactive (--yes / no TTY): do not restart unless --docker-restart
+  elif [[ "$CLI_ASSUME_YES" -eq 1 ]]; then
+    # CLI --yes without /dev/tty: do not restart unless --docker-restart
     SKIPPED_DOCKER_RESTART=1
-    warn "daemon.json изменён; Docker НЕ перезапущен (non-interactive без --docker-restart). Добавьте --docker-restart или запустите интерактивно."
+    warn "daemon.json изменён; Docker НЕ перезапущен (--yes без TTY). Добавьте --docker-restart."
+    return 0
+  else
+    SKIPPED_DOCKER_RESTART=1
+    warn "daemon.json изменён; Docker НЕ перезапущен (нет /dev/tty). Запустите интерактивно или с --docker-restart."
     return 0
   fi
 
