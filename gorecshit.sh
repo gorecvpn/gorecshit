@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# gorecshit v2.2.3 — one-command hardening for Remnawave VPN node servers (Debian 11+/Ubuntu 20.04+)
+# gorecshit v2.2.4 — one-command hardening for Remnawave VPN node servers (Debian 11+/Ubuntu 20.04+)
 # Usage:
 #   bash install.sh --panel-ip X.X.X.X [--node-port 2222] [--yes]
 #   bash install.sh --check --panel-ip X.X.X.X
@@ -8,9 +8,34 @@
 # Does NOT restart Docker while remnanode/xray is live. Does NOT deploy itself.
 set -Eeuo pipefail
 
-VERSION="2.2.3"
+VERSION="2.2.4"
 SCRIPT_NAME="gorecshit"
 BACKUP_ROOT="/root/hardening-backups"
+
+# Optional snapshot only when BASH_SOURCE is a seekable regular file under /dev/fd
+# (NOT a pipe — reading a pipe would consume the script for bash <(curl|cat …)).
+_GORECSHIT_SELF_SNAPSHOT=""
+_gorecshit_early_snapshot_self() {
+  local raw="${BASH_SOURCE[0]:-$0}"
+  case "$raw" in
+    /dev/fd/*|/proc/self/fd/*|/proc/[0-9]*/fd/*)
+      # -f is false for pipes; only snapshot seekable fd-backed files
+      [[ -f "$raw" ]] || return 0
+      _GORECSHIT_SELF_SNAPSHOT="$(mktemp /tmp/gorecshit-self.XXXXXX 2>/dev/null || mktemp 2>/dev/null || true)"
+      [[ -n "$_GORECSHIT_SELF_SNAPSHOT" ]] || return 0
+      if ! cp -f "$raw" "$_GORECSHIT_SELF_SNAPSHOT" 2>/dev/null; then
+        rm -f "$_GORECSHIT_SELF_SNAPSHOT" 2>/dev/null || true
+        _GORECSHIT_SELF_SNAPSHOT=""
+        return 0
+      fi
+      if ! head -1 "$_GORECSHIT_SELF_SNAPSHOT" 2>/dev/null | grep -q '^#!'; then
+        rm -f "$_GORECSHIT_SELF_SNAPSHOT" 2>/dev/null || true
+        _GORECSHIT_SELF_SNAPSHOT=""
+      fi
+      ;;
+  esac
+}
+_gorecshit_early_snapshot_self
 TS="$(date +%Y%m%d-%H%M%S)"
 BACKUP_DIR="${BACKUP_ROOT}/${TS}"
 MARKER_DIR="/var/lib/gorecshit"
@@ -758,9 +783,55 @@ run_dpi_check() {
   echo "Если DETECTED/TLS DROP на EU-ноде — смотрите firewall/маршрут хостера, не «российский DPI»."
 }
 
+_cli_script_looks_valid() {
+  # $1 = path; require shebang+bash and bash -n
+  local f="$1" first
+  [[ -n "$f" && -r "$f" ]] || return 1
+  first="$(head -1 "$f" 2>/dev/null || true)"
+  [[ "$first" == "#!"*bash* || "$first" == "#!/usr/bin/env bash" || "$first" == "#!/bin/bash" ]] || return 1
+  # reject old symlink stub
+  if [[ "$(wc -c <"$f" 2>/dev/null || echo 0)" -lt 200 ]]; then
+    return 1
+  fi
+  bash -n "$f" 2>/dev/null || return 1
+  return 0
+}
+
+_cli_download_full_script_to() {
+  # Download full install.sh into $1 (tmp path). Echo used URL on success via global _CLI_DL_URL
+  local out="$1" u
+  local urls=(
+    "https://raw.githubusercontent.com/gorecvpn/gorecshit/main/install.sh"
+    "https://cdn.jsdelivr.net/gh/gorecvpn/gorecshit@main/install.sh"
+    "https://fastly.jsdelivr.net/gh/gorecvpn/gorecshit@main/install.sh"
+    "https://raw.githubusercontent.com/gorecvpn/gorecshit/main/gorecshit.sh"
+    "https://cdn.jsdelivr.net/gh/gorecvpn/gorecshit@main/gorecshit.sh"
+  )
+  _CLI_DL_URL=""
+  for u in "${urls[@]}"; do
+    if command -v curl >/dev/null 2>&1; then
+      if curl -fsSL --connect-timeout 8 --max-time 60 "$u" -o "$out"; then
+        if _cli_script_looks_valid "$out"; then
+          _CLI_DL_URL="$u"
+          return 0
+        fi
+      fi
+    elif command -v wget >/dev/null 2>&1; then
+      if wget -q -T 60 -O "$out" "$u"; then
+        if _cli_script_looks_valid "$out"; then
+          _CLI_DL_URL="$u"
+          return 0
+        fi
+      fi
+    fi
+    rm -f "$out"
+  done
+  return 1
+}
+
 install_cli_command() {
   # Install/refresh /usr/local/sbin/gorecshit (FULL script body) + /usr/local/bin/gorecshit symlink.
-  # Safe to call on every root run (menu, --status, full hardening) — does NOT re-apply hardening.
+  # Works for: /path/script, bash <(curl …), curl | bash. Does NOT re-apply hardening.
   if [[ "$(id -u 2>/dev/null || echo 1)" -ne 0 ]]; then
     return 0
   fi
@@ -768,39 +839,65 @@ install_cli_command() {
     printf '%b[DRY]%b install CLI -> /usr/local/sbin/gorecshit (+ /usr/local/bin/gorecshit)\n' "${C_YEL}" "${C_RESET}"
     return 0
   fi
-  local src dest link
-  # Prefer the file being executed (works for bash /path/gorecshit.sh and installed binary)
-  src="${BASH_SOURCE[0]:-$0}"
-  if command -v readlink >/dev/null 2>&1; then
-    src="$(readlink -f "$src" 2>/dev/null || true)"
-  fi
-  if [[ -z "$src" || ! -f "$src" ]]; then
-    src="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)/$(basename "${BASH_SOURCE[0]:-$0}")"
-  fi
+  local raw src dest link tmp how="file"
+  raw="${BASH_SOURCE[0]:-$0}"
   dest="/usr/local/sbin/gorecshit"
   link="/usr/local/bin/gorecshit"
   mkdir -p /usr/local/sbin /usr/local/bin
-  if [[ ! -f "$src" ]]; then
-    warn "Не удалось определить путь скрипта для установки CLI (BASH_SOURCE=${BASH_SOURCE[0]:-?})"
-    return 0
-  fi
-  # Refuse to install a broken symlink-download stub (content is just "install.sh")
-  local first
-  first="$(head -1 "$src" 2>/dev/null || true)"
-  if [[ "$first" != "#!"* ]]; then
-    warn "Источник CLI не похож на скрипт (первая строка: ${first:0:40}) — пропуск установки команды"
-    return 0
-  fi
-  local tmp
   tmp="$(mktemp /usr/local/sbin/gorecshit.XXXXXX)"
-  cp -f "$src" "$tmp"
+
+  # Classify source: regular on-disk file vs process-substitution / pipe fd
+  src=""
+  if [[ -n "$raw" && "$raw" != "-" && "$raw" != "/dev/stdin" && "$raw" != "stdin" \
+        && "$raw" != /dev/fd/* && "$raw" != /proc/self/fd/* && "$raw" != /proc/*/fd/* ]]; then
+    # On-disk path — resolve symlinks only for real files
+    if [[ -f "$raw" ]]; then
+      src="$raw"
+      if command -v readlink >/dev/null 2>&1; then
+        src="$(readlink -f "$raw" 2>/dev/null || echo "$raw")"
+      fi
+    fi
+  fi
+
+  if [[ -n "$src" && -f "$src" ]] && _cli_script_looks_valid "$src"; then
+    cp -f "$src" "$tmp"
+    how="file:$src"
+  else
+    # Prefer early process-substitution snapshot (taken at script start)
+    if [[ -n "${_GORECSHIT_SELF_SNAPSHOT:-}" && -f "${_GORECSHIT_SELF_SNAPSHOT}" ]] \
+        && _cli_script_looks_valid "${_GORECSHIT_SELF_SNAPSHOT}"; then
+      cp -f "${_GORECSHIT_SELF_SNAPSHOT}" "$tmp"
+      how="snapshot:${_GORECSHIT_SELF_SNAPSHOT}"
+    else
+      # Try copying from BASH_SOURCE only if seekable regular file (never read a pipe — would break running script)
+      local fd_src="$raw"
+      if [[ -n "$fd_src" && "$fd_src" != "-" && -f "$fd_src" && -r "$fd_src" ]] \
+          && [[ "$fd_src" == /dev/fd/* || "$fd_src" == /proc/self/fd/* ]]; then
+        if cp -f "$fd_src" "$tmp" 2>/dev/null && _cli_script_looks_valid "$tmp"; then
+          how="fd:$fd_src"
+        else
+          : >"$tmp"
+        fi
+      fi
+    fi
+    if ! _cli_script_looks_valid "$tmp"; then
+      log "Источник не файл на диске (BASH_SOURCE=${raw:-?}) — скачиваю полный скрипт для установки команды"
+      if _cli_download_full_script_to "$tmp"; then
+        how="download:${_CLI_DL_URL}"
+      else
+        rm -f "$tmp"
+        warn "Не удалось установить команду gorecshit (нет локального файла и не скачалось с GitHub/jsDelivr). BASH_SOURCE=${raw:-?}"
+        return 0
+      fi
+    fi
+  fi
+
   chmod 755 "$tmp"
   mv -f "$tmp" "$dest"
   chmod 755 "$dest"
   ln -sfn "$dest" "$link"
-  # Make sure common PATHs see it
   hash -r 2>/dev/null || true
-  ok "Команда gorecshit установлена ($dest → v${VERSION}; symlink $link)"
+  ok "Команда gorecshit установлена ($dest → v${VERSION}; symlink $link; via ${how})"
 }
 
 self_update_from_github() {
