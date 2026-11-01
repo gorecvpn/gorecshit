@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# gorecshit v2.2.5 — one-command hardening for Remnawave VPN node servers (Debian 11+/Ubuntu 20.04+)
+# gorecshit v2.2.6 — one-command hardening for Remnawave VPN node servers (Debian 11+/Ubuntu 20.04+)
 # Usage:
 #   bash install.sh --panel-ip X.X.X.X [--node-port 2222] [--yes]
 #   bash install.sh --check --panel-ip X.X.X.X
@@ -8,7 +8,7 @@
 # Does NOT restart Docker while remnanode/xray is live. Does NOT deploy itself.
 set -Eeuo pipefail
 
-VERSION="2.2.5"
+VERSION="2.2.6"
 SCRIPT_NAME="gorecshit"
 BACKUP_ROOT="/root/hardening-backups"
 
@@ -122,6 +122,35 @@ warn() { _log_line WARN "$*"; printf '%b[%s]%b %s\n' "${C_YEL}" "WARN" "${C_RESE
 err()  { _log_line ERR "$*";  printf '%b[%s]%b %s\n' "${C_RED}" "ERR " "${C_RESET}" "$*" >&2; }
 step() { _log_line STEP "$*"; printf '\n%b==>%b %b%s%b\n' "${C_CYN}" "${C_RESET}" "${C_BOLD}" "$*" "${C_RESET}"; }
 
+# Interactive I/O: under `curl|bash` / `bash <(curl)` stdin is the script; use /dev/tty.
+can_prompt_user() {
+  [[ "$ASSUME_YES" -eq 0 ]] || return 1
+  [[ -r /dev/tty ]] && return 0
+  [[ -t 0 && -t 1 ]] && return 0
+  return 1
+}
+
+read_user_input() {
+  # read_user_input VAR — reads one line from /dev/tty if available, else stdin
+  local __ru_var="$1"
+  if [[ -r /dev/tty ]]; then
+    IFS= read -r "$__ru_var" < /dev/tty || true
+  else
+    IFS= read -r "$__ru_var" || true
+  fi
+}
+
+prompt_user() {
+  # prompt_user "text" VAR — print prompt (to tty if possible) and read answer
+  local __msg="$1" __var="$2"
+  if [[ -w /dev/tty ]]; then
+    printf '%s' "$__msg" > /dev/tty
+  else
+    printf '%s' "$__msg"
+  fi
+  read_user_input "$__var"
+}
+
 on_error() {
   local ec=$?
   err "Failed at line ${BASH_LINENO[0]} (exit ${ec}). Backups: ${BACKUP_DIR:-n/a}"
@@ -150,8 +179,8 @@ Required (non-interactive apply):
 
 Options:
   --node-port PORT|auto      remnanode API port (default: auto from /opt/remnanode/.env)
-  --client-ports LIST|auto   Comma-separated TCP client ports (default: auto via ss xray/rw-core)
-  --client-udp-ports LIST|auto  Comma-separated UDP client ports (hysteria2 etc; default: auto)
+  --client-ports LIST|auto   TCP client ports (default: auto from xray inbounds / LISTEN ss, not ephemeral)
+  --client-udp-ports LIST|auto  UDP client ports (default: auto from xray inbounds; ss fallback excludes ephemeral)
   --mode direct|cdn          direct: open detected xray ports; cdn: open 80/443, keep internal xray closed
   --allow-ssh-from IP,...    Extra IPs always allowed (SSH ignore + never-block)
   --ssh-port N               Add SSH listen port N (ufw first, sshd -t, keep 22 until confirmed)
@@ -383,14 +412,13 @@ prompt_panel_ip() {
     err "--panel-ip is required (or set GORECSHIT_PANEL_IP). Refusing non-interactive without it."
     exit 2
   fi
-  if [[ ! -t 0 ]]; then
-    err "No TTY and --panel-ip missing. Pass --panel-ip X.X.X.X"
+  if ! can_prompt_user; then
+    err "Нет интерактива (/dev/tty) и --panel-ip не задан. Передайте --panel-ip X.X.X.X"
     exit 2
   fi
   local ans=""
   while true; do
-    printf 'Введите IPv4 панели / management (обязательно): '
-    read -r ans || true
+    prompt_user 'Введите IPv4 панели / management (обязательно): ' ans
     if is_ipv4 "$ans"; then
       PANEL_IP="$ans"
       break
@@ -983,8 +1011,12 @@ interactive_menu() {
     menu_sep
     printf '  %b0)%b 🚪 Выход\n' "${C_BOLD}" "${C_RESET}"
     printf '%bCLI: gorecshit [--status|--update|--yes|--modules …]%b\n' "${C_GREY}" "${C_RESET}"
-    printf '%bВыберите пункт [0-7]:%b ' "${C_BOLD}" "${C_RESET}"
-    read -r choice || true
+    if [[ -w /dev/tty ]]; then
+      printf '%bВыберите пункт [0-7]:%b ' "${C_BOLD}" "${C_RESET}" > /dev/tty
+    else
+      printf '%bВыберите пункт [0-7]:%b ' "${C_BOLD}" "${C_RESET}"
+    fi
+    read_user_input choice
     case "$choice" in
       1)
         apply_modules_csv "all"
@@ -1035,9 +1067,8 @@ interactive_select_modules() {
   echo "  1 ufw  2 blocklist  3 hide_ports  4 anti_probe  5 ssh"
   echo "  6 stealth  7 fail2ban  8 sysctl  9 hostname  10 docker"
   echo "  (или: minimum — UFW+SSH+fail2ban+blocklist+BBR)"
-  printf 'Номера: '
   local ans
-  read -r ans || true
+  prompt_user 'Номера: ' ans
   if [[ -z "$ans" ]]; then
     selected="all"
   elif [[ "$ans" == "minimum" || "$ans" == "min" ]]; then
@@ -1092,6 +1123,235 @@ preflight() {
   fi
 }
 
+# --- client port detection (inbounds over ephemeral ss noise) ---
+EPHEMERAL_LO=32768
+EPHEMERAL_HI=60999
+
+load_ephemeral_port_range() {
+  EPHEMERAL_LO=32768
+  EPHEMERAL_HI=60999
+  if [[ -r /proc/sys/net/ipv4/ip_local_port_range ]]; then
+    read -r EPHEMERAL_LO EPHEMERAL_HI < /proc/sys/net/ipv4/ip_local_port_range || true
+  fi
+  [[ "$EPHEMERAL_LO" =~ ^[0-9]+$ ]] || EPHEMERAL_LO=32768
+  [[ "$EPHEMERAL_HI" =~ ^[0-9]+$ ]] || EPHEMERAL_HI=60999
+}
+
+is_ephemeral_port() {
+  local p="$1"
+  [[ "$p" =~ ^[0-9]+$ ]] || return 1
+  (( p >= EPHEMERAL_LO && p <= EPHEMERAL_HI ))
+}
+
+is_excluded_service_port() {
+  local p="$1" node="${2:-}"
+  case "$p" in
+    22|53|68|323|2222|3000|4430|62789) return 0 ;;
+  esac
+  [[ -n "$node" && "$p" == "$node" ]] && return 0
+  [[ -n "${SSH_PORT_NEW:-}" && "$p" == "$SSH_PORT_NEW" ]] && return 0
+  return 1
+}
+
+parse_inbound_ports_from_json() {
+  # JSON on stdin -> lines "tcp PORT" / "udp PORT"
+  python3 -c '
+import json, sys, re
+
+def add_port(bucket, p):
+    if p is None or isinstance(p, bool):
+        return
+    if isinstance(p, int):
+        if 1 <= p <= 65535:
+            bucket.append(p)
+        return
+    s = str(p).strip()
+    if not s:
+        return
+    for part in re.split(r"[,\s]+", s):
+        if not part:
+            continue
+        if "-" in part and not part.startswith("-"):
+            a, b = part.split("-", 1)
+            if a.isdigit() and b.isdigit():
+                lo, hi = int(a), int(b)
+                if 0 < lo <= hi <= 65535 and hi - lo <= 64:
+                    bucket.extend(range(lo, hi + 1))
+            continue
+        if part.isdigit():
+            x = int(part)
+            if 1 <= x <= 65535:
+                bucket.append(x)
+
+def network_of(ib):
+    ss = ib.get("streamSettings") or ib.get("stream_settings") or {}
+    return (ss.get("network") or ib.get("network") or "").lower()
+
+def proto_family(ib):
+    p = (ib.get("protocol") or ib.get("type") or "").lower()
+    net = network_of(ib)
+    if p in ("hysteria", "hysteria2", "hy2", "tuic", "wireguard"):
+        return "udp"
+    if p in ("shadowsocks", "dokodemo-door"):
+        return "both"
+    if p in ("vless", "vmess", "trojan", "http", "socks"):
+        if net in ("quic", "kcp"):
+            return "udp"
+        return "tcp"
+    if net in ("quic", "http3", "kcp"):
+        return "udp"
+    return "tcp"
+
+raw = sys.stdin.read()
+if not raw.strip():
+    raise SystemExit(0)
+try:
+    cfg = json.loads(raw)
+except Exception:
+    raise SystemExit(0)
+if not isinstance(cfg, dict):
+    raise SystemExit(0)
+inbounds = cfg.get("inbounds") or cfg.get("inbound") or []
+if isinstance(inbounds, dict):
+    inbounds = list(inbounds.values())
+if not isinstance(inbounds, list):
+    raise SystemExit(0)
+seen = set()
+for ib in inbounds:
+    if not isinstance(ib, dict):
+        continue
+    tag = str(ib.get("tag") or "").lower()
+    if tag in ("api", "metrics", "stats"):
+        continue
+    fam = proto_family(ib)
+    ports = []
+    add_port(ports, ib.get("port"))
+    add_port(ports, ib.get("listen_port"))
+    for pr in ports:
+        for f in (("tcp", "udp") if fam == "both" else (fam,)):
+            key = (f, pr)
+            if key in seen:
+                continue
+            seen.add(key)
+            print("%s %s" % (f, pr))
+' 2>/dev/null || true
+}
+
+collect_xray_config_json() {
+  local cjson="" cand cname f
+  if command -v docker >/dev/null 2>&1; then
+    cname="$(docker ps --format '{{.Names}}' 2>/dev/null | grep -iE 'remnanode' | head -1 || true)"
+    if [[ -n "$cname" ]]; then
+      for cand in \
+        /var/lib/remnanode/xray/config.json \
+        /var/lib/remnanode/config.json \
+        /etc/xray/config.json \
+        /usr/local/etc/xray/config.json \
+        /tmp/xray/config.json \
+        /opt/xray/config.json; do
+        cjson="$(docker exec "$cname" sh -c "test -f '$cand' && cat '$cand'" 2>/dev/null || true)"
+        if printf '%s' "$cjson" | grep -q '"inbounds"'; then
+          printf '%s\n' "$cjson"
+          return 0
+        fi
+      done
+      cand="$(docker exec "$cname" sh -c 'find /var/lib /etc /tmp /run /opt -name "config.json" 2>/dev/null | head -20' 2>/dev/null || true)"
+      while IFS= read -r f; do
+        [[ -n "$f" ]] || continue
+        cjson="$(docker exec "$cname" sh -c "cat '$f' 2>/dev/null" 2>/dev/null || true)"
+        if printf '%s' "$cjson" | grep -q '"inbounds"'; then
+          printf '%s\n' "$cjson"
+          return 0
+        fi
+      done <<<"$cand"
+    fi
+  fi
+  for cand in \
+    /var/lib/remnanode/xray/config.json \
+    /usr/local/etc/xray/config.json \
+    /etc/xray/config.json; do
+    if [[ -f "$cand" ]] && grep -q '"inbounds"' "$cand" 2>/dev/null; then
+      cat "$cand"
+      return 0
+    fi
+  done
+  local pid
+  pid="$(pgrep -n rw-core 2>/dev/null || pgrep -n xray 2>/dev/null || true)"
+  if [[ -n "$pid" && -d "/proc/$pid/root" ]]; then
+    for cand in \
+      "/proc/$pid/root/var/lib/remnanode/xray/config.json" \
+      "/proc/$pid/root/etc/xray/config.json" \
+      "/proc/$pid/root/usr/local/etc/xray/config.json"; do
+      if [[ -f "$cand" ]] && grep -q '"inbounds"' "$cand" 2>/dev/null; then
+        cat "$cand"
+        return 0
+      fi
+    done
+  fi
+  return 1
+}
+
+detect_ports_from_inbounds_config() {
+  local json line fam port found=0
+  json="$(collect_xray_config_json || true)"
+  [[ -n "$json" ]] || return 1
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    fam="${line%% *}"
+    port="${line##* }"
+    [[ "$port" =~ ^[0-9]+$ ]] || continue
+    if is_excluded_service_port "$port" "${DETECTED_NODE_PORT:-}"; then
+      continue
+    fi
+    if [[ "$fam" == "tcp" ]]; then
+      DETECTED_CLIENT_PORTS+=("$port"); found=1
+    elif [[ "$fam" == "udp" ]]; then
+      DETECTED_CLIENT_UDP_PORTS+=("$port"); found=1
+    fi
+  done < <(printf '%s\n' "$json" | parse_inbound_ports_from_json)
+  [[ "$found" -eq 1 ]]
+}
+
+detect_ports_from_ss_filtered() {
+  local line addr port proc node_ex="${1:-3000}" have_cfg_udp="${2:-0}"
+  command -v ss >/dev/null 2>&1 || return 0
+  while IFS= read -r line; do
+    addr="$(ss_local_addr "$line")"
+    port="${addr##*:}"; port="${port%%]*}"
+    [[ "$port" =~ ^[0-9]+$ ]] || continue
+    is_excluded_service_port "$port" "$node_ex" && continue
+    ss_is_loopback_addr "$addr" && continue
+    is_ephemeral_port "$port" && continue
+    proc=""
+    if [[ "$line" == *'users:(('* ]]; then
+      proc="$(sed -n 's/.*users:(("\([^"]*\).*/\1/p' <<<"$line" | head -1 || true)"
+    fi
+    case "$proc" in
+      xray|rw-core|remnanode|rw-node|Xray|sing-box|singbox|hysteria|hysteria2|hy2)
+        DETECTED_CLIENT_PORTS+=("$port") ;;
+    esac
+  done < <(ss -lntp 2>/dev/null | awk 'NR>1' || true)
+
+  [[ "$have_cfg_udp" -eq 1 ]] && return 0
+  while IFS= read -r line; do
+    addr="$(ss_local_addr "$line")"
+    port="${addr##*:}"; port="${port%%]*}"
+    [[ "$port" =~ ^[0-9]+$ ]] || continue
+    is_excluded_service_port "$port" "$node_ex" && continue
+    ss_is_loopback_addr "$addr" && continue
+    is_ephemeral_port "$port" && continue
+    proc=""
+    if [[ "$line" == *'users:(('* ]]; then
+      proc="$(sed -n 's/.*users:(("\([^"]*\).*/\1/p' <<<"$line" | head -1 || true)"
+    fi
+    case "$proc" in
+      xray|rw-core|remnanode|rw-node|Xray|sing-box|singbox|hysteria|hysteria2|hy2)
+        DETECTED_CLIENT_UDP_PORTS+=("$port") ;;
+    esac
+  done < <(ss -lnup 2>/dev/null | awk 'NR>1' || true)
+}
+
+
 detect_remnanode() {
   step "Detect remnanode / listeners"
   DETECTED_NODE_PORT=""
@@ -1142,45 +1402,23 @@ detect_remnanode() {
   fi
 
   local exclude_port="${DETECTED_NODE_PORT:-3000}"
-  # Detect ALL client TCP/UDP ports from xray/rw-core/remnanode/sing-box — never hardcode 443/8443
-  if command -v ss >/dev/null 2>&1; then
-    local line addr port proc
-    while IFS= read -r line; do
-      addr="$(ss_local_addr "$line")"
-      port="${addr##*:}"
-      port="${port%%]*}"
-      if [[ ! "$port" =~ ^[0-9]+$ ]]; then continue; fi
-      if [[ "$port" == "22" || "$port" == "$exclude_port" || "$port" == "${SSH_PORT_NEW:-}" ]]; then continue; fi
-      if ss_is_loopback_addr "$addr"; then continue; fi
-      proc=""
-      if [[ "$line" == *'users:(('* ]]; then
-        proc="$(sed -n 's/.*users:(("\([^"]*\).*/\1/p' <<<"$line" | head -1 || true)"
-      fi
-      case "$proc" in
-        xray|rw-core|remnanode|rw-node|Xray|sing-box|singbox|hysteria|hysteria2|hy2)
-          DETECTED_CLIENT_PORTS+=("$port")
-          ;;
-      esac
-    done < <(ss -lntp 2>/dev/null | awk 'NR>1' || true)
+  load_ephemeral_port_range
+  log "Эфемерный диапазон: ${EPHEMERAL_LO}-${EPHEMERAL_HI} (исключаем из auto-detect)"
 
-    while IFS= read -r line; do
-      addr="$(ss_local_addr "$line")"
-      port="${addr##*:}"
-      port="${port%%]*}"
-      if [[ ! "$port" =~ ^[0-9]+$ ]]; then continue; fi
-      if [[ "$port" == "53" || "$port" == "68" || "$port" == "323" ]]; then continue; fi
-      if ss_is_loopback_addr "$addr"; then continue; fi
-      proc=""
-      if [[ "$line" == *'users:(('* ]]; then
-        proc="$(sed -n 's/.*users:(("\([^"]*\).*/\1/p' <<<"$line" | head -1 || true)"
-      fi
-      case "$proc" in
-        xray|rw-core|remnanode|rw-node|Xray|sing-box|singbox|hysteria|hysteria2|hy2)
-          DETECTED_CLIENT_UDP_PORTS+=("$port")
-          ;;
-      esac
-    done < <(ss -lnup 2>/dev/null | awk 'NR>1' || true)
+  local cfg_ok=0 have_cfg_udp=0
+  DETECTED_CLIENT_PORTS=()
+  DETECTED_CLIENT_UDP_PORTS=()
+  if detect_ports_from_inbounds_config; then
+    cfg_ok=1
+    if [[ ${#DETECTED_CLIENT_UDP_PORTS[@]} -gt 0 ]]; then
+      have_cfg_udp=1
+    fi
+    ok "Порты из xray inbounds: tcp=[${DETECTED_CLIENT_PORTS[*]:-}] udp=[${DETECTED_CLIENT_UDP_PORTS[*]:-}]"
+  else
+    log "Конфиг inbounds недоступен — fallback ss (без ephemeral ${EPHEMERAL_LO}-${EPHEMERAL_HI})"
   fi
+
+  detect_ports_from_ss_filtered "$exclude_port" "$have_cfg_udp"
 
   if [[ ${#DETECTED_CLIENT_PORTS[@]} -gt 0 ]]; then
     mapfile -t DETECTED_CLIENT_PORTS < <(printf '%s\n' "${DETECTED_CLIENT_PORTS[@]}" | sort -n -u)
@@ -1217,7 +1455,7 @@ detect_remnanode() {
   ok "NODE_PORT=${NODE_PORT}"
   ok "CLIENT_PORTS(tcp)=${CLIENT_PORTS:-<none>}"
   ok "CLIENT_UDP_PORTS=${CLIENT_UDP_PORTS:-<none>}"
-  ok "MODE=${MODE}"
+  ok "MODE=${MODE} ephemeral_excluded=${EPHEMERAL_LO}-${EPHEMERAL_HI}"
 }
 
 
@@ -2529,10 +2767,9 @@ maybe_apply_docker_daemon_restart() {
   if [[ "$FORCE_DOCKER_RESTART" -eq 1 ]]; then
     do_it=1
     log "Перезапуск Docker (--docker-restart)"
-  elif [[ -t 0 && -t 1 && "$ASSUME_YES" -eq 0 ]]; then
-    printf '%bПерезапустить Docker сейчас? Нода отключится на ~10-30 сек [y/N]:%b ' "${C_BOLD}" "${C_RESET}"
+  elif can_prompt_user; then
     local ans=""
-    read -r ans || true
+    prompt_user $'Перезапустить Docker сейчас? Нода отключится на ~10-30 сек [y/N]: ' ans
     if [[ "$ans" =~ ^[Yy]$ ]]; then
       do_it=1
     else
@@ -2947,12 +3184,11 @@ main() {
   detect_remnanode
   write_rollback_script
 
-  if [[ "$ASSUME_YES" -eq 0 && "$DRY_RUN" -eq 0 && -t 0 ]]; then
+  if [[ "$ASSUME_YES" -eq 0 && "$DRY_RUN" -eq 0 ]] && can_prompt_user; then
     echo
     log "Будет применён hardening: panel=${PANEL_IP} node_port=${NODE_PORT} clients=${CLIENT_PORTS} udp=${CLIENT_UDP_PORTS} mode=${MODE} relays=${RELAY_IPS}"
-    printf 'Продолжить? [y/N] '
     local ans
-    read -r ans || true
+    prompt_user 'Продолжить? [y/N] ' ans
     [[ "$ans" =~ ^[Yy]$ ]] || { warn "Отменено"; exit 0; }
   fi
 

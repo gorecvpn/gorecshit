@@ -2,7 +2,7 @@
 
 Однокомандное hardening-окружение для **нод Remnawave** (Debian 11+ / Ubuntu 20.04+).
 
-**Версия: 2.2.5**
+**Версия: 2.2.6**
 
 Скрипт идемпотентен: его можно запускать повторно. IP панели **не зашит** в репозиторий — его нужно передать параметром `--panel-ip` (или выбрать в интерактивном меню).
 
@@ -11,7 +11,7 @@
 ## Что делает
 
 1. **Preflight** — root, определение ОС, бэкап всех затрагиваемых файлов в `/root/hardening-backups/<timestamp>/` + `rollback.sh`.
-2. **Автодетект remnanode** — `/opt/remnanode/.env` (`NODE_PORT` / `APP_PORT`), docker compose; клиентские **TCP и UDP** порты через `ss` у процессов xray/rw-core/remnanode/sing-box/hysteria (**без хардкода 443/8443**). Явно: `--client-ports`, `--client-udp-ports`.
+2. **Автодетект remnanode** — `/opt/remnanode/.env` (`NODE_PORT` / `APP_PORT`), docker compose; клиентские **TCP и UDP** порты из xray **inbounds** (fallback: `ss` LISTEN вне ephemeral; UDP без эфемерного диапазона). Явно: `--client-ports`, `--client-udp-ports`.
 3. **Интерактивное меню (RU)** — при запуске в TTY без `--yes`: статус-строка + простые пункты с emoji (plain `read` + ANSI, whiptail не обязателен).
 4. **Пакеты** — `ufw`, `fail2ban`, `ipset`, `chrony`, `curl`; при отключении IPv6 — `Acquire::ForceIPv4`.
 5. **UFW** — deny incoming (**DROP**), logging low; `limit 22/tcp`; клиентские TCP/UDP порты; `NODE_PORT` **только с IP панели**; deny публичного `4443/tcp`; whitelist HAProxy-релеев; анти-lockout (`$SSH_CLIENT`, `--allow-ssh-from`, `--relay-ips`).
@@ -62,6 +62,11 @@ sudo bash gorecshit.sh --dpi-check
 На зарубежной VPS обычно всё OK — это нормально (российский DPI на пути ноды нет). Модуль полезен как диагностика egress/DNS ноды.
 
 ## Changelog
+
+### v2.2.6
+
+- Auto-detect клиентских портов: сначала xray **inbounds** (docker exec / config.json); ss-fallback **исключает** `ip_local_port_range` (эфемерные UDP UNCONN rw-core); не берёт 2222/3000/53
+- Интерактив через `/dev/tty`: меню и вопросы (в т.ч. перезапуск Docker) работают при `bash <(curl …)` и `curl | bash`
 
 ### v2.2.5
 
