@@ -2,7 +2,7 @@
 
 Однокомандное hardening-окружение для **нод Remnawave** (Debian 11+ / Ubuntu 20.04+).
 
-**Версия: 2.2.0**
+**Версия: 2.2.1**
 
 Скрипт идемпотентен: его можно запускать повторно. IP панели **не зашит** в репозиторий — его нужно передать параметром `--panel-ip` (или выбрать в интерактивном меню).
 
@@ -16,9 +16,9 @@
 4. **Пакеты** — `ufw`, `fail2ban`, `ipset`, `chrony`, `curl`; при отключении IPv6 — `Acquire::ForceIPv4`.
 5. **UFW** — deny incoming (**DROP**), logging low; `limit 22/tcp`; клиентские TCP/UDP порты; `NODE_PORT` **только с IP панели**; deny публичного `4443/tcp`; whitelist HAProxy-релеев; анти-lockout (`$SSH_CLIENT`, `--allow-ssh-from`, `--relay-ips`).
 6. **Скрытие портов и ping** — ICMP echo-request → DROP; закрытые порты без RST/REJECT (DROP); не светить unreachable.
-7. **Anti-probing** — на **всех** автодетектнутых/указанных клиентских портах: hashlimit/connlimit (CGNAT-friendly) + recent soft-ban. Не ломает REALITY.
+7. **Anti-probing** — на клиентских портах только для **NEW**; `ESTABLISHED,RELATED` всегда в обход (без hashlimit/connlimit на датаплейне). Потолки NAT-friendly; **без** xt_recent soft-ban. Не ломает REALITY.
 8. **DOCKER-USER** — ограничение `NODE_PORT` на bridge-publish; Docker **не перезапускается**, пока живы remnanode/xray.
-9. **sysctl** — BBR + `fq`, буферы 32MB; опционально `--tcp-timestamps-off`; IPv6 off; `nofile` 1048576.
+9. **sysctl / скорость** — BBR + `fq`, буферы **64MB**, `tcp_fastopen=3`, `tcp_slow_start_after_idle=0`, `tcp_mtu_probing=1`, `tcp_notsent_lowat=16384`, `somaxconn`/`netdev_max_backlog`, `conntrack_max`, `txqueuelen=10000`, `irqbalance`; `nf_conntrack_tcp_be_liberal=1`; IPv6 **включён по умолчанию** (`--ipv6-off` опционально); `nofile` 1048576; `--tcp-timestamps-off` опционально.
 10. **SSH** — Banner none, MaxAuthTries 3, опция `--ssh-port N` (сначала UFW, `sshd -t`, **22 сохраняется**). Парольный и root-логин **не** отключаются. fail2ban sshd + **recidive**; сканеры из ipset режутся до SSH.
 11. **Блоклист сканеров** — ipset + weekly timer; **зеркала** raw.githubusercontent.com → cdn.jsdelivr.net / fastly.jsdelivr.net; `--blocklist-from`; never-block для панели/релеев/`$SSH_CLIENT`/private/bogons.
 12. **Стелс** — нейтральный hostname `web-<hex>`, без баннеров, предупреждение о лишних слушателях, отключение nginx default site; NODE_PORT только с панели.
@@ -61,6 +61,15 @@ sudo bash gorecshit.sh --dpi-check
 На зарубежной VPS обычно всё OK — это нормально (российский DPI на пути ноды нет). Модуль полезен как диагностика egress/DNS ноды.
 
 ## Changelog
+
+### v2.2.1
+
+- **IPv6 по умолчанию включён** (отключение только через `--ipv6-off`): под живым dual-stack xray `disable_ipv6=1` ломало сессии
+- Всегда `net.netfilter.nf_conntrack_tcp_be_liberal=1` — меньше ложных INVALID при UFW `ctstate INVALID DROP` / NAT
+- Anti-probe: **сначала** `ESTABLISHED,RELATED`; лимиты только на **NEW**; UDP тоже NEW-only; убран xt_recent 10‑минутный soft-ban; потолки подняты (TCP ~600/min burst 1200, connlimit 2000)
+- На INPUT — ранний `ACCEPT` для ESTABLISHED/RELATED (горячий путь до fail2ban/antiprobe)
+- ipset `scanner-block` в UFW before.rules только для **NEW**
+- **Тюнинг скорости (safe defaults):** BBR + `fq` на default iface; буферы 64MB (`rmem`/`wmem`/`tcp_rmem`/`tcp_wmem`); `tcp_fastopen=3`; `tcp_slow_start_after_idle=0`; `tcp_mtu_probing=1`; `tcp_notsent_lowat=16384`; `somaxconn=4096`; `netdev_max_backlog=16384`; `nf_conntrack_max=1048576`; `nofile=1048576` (limits + systemd + docker remnanode); `txqueuelen=10000`; `irqbalance` (best-effort). `tcp_timestamps` по умолчанию не трогаем; без MSS clamp
 
 ### v2.2.0
 
@@ -131,7 +140,8 @@ sudo bash install.sh --panel-ip X.X.X.X --modules ufw,blocklist,hide_ports,anti_
 | `--modules LIST` | `ufw,blocklist,hide_ports,anti_probe,ssh,stealth,fail2ban,sysctl,hostname,docker` или `all`/`minimum`. |
 | `--no-hide-ports` / `--no-anti-probe` / `--no-stealth` | Отключить соответствующие модули. |
 | `--tcp-timestamps-off` | `net.ipv4.tcp_timestamps=0`. |
-| `--no-ipv6-off` / `--no-blocklist` / `--no-hostname` / … | Как в v2.0. |
+| `--ipv6-off` | Опционально отключить IPv6 (по умолчанию IPv6 **остаётся**). |
+| `--no-ipv6-off` / `--no-blocklist` / `--no-hostname` / … | Как в v2.0 (`--no-ipv6-off` = поведение по умолчанию). |
 | `--yes` | Без подтверждения / без меню. |
 | `--dry-run` / `--check` | Только план. |
 | `--refresh-lists` | Только обновить ipset-списки. |

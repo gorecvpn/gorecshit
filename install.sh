@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# gorecshit v2.2 — one-command hardening for Remnawave VPN node servers (Debian 11+/Ubuntu 20.04+)
+# gorecshit v2.2.1 — one-command hardening for Remnawave VPN node servers (Debian 11+/Ubuntu 20.04+)
 # Usage:
 #   bash install.sh --panel-ip X.X.X.X [--node-port 2222] [--yes]
 #   bash install.sh --check --panel-ip X.X.X.X
@@ -8,7 +8,7 @@
 # Does NOT restart Docker while remnanode/xray is live. Does NOT deploy itself.
 set -Eeuo pipefail
 
-VERSION="2.2.0"
+VERSION="2.2.1"
 SCRIPT_NAME="gorecshit"
 BACKUP_ROOT="/root/hardening-backups"
 TS="$(date +%Y%m%d-%H%M%S)"
@@ -24,7 +24,7 @@ MODE="direct"             # direct | cdn
 ALLOW_SSH_FROM=""
 # HAProxy relays — never block (scanner ipset / fail2ban / UFW ACCEPT before DROP)
 RELAY_IPS="188.225.24.250,188.225.27.46"
-IPV6_OFF=1
+IPV6_OFF=0
 DO_BLOCKLIST=1
 DO_HOSTNAME=1
 DO_DOCKER_USER=1
@@ -128,7 +128,8 @@ Options:
   --blocklist-from SRC       Copy/fetch blocklist from ssh-host, URL, or local path (fallback)
   --modules LIST             Comma modules: ufw,blocklist,hide_ports,anti_probe,ssh,stealth,
                              fail2ban,sysctl,hostname,docker (default: all enabled)
-  --no-ipv6-off              Keep IPv6 enabled
+  --ipv6-off                 Opt-in: disable IPv6 via sysctl (default: keep IPv6 on; safer under dual-stack xray)
+  --no-ipv6-off              Keep IPv6 enabled (default; retained for compatibility)
   --no-blocklist             Skip scanner ipset blocklist
   --no-hostname              Do not change hostname
   --no-hide-ports            Skip ICMP/closed-port hiding
@@ -288,6 +289,7 @@ parse_args() {
       --ssh-port) SSH_PORT_NEW="${2:-}"; shift 2 ;;
       --blocklist-from) BLOCKLIST_FROM="${2:-}"; shift 2 ;;
       --modules) MODULES_CSV="${2:-}"; shift 2 ;;
+      --ipv6-off) IPV6_OFF=1; shift ;;
       --no-ipv6-off) IPV6_OFF=0; shift ;;
       --no-blocklist) DO_BLOCKLIST=0; shift ;;
       --no-hostname) DO_HOSTNAME=0; shift ;;
@@ -1105,24 +1107,31 @@ configure_sysctl() {
     QDISC="fq_codel"
   fi
 
-  local body="# Managed by ${SCRIPT_NAME} ${VERSION} — BBR + ${QDISC}
+  local body="# Managed by ${SCRIPT_NAME} ${VERSION} — BBR + ${QDISC} + throughput buffers
 net.core.default_qdisc = ${QDISC}
 net.ipv4.tcp_congestion_control = bbr
-net.core.rmem_max = 33554432
-net.core.wmem_max = 33554432
+net.core.rmem_max = 67108864
+net.core.wmem_max = 67108864
 net.core.rmem_default = 1048576
 net.core.wmem_default = 1048576
-net.ipv4.tcp_rmem = 4096 87380 33554432
-net.ipv4.tcp_wmem = 4096 65536 33554432
+net.ipv4.tcp_rmem = 4096 131072 67108864
+net.ipv4.tcp_wmem = 4096 131072 67108864
 net.core.somaxconn = 4096
 net.core.netdev_max_backlog = 16384
 net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_mtu_probing = 1
 net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_notsent_lowat = 16384
 fs.file-max = 2097152
 net.netfilter.nf_conntrack_max = 1048576
 "
   write_content /etc/sysctl.d/99-zz-bbr.conf "$body"
+
+  # Always liberal conntrack: UFW drops INVALID; without this, NAT/asymmetric TCP can kill live VPN flows
+  write_content /etc/sysctl.d/99-conntrack-liberal.conf \
+"# Managed by ${SCRIPT_NAME} ${VERSION}
+net.netfilter.nf_conntrack_tcp_be_liberal = 1
+"
 
   if [[ "$IPV6_OFF" -eq 1 ]]; then
     write_content /etc/sysctl.d/99-disable-ipv6.conf \
@@ -1130,10 +1139,25 @@ net.netfilter.nf_conntrack_max = 1048576
 net.ipv6.conf.default.disable_ipv6 = 1
 net.ipv6.conf.lo.disable_ipv6 = 1
 "
-    ok "IPv6 disable sysctl written"
+    # remove enable override if present
+    if [[ "$DRY_RUN" -eq 0 && -f /etc/sysctl.d/99-enable-ipv6.conf ]]; then
+      rm -f /etc/sysctl.d/99-enable-ipv6.conf
+    fi
+    ok "IPv6 disable sysctl written (--ipv6-off)"
   else
-    if [[ "$DRY_RUN" -eq 0 && -f /etc/sysctl.d/99-disable-ipv6.conf ]]; then
-      log "Leaving IPv6 settings (--no-ipv6-off)"
+    # Default: keep IPv6. Remove prior disable file so re-runs heal dual-stack xray nodes.
+    if [[ "$DRY_RUN" -eq 0 ]]; then
+      if [[ -f /etc/sysctl.d/99-disable-ipv6.conf ]]; then
+        backup_file /etc/sysctl.d/99-disable-ipv6.conf
+        rm -f /etc/sysctl.d/99-disable-ipv6.conf
+        ok "Removed 99-disable-ipv6.conf (IPv6 kept by default)"
+      fi
+      write_content /etc/sysctl.d/99-enable-ipv6.conf \
+"# Managed by ${SCRIPT_NAME} ${VERSION} — xray often listens dual-stack; IPv6 off is opt-in (--ipv6-off)
+net.ipv6.conf.all.disable_ipv6 = 0
+net.ipv6.conf.default.disable_ipv6 = 0
+net.ipv6.conf.lo.disable_ipv6 = 0
+"
     fi
   fi
 
@@ -1144,10 +1168,50 @@ net.ipv6.conf.lo.disable_ipv6 = 1
 
   if [[ "$DRY_RUN" -eq 0 ]]; then
     sysctl --system >/dev/null 2>&1 || sysctl -p /etc/sysctl.d/99-zz-bbr.conf >/dev/null 2>&1 || true
+    # default_qdisc=fq only affects new devices; force fq + txqueuelen on default route iface
+    local iface
+    iface="$(ip -o route show default 2>/dev/null | awk '{print $5; exit}' || true)"
+    if [[ -n "$iface" ]]; then
+      tc qdisc replace dev "$iface" root fq 2>/dev/null || tc qdisc change dev "$iface" root fq 2>/dev/null || true
+      ip link set dev "$iface" txqueuelen 10000 2>/dev/null || true
+    fi
+    # Persist NIC tune across reboot (no docker restart)
+    write_content /usr/local/sbin/gorecshit-nic-tune.sh \
+'#!/bin/bash
+IFACE=$(ip -o route show default 2>/dev/null | awk '"'"'{print $5; exit}'"'"')
+[ -n "$IFACE" ] || exit 0
+ip link set dev "$IFACE" txqueuelen 10000 2>/dev/null || true
+tc qdisc replace dev "$IFACE" root fq 2>/dev/null || true
+'
+    chmod 755 /usr/local/sbin/gorecshit-nic-tune.sh
+    write_content /etc/systemd/system/gorecshit-nic-tune.service \
+"[Unit]
+Description=gorecshit NIC txqueuelen + fq
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/gorecshit-nic-tune.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+"
+    systemctl daemon-reload
+    systemctl enable --now gorecshit-nic-tune.service >/dev/null 2>&1 || true
+    # irqbalance best-effort (spreads NIC IRQs; skip quietly if unavailable)
+    if ! command -v irqbalance >/dev/null 2>&1; then
+      apt-get install -y -qq irqbalance >/dev/null 2>&1 || true
+    fi
+    if command -v irqbalance >/dev/null 2>&1; then
+      systemctl enable --now irqbalance >/dev/null 2>&1 || true
+      ok "irqbalance enabled"
+    fi
   else
-    printf '%b[DRY]%b sysctl --system\n' "${C_YEL}" "${C_RESET}"
+    printf '%b[DRY]%b sysctl --system + tc fq + txqueuelen 10000 + irqbalance\n' "${C_YEL}" "${C_RESET}"
   fi
-  ok "Sysctl applied (cc=bbr qdisc=${QDISC})"
+  ok "Sysctl applied (cc=bbr qdisc=${QDISC}; buffers=64MB; tcp_notsent_lowat=16384; tcp_be_liberal=1; ipv6_off=${IPV6_OFF})"
 }
 
 configure_ssh() {
@@ -1312,7 +1376,7 @@ hook_ufw_before_rules() {
     insert+="-A ufw-before-input -s ${a} -j ACCEPT"$'\n'
   done < <(foreach_csv_ip "$RELAY_IPS")
   if [[ "$DO_BLOCKLIST" -eq 1 ]]; then
-    insert+="-A ufw-before-input -m set --match-set scanner-block src -j DROP"$'\n'
+    insert+="-A ufw-before-input -m conntrack --ctstate NEW -m set --match-set scanner-block src -j DROP"$'\n'
   fi
   insert+="# gorecshit-managed-end"$'\n'
 
@@ -1365,8 +1429,12 @@ configure_hide_ports() {
 
   # UFW: deny = DROP (not REJECT)
   sed -i 's/^DEFAULT_INPUT_POLICY=.*/DEFAULT_INPUT_POLICY="DROP"/' /etc/default/ufw || true
-  # Ensure IPV6 similarly if present
-  sed -i 's/^IPV6=.*/IPV6=no/' /etc/default/ufw 2>/dev/null || true
+  # UFW IPv6 follows IPV6_OFF (default: keep IPv6)
+  if [[ "$IPV6_OFF" -eq 1 ]]; then
+    sed -i 's/^IPV6=.*/IPV6=no/' /etc/default/ufw 2>/dev/null || true
+  else
+    sed -i 's/^IPV6=.*/IPV6=yes/' /etc/default/ufw 2>/dev/null || true
+  fi
   ufw logging low || true
   ufw default deny incoming || true
   ufw default allow outgoing || true
@@ -1414,20 +1482,24 @@ configure_anti_probe() {
   backup_file "$unit"
 
   if [[ "$DRY_RUN" -eq 1 ]]; then
-    printf '%b[DRY]%b anti-probe TCP=%s UDP=%s (hashlimit >60/min burst 120, connlimit ~200)\n' \
+    printf '%b[DRY]%b anti-probe TCP=%s UDP=%s (ESTABLISHED first; NEW-only hashlimit 600/min burst 1200, connlimit 2000; no recent-ban)\n' \
       "${C_YEL}" "${C_RESET}" "${CLIENT_PORTS}" "${CLIENT_UDP_PORTS}"
     return 0
   fi
 
-  # Generous for CGNAT: 60 new conn/min with burst 120; connlimit 200 per /32
-  # Apply on INPUT for new connections to client ports; never touch panel/relays/ssh client
+  # Throughput rules:
+  #  - ESTABLISHED,RELATED always bypass (never hashlimit/connlimit/ipset on hot path)
+  #  - limits apply to NEW only; ceilings generous for CGNAT/home NAT
+  #  - no xt_recent silent 10m ban (banned legit NAT clients after reconnect bursts)
   {
     echo '#!/bin/bash'
     echo "# Managed by ${SCRIPT_NAME} ${VERSION}"
     echo 'set -euo pipefail'
     echo 'CHAIN=GORECSHIT-ANTIPROBE'
     echo 'iptables -N "$CHAIN" 2>/dev/null || iptables -F "$CHAIN"'
-    echo '# never-block first'
+    echo '# Hot path: established client traffic never rate-limited'
+    echo 'iptables -A "$CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN'
+    echo '# never-block (panel / ssh client / relays)'
     echo "iptables -A \"\$CHAIN\" -s ${PANEL_IP} -j RETURN"
     [[ -n "$SSH_CLIENT_IP" ]] && echo "iptables -A \"\$CHAIN\" -s ${SSH_CLIENT_IP} -j RETURN"
     while IFS= read -r a; do
@@ -1437,28 +1509,31 @@ configure_anti_probe() {
       echo "iptables -A \"\$CHAIN\" -s ${a} -j RETURN"
     done < <(foreach_csv_ip "$RELAY_IPS")
     for p in "${ports_tcp[@]}"; do
-      echo "iptables -A \"\$CHAIN\" -p tcp --dport ${p} -m conntrack --ctstate NEW -m connlimit --connlimit-above 200 --connlimit-mask 32 -j DROP"
-      echo "iptables -A \"\$CHAIN\" -p tcp --dport ${p} -m conntrack --ctstate NEW -m hashlimit --hashlimit-name gs_ap_${p} --hashlimit-mode srcip --hashlimit-above 60/min --hashlimit-burst 120 --hashlimit-htable-expire 120000 -j DROP"
-      # recent-module soft ban for repeat offenders (10 hits / 60s → drop 10 min)
-      echo "iptables -A \"\$CHAIN\" -p tcp --dport ${p} -m conntrack --ctstate NEW -m recent --name gs_probe_${p} --rcheck --seconds 600 --hitcount 1 -j DROP"
-      echo "iptables -A \"\$CHAIN\" -p tcp --dport ${p} -m conntrack --ctstate NEW -m hashlimit --hashlimit-name gs_apmark_${p} --hashlimit-mode srcip --hashlimit-above 90/min --hashlimit-burst 150 -m recent --name gs_probe_${p} --set -j DROP"
+      echo "iptables -A \"\$CHAIN\" -p tcp --dport ${p} -m conntrack --ctstate NEW -m connlimit --connlimit-above 2000 --connlimit-mask 32 -j DROP"
+      echo "iptables -A \"\$CHAIN\" -p tcp --dport ${p} -m conntrack --ctstate NEW -m hashlimit --hashlimit-name gs_ap_${p} --hashlimit-mode srcip --hashlimit-above 600/min --hashlimit-burst 1200 --hashlimit-htable-expire 120000 -j DROP"
     done
     for p in "${ports_udp[@]}"; do
-      echo "iptables -A \"\$CHAIN\" -p udp --dport ${p} -m hashlimit --hashlimit-name gs_apu_${p} --hashlimit-mode srcip --hashlimit-above 120/min --hashlimit-burst 240 --hashlimit-htable-expire 120000 -j DROP"
+      # NEW only — never limit established UDP flows (hy2/tuic data plane)
+      echo "iptables -A \"\$CHAIN\" -p udp --dport ${p} -m conntrack --ctstate NEW -m hashlimit --hashlimit-name gs_apu_${p} --hashlimit-mode srcip --hashlimit-above 1200/min --hashlimit-burst 2400 --hashlimit-htable-expire 120000 -j DROP"
     done
     echo 'iptables -A "$CHAIN" -j RETURN'
-    echo '# Hook into ufw-before-input if present, else INPUT'
+    echo '# Hook into ufw-before-input if present, else INPUT (after ESTABLISHED hotpath if any)'
     echo 'if iptables -L ufw-before-input -n >/dev/null 2>&1; then'
     echo '  iptables -C ufw-before-input -j "$CHAIN" 2>/dev/null || iptables -I ufw-before-input 4 -j "$CHAIN"'
     echo 'else'
     echo '  iptables -C INPUT -j "$CHAIN" 2>/dev/null || iptables -I INPUT 1 -j "$CHAIN"'
     echo 'fi'
+    echo '# INPUT hot-path: ACCEPT ESTABLISHED/RELATED before fail2ban/antiprobe jumps'
+    echo 'while iptables -C INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null; do'
+    echo '  iptables -D INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT || break'
+    echo 'done'
+    echo 'iptables -I INPUT 1 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT'
   } >"$script"
   chmod 755 "$script"
 
   cat >"$unit" <<EOF
 [Unit]
-Description=gorecshit anti-probe rate limits on client ports
+Description=gorecshit anti-probe rate limits on client ports (NEW only; ESTABLISHED first)
 After=network.target ufw.service
 Wants=ufw.service
 
@@ -1473,7 +1548,7 @@ EOF
   systemctl daemon-reload
   systemctl enable gorecshit-anti-probe.service >/dev/null 2>&1 || true
   "$script" || warn "anti-probe apply returned non-zero"
-  ok "Anti-probe установлен на TCP=[${CLIENT_PORTS}] UDP=[${CLIENT_UDP_PORTS}] (CGNAT-friendly)"
+  ok "Anti-probe TCP=[${CLIENT_PORTS}] UDP=[${CLIENT_UDP_PORTS}] (ESTABLISHED bypass; NEW-only NAT-friendly limits; no recent-ban)"
 }
 
 configure_ufw() {
