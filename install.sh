@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# gorecshit v2.1 — one-command hardening for Remnawave VPN node servers (Debian 11+/Ubuntu 20.04+)
+# gorecshit v2.2 — one-command hardening for Remnawave VPN node servers (Debian 11+/Ubuntu 20.04+)
 # Usage:
 #   bash install.sh --panel-ip X.X.X.X [--node-port 2222] [--yes]
 #   bash install.sh --check --panel-ip X.X.X.X
@@ -8,7 +8,7 @@
 # Does NOT restart Docker while remnanode/xray is live. Does NOT deploy itself.
 set -Eeuo pipefail
 
-VERSION="2.1.0"
+VERSION="2.2.0"
 SCRIPT_NAME="gorecshit"
 BACKUP_ROOT="/root/hardening-backups"
 TS="$(date +%Y%m%d-%H%M%S)"
@@ -50,6 +50,7 @@ CHECK_ONLY=0
 DO_ROLLBACK=0
 DO_REFRESH_LISTS_ONLY=0
 DO_STATUS_ONLY=0
+DO_DPI_CHECK=0
 INTERACTIVE=0
 LOG_FILE="/var/log/gorecshit.log"
 
@@ -70,8 +71,10 @@ NGINX_PRESENT=0
 if [[ -t 1 ]] || [[ "${FORCE_COLOR:-0}" == "1" ]]; then
   C_RESET='\033[0m'; C_RED='\033[0;31m'; C_GRN='\033[0;32m'
   C_YEL='\033[0;33m'; C_BLU='\033[0;34m'; C_CYN='\033[0;36m'; C_BOLD='\033[1m'
+  C_DIM='\033[2m'; C_GREY='\033[90m'
 else
   C_RESET=''; C_RED=''; C_GRN=''; C_YEL=''; C_BLU=''; C_CYN=''; C_BOLD=''
+  C_DIM=''; C_GREY=''
 fi
 
 _log_ts() { date '+%Y-%m-%d %H:%M:%S %z'; }
@@ -110,6 +113,7 @@ Usage:
   install.sh --dry-run --panel-ip X.X.X.X [options]
   install.sh --refresh-lists         # only refresh scanner blocklist
   install.sh --status                # show hardening status
+  install.sh --dpi-check             # outbound DPI / DNS / TLS checks (node egress)
 
 Required (non-interactive apply):
   --panel-ip IP              Management/panel host allowed to reach NODE_PORT
@@ -141,6 +145,7 @@ Options:
   --dry-run, --check         Print actions / verify plan only; make no changes
   --refresh-lists            Only run scanner-block refresh
   --status                   Show current hardening status
+  --dpi-check                Check DPI/DNS/TLS from this node (egress diagnostics)
   --rollback / --uninstall   Restore latest backup under /root/hardening-backups/
   -h, --help                 Show this help
 
@@ -300,6 +305,7 @@ parse_args() {
       --dry-run|--check) DRY_RUN=1; CHECK_ONLY=1; shift ;;
       --refresh-lists) DO_REFRESH_LISTS_ONLY=1; shift ;;
       --status) DO_STATUS_ONLY=1; shift ;;
+      --dpi-check) DO_DPI_CHECK=1; shift ;;
       --rollback|--uninstall) DO_ROLLBACK=1; shift ;;
       -h|--help) usage; exit 0 ;;
       *) err "Unknown option: $1"; usage; exit 2 ;;
@@ -334,7 +340,7 @@ parse_args() {
 
 prompt_panel_ip() {
   if [[ -n "$PANEL_IP" ]]; then return 0; fi
-  if [[ "$DO_ROLLBACK" -eq 1 || "$DO_STATUS_ONLY" -eq 1 || "$DO_REFRESH_LISTS_ONLY" -eq 1 ]]; then return 0; fi
+  if [[ "$DO_ROLLBACK" -eq 1 || "$DO_STATUS_ONLY" -eq 1 || "$DO_REFRESH_LISTS_ONLY" -eq 1 || "$DO_DPI_CHECK" -eq 1 ]]; then return 0; fi
   if [[ "$ASSUME_YES" -eq 1 ]]; then
     err "--panel-ip is required (or set GORECSHIT_PANEL_IP). Refusing non-interactive without it."
     exit 2
@@ -384,10 +390,80 @@ remnanode_running() {
 }
 
 # ---------- Interactive Russian menu ----------
+menu_sep() {
+  printf '%b%s%b\n' "${C_DIM}" "────────────────────────────────────────" "${C_RESET}"
+}
+
+# Compact one-line status for the menu header (no secrets).
+print_menu_status_line() {
+  local ufw_s="ufw off" f2b_s="fail2ban off" ipset_n=0 ports="" active=1
+  local marker_ok=0
+
+  if [[ -d "$MARKER_DIR" ]] || [[ -x /usr/local/sbin/scanner-block-refresh.sh ]]; then
+    marker_ok=1
+  fi
+
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qiE 'Status:\s*active'; then
+    ufw_s="ufw on"
+  else
+    active=0
+  fi
+
+  if command -v fail2ban-client >/dev/null 2>&1 && fail2ban-client ping 2>/dev/null | grep -qi pong; then
+    f2b_s="fail2ban on"
+  else
+    # also accept systemd active without ping
+    if systemctl is-active --quiet fail2ban 2>/dev/null; then
+      f2b_s="fail2ban on"
+    else
+      active=0
+    fi
+  fi
+
+  if command -v ipset >/dev/null 2>&1 && ipset list scanner-block >/dev/null 2>&1; then
+    ipset_n="$(ipset list scanner-block 2>/dev/null | grep -cE '^[0-9]' || true)"
+    ipset_n="${ipset_n:-0}"
+  else
+    active=0
+  fi
+
+  # Client ports: prefer live VPN process listeners; else UFW client-* rules; else —
+  ports="$(
+    { ss -lntup 2>/dev/null || true; } \
+      | grep -E 'xray|rw-core|remnanode|sing-box|hysteria|xhttp' \
+      | grep -oE ':[0-9]+' | tr -d ':' | sort -nu | head -8 | tr '\n' ',' | sed 's/,$//' || true
+  )"
+  if [[ -z "$ports" ]] && command -v ufw >/dev/null 2>&1; then
+    ports="$(
+      ufw status 2>/dev/null | grep -oE 'client-[0-9]+' | grep -oE '[0-9]+' | sort -nu | head -8 | tr '\n' ',' | sed 's/,$//' || true
+    )"
+  fi
+  if [[ -z "$ports" ]]; then
+    ports="—"
+  fi
+
+  if [[ "$marker_ok" -eq 0 && "$active" -eq 1 ]]; then
+    # tools present but gorecshit may not have been applied
+    :
+  fi
+
+  if [[ "$active" -eq 1 && "$ipset_n" -gt 0 ]]; then
+    printf '%b✅ Защита: активна%b%b · %s · %s · ipset %s подсетей · порты: %s%b\n' \
+      "${C_GRN}" "${C_RESET}" "${C_GREY}" "$ufw_s" "$f2b_s" "$ipset_n" "$ports" "${C_RESET}"
+  elif [[ "$ufw_s" == "ufw on" ]]; then
+    printf '%b⚠️  Защита: частично%b%b · %s · %s · ipset %s подсетей · порты: %s%b\n' \
+      "${C_YEL}" "${C_RESET}" "${C_GREY}" "$ufw_s" "$f2b_s" "$ipset_n" "$ports" "${C_RESET}"
+  else
+    printf '%b❌ Защита: не активна%b%b · %s · %s · ipset %s подсетей · порты: %s%b\n' \
+      "${C_RED}" "${C_RESET}" "${C_GREY}" "$ufw_s" "$f2b_s" "$ipset_n" "$ports" "${C_RESET}"
+  fi
+}
+
 show_status_summary() {
   step "Статус hardening"
   echo "Версия скрипта: ${VERSION}"
   echo "Hostname: $(hostname 2>/dev/null || true)"
+  print_menu_status_line
   if command -v ufw >/dev/null 2>&1; then
     echo "---- UFW ----"
     ufw status verbose 2>/dev/null | head -35 || true
@@ -408,34 +484,288 @@ show_status_summary() {
   [[ -d "$BACKUP_ROOT" ]] && echo "Бэкапы: $(find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l) шт. в $BACKUP_ROOT"
 }
 
+# ---------- DPI / DNS / TLS egress checks (bash + curl/openssl/timeout) ----------
+# Inspired by Runnin4ik/dpi-detector, adapted for a VPN *node* (outbound path).
+# No GitHub installs, no Python/rich/httpx. Never prints secrets.
+
+_dpi_have() { command -v "$1" >/dev/null 2>&1; }
+
+_dpi_pad() {
+  # ~4KB alphanumeric pad for fat-header probes (TCP 16–20KB style)
+  local n="${1:-4000}"
+  if [[ -r /dev/urandom ]]; then
+    head -c "$((n * 2))" /dev/urandom 2>/dev/null | base64 2>/dev/null | tr -d '\n+/=' | head -c "$n"
+  else
+    printf '%*s' "$n" '' | tr ' ' 'A'
+  fi
+}
+
+_dpi_resolve_doh() {
+  # Resolve A via Cloudflare DoH JSON (truth reference). Prints first A or empty.
+  local host="$1"
+  local raw
+  raw="$(timeout 8 curl -fsS -H 'accept: application/dns-json' \
+    "https://cloudflare-dns.com/dns-query?name=${host}&type=A" 2>/dev/null || true)"
+  printf '%s' "$raw" | tr '{}' '\n' | grep -oE '"data":"[0-9.]+"' | head -1 | cut -d'"' -f4
+}
+
+_dpi_resolve_system() {
+  local host="$1"
+  local ip=""
+  ip="$(getent ahostsv4 "$host" 2>/dev/null | awk '/STREAM|RAW|DGRAM/ {print $1; exit}')"
+  if [[ -z "$ip" ]]; then
+    ip="$(getent hosts "$host" 2>/dev/null | awk '{print $1; exit}')"
+  fi
+  printf '%s' "$ip"
+}
+
+_dpi_tls_probe() {
+  # Args: host [sni] [ip]  → prints STATUS|detail
+  local host="$1"
+  local sni="${2:-$1}"
+  local ip="${3:-}"
+  local connect_to
+  if [[ -n "$ip" ]]; then
+    connect_to="${ip}:443"
+  else
+    connect_to="${host}:443"
+  fi
+  local out ec=0
+  # -brief is OpenSSL 1.1.1+; fall back to classic output on older builds
+  out="$(timeout 8 openssl s_client -connect "$connect_to" -servername "$sni" -brief </dev/null 2>&1)" || ec=$?
+  if ! printf '%s' "$out" | grep -qiE 'CONNECTION ESTABLISHED|Protocol version|Cipher|Verify return code'; then
+    ec=0
+    out="$(timeout 8 openssl s_client -connect "$connect_to" -servername "$sni" </dev/null 2>&1)" || ec=$?
+  fi
+  if printf '%s' "$out" | grep -qiE 'CONNECTION ESTABLISHED|Protocol version|Cipher|Verify return code|SSL-Session'; then
+    local proto cipher
+    proto="$(printf '%s' "$out" | grep -iE 'Protocol version|Protocol *:' | head -1 | sed 's/.*: *//' | tr -d '\r')"
+    cipher="$(printf '%s' "$out" | grep -iE 'Cipher *(|Ciphersuite|Cipher is)' | head -1 | sed 's/.*: *//;s/.*Cipher is //' | tr -d '\r')"
+    printf 'OK|%s %s' "${proto:-tls}" "${cipher:-ok}"
+    return 0
+  fi
+  if [[ "$ec" -eq 124 ]]; then
+    printf 'TLS DROP|handshake timeout (возможный SNI/DPI drop)'
+    return 1
+  fi
+  if printf '%s' "$out" | grep -qiE 'Connection reset|errno=104|ECONNRESET'; then
+    printf 'TLS RST|TCP RST на ClientHello'
+    return 1
+  fi
+  if printf '%s' "$out" | grep -qiE 'Connection refused|ECONNREFUSED'; then
+    printf 'REFUSED|порт закрыт'
+    return 1
+  fi
+  if printf '%s' "$out" | grep -qiE 'Name or service not known|getaddrinfo|NXDOMAIN'; then
+    printf 'DNS FAIL|не резолвится'
+    return 1
+  fi
+  printf 'FAIL|%s' "$(printf '%s' "$out" | tr '\n' ' ' | head -c 80)"
+  return 1
+}
+
+_dpi_tcp_connect() {
+  local host="$1" port="${2:-443}"
+  if timeout 5 bash -c "echo >/dev/tcp/${host}/${port}" 2>/dev/null; then
+    printf 'OK'
+    return 0
+  fi
+  printf 'FAIL'
+  return 1
+}
+
+_dpi_fat_probe() {
+  # Lightweight TCP 16–20KB style: keep-alive HTTP/1.1 HEAD with growing X-Pad.
+  # Target: host:443 via curl. Returns OK|DETECTED@Nkb|TIMEOUT|FAIL
+  local host="$1"
+  local ip="${2:-}"
+  local pad i sent_kb=0
+  local resolve=()
+  pad="$(_dpi_pad 4000)"
+  [[ -z "$pad" ]] && pad="$(printf 'A%.0s' {1..4000})"
+  if [[ -n "$ip" ]]; then
+    resolve=(--resolve "${host}:443:${ip}")
+  fi
+  # warmup (no pad)
+  if ! timeout 10 curl -fsS -o /dev/null --http1.1 --connect-timeout 5 -m 8 \
+      "${resolve[@]}" "https://${host}/" -I 2>/dev/null; then
+    # try without -I / allow insecure for DPI labs
+    if ! timeout 10 curl -ksS -o /dev/null --http1.1 --connect-timeout 5 -m 8 \
+        "${resolve[@]}" "https://${host}/" -I 2>/dev/null; then
+      printf 'UNREACH|не удалось установить TLS'
+      return 1
+    fi
+  fi
+  for i in 1 2 3 4 5 6 7 8; do
+    sent_kb=$((i * 4))
+    if ! timeout 12 curl -ksS -o /dev/null --http1.1 --connect-timeout 5 -m 10 \
+        "${resolve[@]}" -H "X-Pad: ${pad}" -H "Connection: keep-alive" \
+        "https://${host}/" -I 2>/dev/null; then
+      if [[ "$sent_kb" -ge 12 ]]; then
+        printf 'DETECTED|обрыв около %sKB (TCP16-20 стиль)' "$sent_kb"
+      else
+        printf 'TIMEOUT|обрыв рано (~%sKB)' "$sent_kb"
+      fi
+      return 1
+    fi
+  done
+  printf 'OK|прошли ~%sKB без обрыва' "$sent_kb"
+  return 0
+}
+
+_dpi_row() {
+  # printf table row: col1 col2 col3
+  printf '  %-22s %-14s %s\n' "$1" "$2" "$3"
+}
+
+run_dpi_check() {
+  step "Проверка DPI / DNS / TLS (egress с ноды)"
+  echo "Источник идей: github.com/Runnin4ik/dpi-detector — облегчённый bash-порт для VPN-ноды."
+  echo "Инструменты: bash, curl, openssl, timeout (без Python/GitHub-установок)."
+  echo
+
+  local have_curl=0 have_openssl=0
+  _dpi_have curl && have_curl=1
+  _dpi_have openssl && have_openssl=1
+  if [[ "$have_curl" -eq 0 ]]; then
+    err "нужен curl"; return 1
+  fi
+
+  # --- 1) DNS spoof / stub check ---
+  echo "=== 1) DNS: систем vs DoH (Cloudflare) ==="
+  _dpi_row "домен" "результат" "system → doh"
+  menu_sep
+  local doms=( "vk.ru" "google.com" "discord.com" "meduza.io" "instagram.com" "youtube.com" "x.com" "cloudflare.com" )
+  # Known RU ISP stub / sinkhole patterns (subset; heuristic only)
+  local stub_re='^(1\.1\.1\.1|0\.0\.0\.0|127\.|10\.|192\.0\.2\.|198\.18\.|198\.51\.100\.|203\.0\.113\.|255\.255\.255\.255)'
+  local d sys doh verdict
+  for d in "${doms[@]}"; do
+    sys="$(_dpi_resolve_system "$d")"
+    doh="$(_dpi_resolve_doh "$d")"
+    if [[ -z "$sys" && -z "$doh" ]]; then
+      verdict="DNS FAIL"
+    elif [[ -z "$sys" ]]; then
+      verdict="DNS FAIL (system)"
+    elif [[ -n "$sys" && "$sys" =~ $stub_re ]]; then
+      verdict="DNS FAKE/stub?"
+    elif [[ -n "$doh" && -n "$sys" && "$sys" != "$doh" ]]; then
+      # Different A is not always spoof (CDN geo); flag only if sys looks private/stub-like
+      if [[ "$sys" =~ ^(100\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.) ]]; then
+        verdict="DNS FAKE?"
+      else
+        verdict="DIFF (CDN/geo)"
+      fi
+    else
+      verdict="OK"
+    fi
+    _dpi_row "$d" "$verdict" "${sys:-—} → ${doh:-—}"
+  done
+  echo
+
+  # --- 2) TLS reachability to known domains ---
+  echo "=== 2) TLS reachability (SNI=hostname) ==="
+  _dpi_row "домен" "результат" "деталь"
+  menu_sep
+  local tdoms=( "vk.ru" "google.com" "cloudflare.com" "discord.com" "meduza.io" "www.instagram.com" "www.youtube.com" "github.com" )
+  local res detail status
+  if [[ "$have_openssl" -eq 1 ]]; then
+    for d in "${tdoms[@]}"; do
+      res="$(_dpi_tls_probe "$d" "$d" || true)"
+      status="${res%%|*}"
+      detail="${res#*|}"
+      _dpi_row "$d" "$status" "$detail"
+    done
+  else
+    warn "openssl не найден — TLS-пробы через curl -I"
+    for d in "${tdoms[@]}"; do
+      if timeout 8 curl -ksS -o /dev/null --connect-timeout 5 -m 8 -I "https://${d}/" 2>/dev/null; then
+        _dpi_row "$d" "OK" "HTTP HEAD ok"
+      else
+        _dpi_row "$d" "FAIL" "curl HEAD failed"
+      fi
+    done
+  fi
+  echo
+
+  # --- 3) SNI-based drop: same Cloudflare IP, different SNI ---
+  echo "=== 3) SNI-фильтр (один IP Cloudflare, разный SNI) ==="
+  local cf_ip
+  cf_ip="$(_dpi_resolve_doh www.cloudflare.com)"
+  [[ -z "$cf_ip" ]] && cf_ip="$(_dpi_resolve_system www.cloudflare.com)"
+  [[ -z "$cf_ip" ]] && cf_ip="1.1.1.1"
+  echo "IP: ${cf_ip}"
+  _dpi_row "SNI" "результат" "деталь"
+  menu_sep
+  local snis=( "www.cloudflare.com" "discord.com" "meduza.io" "www.instagram.com" "vk.ru" )
+  if [[ "$have_openssl" -eq 1 ]]; then
+    for d in "${snis[@]}"; do
+      res="$(_dpi_tls_probe "$cf_ip" "$d" "$cf_ip" || true)"
+      status="${res%%|*}"
+      detail="${res#*|}"
+      # Cert mismatch on open CDN IP is normal if SNI host isn't served there —
+      # distinguish handshake drop vs cert/alert.
+      _dpi_row "$d" "$status" "$detail"
+    done
+  else
+    warn "openssl нет — секция SNI пропущена"
+  fi
+  echo
+
+  # --- 4) TCP 16–20KB-style fat probes on a few CDNs ---
+  echo "=== 4) TCP 16–20KB-стиль (fat HEAD / X-Pad ~32KB) ==="
+  _dpi_row "цель" "результат" "деталь"
+  menu_sep
+  # Compact targets (host + optional pin IP). Keep short for node health.
+  local targets=(
+    "cloudflare.com|"
+    "www.cloudflare.com|"
+    "discord.com|"
+    "github.com|"
+  )
+  local t host tip
+  for t in "${targets[@]}"; do
+    host="${t%%|*}"
+    tip="${t#*|}"
+    res="$(_dpi_fat_probe "$host" "$tip" || true)"
+    status="${res%%|*}"
+    detail="${res#*|}"
+    _dpi_row "$host" "$status" "$detail"
+  done
+  echo
+
+  # --- 5) Quick TCP connect to common ports / self REALITY note ---
+  echo "=== 5) Локальные слушатели (нода) ==="
+  local lp
+  lp="$(ss -lntH 2>/dev/null | awk '{print $4}' | grep -oE '[0-9]+$' | sort -nu | tr '\n' ' ')"
+  echo "  TCP listen: ${lp:-нет данных}"
+  if remnanode_running 2>/dev/null; then
+    ok "remnanode/xray контейнер жив (DPI-check его не трогает)"
+  else
+    warn "remnanode не виден — проверьте docker ps отдельно"
+  fi
+  echo
+  ok "DPI-check завершён. На зарубежной VPS чаще всего всё OK — это нормально (DPI у провайдера РФ)."
+  echo "Если DETECTED/TLS DROP на EU-ноде — смотрите firewall/маршрут хостера, не «российский DPI»."
+}
+
 interactive_menu() {
-  : # interactive mode
   local choice=""
   while true; do
-    if command -v whiptail >/dev/null 2>&1; then
-      choice="$(whiptail --title "gorecshit ${VERSION}" --menu "Выберите действие:" 22 72 12 \
-        "1" "Всё (рекомендуется) — полный hardening" \
-        "2" "Минимум — UFW + SSH + fail2ban + blocklist + BBR" \
-        "3" "Выборочно — отметить модули" \
-        "4" "Проверка (--check) — без изменений" \
-        "5" "Откат (--rollback)" \
-        "6" "Обновить списки сканеров" \
-        "7" "Статус" \
-        "8" "Выход" \
-        3>&1 1>&2 2>&3)" || { warn "Отменено"; exit 0; }
-    else
-      printf '\n%bgorecshit %s%b — меню\n' "${C_BOLD}" "$VERSION" "${C_RESET}"
-      echo "  1) Всё (рекомендуется)"
-      echo "  2) Минимум"
-      echo "  3) Выборочно (модули)"
-      echo "  4) Проверка (--check)"
-      echo "  5) Откат (--rollback)"
-      echo "  6) Обновить списки"
-      echo "  7) Статус"
-      echo "  8) Выход"
-      printf 'Выбор [1-8]: '
-      read -r choice || true
-    fi
+    echo
+    print_menu_status_line
+    menu_sep
+    printf '%b📋 Меню:%b\n' "${C_BOLD}" "${C_RESET}"
+    printf '  %b1)%b 🚀 Установить защиту (всё)\n' "${C_BOLD}" "${C_RESET}"
+    printf '  %b2)%b 🧩 Выборочная установка\n' "${C_BOLD}" "${C_RESET}"
+    printf '  %b3)%b 🔄 Обновить списки сканеров\n' "${C_BOLD}" "${C_RESET}"
+    printf '  %b4)%b 📊 Показать статус\n' "${C_BOLD}" "${C_RESET}"
+    printf '  %b5)%b 🔍 Проверка DPI/блокировок\n' "${C_BOLD}" "${C_RESET}"
+    printf '  %b6)%b ↩️  Откат\n' "${C_BOLD}" "${C_RESET}"
+    menu_sep
+    printf '  %b0)%b 🚪 Выход\n' "${C_BOLD}" "${C_RESET}"
+    printf '%bCLI: gorecshit.sh --yes|--modules|--status|--dpi-check …%b\n' "${C_GREY}" "${C_RESET}"
+    printf '%bВыберите пункт [0-6]:%b ' "${C_BOLD}" "${C_RESET}"
+    read -r choice || true
     case "$choice" in
       1)
         apply_modules_csv "all"
@@ -444,35 +774,26 @@ interactive_menu() {
         return 0
         ;;
       2)
-        apply_modules_csv "minimum"
-        prompt_panel_ip
-        ASSUME_YES=1
-        return 0
-        ;;
-      3)
         interactive_select_modules
         prompt_panel_ip
         ASSUME_YES=1
         return 0
         ;;
-      4)
-        DRY_RUN=1; CHECK_ONLY=1
-        prompt_panel_ip
-        ASSUME_YES=1
-        return 0
-        ;;
-      5)
-        DO_ROLLBACK=1
-        return 0
-        ;;
-      6)
+      3)
         DO_REFRESH_LISTS_ONLY=1
         return 0
         ;;
-      7)
+      4)
         show_status_summary
         ;;
-      8|q|Q)
+      5)
+        run_dpi_check
+        ;;
+      6)
+        DO_ROLLBACK=1
+        return 0
+        ;;
+      0|q|Q)
         exit 0
         ;;
       *)
@@ -484,42 +805,27 @@ interactive_menu() {
 
 interactive_select_modules() {
   local selected=""
-  if command -v whiptail >/dev/null 2>&1; then
-    selected="$(whiptail --title "Модули gorecshit" --checklist \
-      "Пробел — отметить, Enter — подтвердить:" 22 78 12 \
-      "ufw" "UFW firewall (deny DROP, allow clients/panel)" ON \
-      "blocklist" "Блоклист сканеров (ipset + зеркала)" ON \
-      "hide_ports" "Скрыть закрытые порты и ping (DROP ICMP)" ON \
-      "anti_probe" "Anti-probing на клиентских портах" ON \
-      "ssh" "SSH hardening (+ опционально --ssh-port)" ON \
-      "stealth" "Не выглядеть как VPN-нода" ON \
-      "fail2ban" "fail2ban sshd + recidive" ON \
-      "sysctl" "BBR / sysctl / nofile" ON \
-      "hostname" "Нейтральный hostname" ON \
-      "docker" "Docker/journald/resolv/DOCKER-USER" ON \
-      3>&1 1>&2 2>&3)" || { warn "Модули не выбраны"; exit 0; }
-    # whiptail returns quoted items
-    selected="$(echo "$selected" | tr -d '"' | tr ' ' ',')"
+  echo "Модули (введите номера через запятую, Enter = все):"
+  echo "  1 ufw  2 blocklist  3 hide_ports  4 anti_probe  5 ssh"
+  echo "  6 stealth  7 fail2ban  8 sysctl  9 hostname  10 docker"
+  echo "  (или: minimum — UFW+SSH+fail2ban+blocklist+BBR)"
+  printf 'Номера: '
+  local ans
+  read -r ans || true
+  if [[ -z "$ans" ]]; then
+    selected="all"
+  elif [[ "$ans" == "minimum" || "$ans" == "min" ]]; then
+    selected="minimum"
   else
-    echo "Модули (введите номера через запятую, Enter = все):"
-    echo "  1 ufw  2 blocklist  3 hide_ports  4 anti_probe  5 ssh"
-    echo "  6 stealth  7 fail2ban  8 sysctl  9 hostname  10 docker"
-    printf 'Номера: '
-    local ans
-    read -r ans || true
-    if [[ -z "$ans" ]]; then
-      selected="all"
-    else
-      local map=( "" ufw blocklist hide_ports anti_probe ssh stealth fail2ban sysctl hostname docker )
-      local n parts=()
-      local IFS=,
-      for n in $ans; do
-        n="$(echo "$n" | tr -d ' ')"
-        [[ "$n" =~ ^[0-9]+$ ]] && parts+=("${map[$n]}")
-      done
-      local IFS=,
-      selected="${parts[*]}"
-    fi
+    local map=( "" ufw blocklist hide_ports anti_probe ssh stealth fail2ban sysctl hostname docker )
+    local n parts=()
+    local IFS=,
+    for n in $ans; do
+      n="$(echo "$n" | tr -d ' ')"
+      [[ "$n" =~ ^[0-9]+$ ]] && parts+=("${map[$n]}")
+    done
+    local IFS=,
+    selected="${parts[*]}"
   fi
   apply_modules_csv "${selected:-all}"
   log "Выбраны модули: ufw=$DO_UFW blocklist=$DO_BLOCKLIST hide=$DO_HIDE_PORTS probe=$DO_ANTI_PROBE ssh=$DO_SSH stealth=$DO_STEALTH f2b=$DO_FAIL2BAN sysctl=$DO_SYSCTL host=$DO_HOSTNAME docker=$DO_DOCKER_JOURNAL"
@@ -2137,13 +2443,18 @@ main() {
 
   # Interactive menu when TTY and no --yes and not a one-shot action flag
   if [[ "$ASSUME_YES" -eq 0 && "$DO_ROLLBACK" -eq 0 && "$CHECK_ONLY" -eq 0 \
-        && "$DO_REFRESH_LISTS_ONLY" -eq 0 && "$DO_STATUS_ONLY" -eq 0 \
+        && "$DO_REFRESH_LISTS_ONLY" -eq 0 && "$DO_STATUS_ONLY" -eq 0 && "$DO_DPI_CHECK" -eq 0 \
         && -t 0 && -t 1 ]]; then
     interactive_menu
   fi
 
   if [[ "$DO_STATUS_ONLY" -eq 1 ]]; then
     show_status_summary
+    exit 0
+  fi
+
+  if [[ "$DO_DPI_CHECK" -eq 1 ]]; then
+    run_dpi_check
     exit 0
   fi
 

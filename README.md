@@ -2,27 +2,72 @@
 
 Однокомандное hardening-окружение для **нод Remnawave** (Debian 11+ / Ubuntu 20.04+).
 
-**Версия: 2.1.0**
+**Версия: 2.2.0**
 
 Скрипт идемпотентен: его можно запускать повторно. IP панели **не зашит** в репозиторий — его нужно передать параметром `--panel-ip` (или выбрать в интерактивном меню).
+
+Точка входа: `install.sh` (симлинк `gorecshit.sh` → тот же скрипт).
 
 ## Что делает
 
 1. **Preflight** — root, определение ОС, бэкап всех затрагиваемых файлов в `/root/hardening-backups/<timestamp>/` + `rollback.sh`.
 2. **Автодетект remnanode** — `/opt/remnanode/.env` (`NODE_PORT` / `APP_PORT`), docker compose; клиентские **TCP и UDP** порты через `ss` у процессов xray/rw-core/remnanode/sing-box/hysteria (**без хардкода 443/8443**). Явно: `--client-ports`, `--client-udp-ports`.
-3. **Интерактивное меню (RU)** — при запуске в TTY без `--yes`: пресеты «Всё / Минимум / Выборочно», Проверка, Откат, Обновить списки, Статус (whiptail или обычный read).
+3. **Интерактивное меню (RU)** — при запуске в TTY без `--yes`: статус-строка + простые пункты с emoji (plain `read` + ANSI, whiptail не обязателен).
 4. **Пакеты** — `ufw`, `fail2ban`, `ipset`, `chrony`, `curl`; при отключении IPv6 — `Acquire::ForceIPv4`.
 5. **UFW** — deny incoming (**DROP**), logging low; `limit 22/tcp`; клиентские TCP/UDP порты; `NODE_PORT` **только с IP панели**; deny публичного `4443/tcp`; whitelist HAProxy-релеев; анти-lockout (`$SSH_CLIENT`, `--allow-ssh-from`, `--relay-ips`).
 6. **Скрытие портов и ping** — ICMP echo-request → DROP; закрытые порты без RST/REJECT (DROP); не светить unreachable.
-7. **Anti-probing** — на **всех** автодетектнутых/указанных клиентских портах: hashlimit/connlimit (CGNAT-friendly: ~60 new/min burst 120, connlimit ~200/32) + recent soft-ban. Не ломает REALITY.
+7. **Anti-probing** — на **всех** автодетектнутых/указанных клиентских портах: hashlimit/connlimit (CGNAT-friendly) + recent soft-ban. Не ломает REALITY.
 8. **DOCKER-USER** — ограничение `NODE_PORT` на bridge-publish; Docker **не перезапускается**, пока живы remnanode/xray.
 9. **sysctl** — BBR + `fq`, буферы 32MB; опционально `--tcp-timestamps-off`; IPv6 off; `nofile` 1048576.
 10. **SSH** — Banner none, MaxAuthTries 3, опция `--ssh-port N` (сначала UFW, `sshd -t`, **22 сохраняется**). Парольный и root-логин **не** отключаются. fail2ban sshd + **recidive**; сканеры из ipset режутся до SSH.
-11. **Блоклист сканеров** — ipset + weekly timer; **зеркала** raw.githubusercontent.com → cdn.jsdelivr.net / fastly.jsdelivr.net; таймауты connect 8s / max 20s; параллельные загрузки; `--blocklist-from` (URL / ssh-host / файл); never-block для панели/релеев/`$SSH_CLIENT`/private/bogons.
+11. **Блоклист сканеров** — ipset + weekly timer; **зеркала** raw.githubusercontent.com → cdn.jsdelivr.net / fastly.jsdelivr.net; `--blocklist-from`; never-block для панели/релеев/`$SSH_CLIENT`/private/bogons.
 12. **Стелс** — нейтральный hostname `web-<hex>`, без баннеров, предупреждение о лишних слушателях, отключение nginx default site; NODE_PORT только с панели.
-13. **`--check` / `--rollback` / `--status` / `--refresh-lists`**.
+13. **`--check` / `--rollback` / `--status` / `--refresh-lists` / `--dpi-check`**.
+
+## Меню (TTY)
+
+```
+✅ Защита: активна · ufw on · fail2ban on · ipset N подсетей · порты: 8443
+────────────────────────────────────────
+📋 Меню:
+  1) 🚀 Установить защиту (всё)
+  2) 🧩 Выборочная установка
+  3) 🔄 Обновить списки сканеров
+  4) 📊 Показать статус
+  5) 🔍 Проверка DPI/блокировок
+  6) ↩️  Откат
+────────────────────────────────────────
+  0) 🚪 Выход
+CLI: gorecshit.sh --yes|--modules|--status|--dpi-check …
+Выберите пункт [0-6]:
+```
+
+## Проверка DPI/блокировок
+
+Облегчённый bash-порт идей из [dpi-detector](https://github.com/Runnin4ik/dpi-detector) для **egress с VPN-ноды** (без Python/rich/httpx, без установок с GitHub):
+
+1. **DNS** — сравнение system resolver vs Cloudflare DoH; эвристика stub/fake (RFC 5737, 198.18/15, private).
+2. **TLS reachability** — `openssl s_client` / curl HEAD к известным доменам (в т.ч. часто блокируемым в РФ и «белым»).
+3. **SNI-фильтр** — один IP Cloudflare, разные SNI (детект TLS DROP / RST на ClientHello).
+4. **TCP 16–20KB-стиль** — keep-alive HEAD с `X-Pad` ~4KB × 8 (~32KB), как у dpi-detector fat-probe.
+5. **Локальные слушатели** — список TCP listen + факт жизни remnanode (без рестарта Docker).
+
+```bash
+sudo bash install.sh --dpi-check
+# или
+sudo bash gorecshit.sh --dpi-check
+```
+
+На зарубежной VPS обычно всё OK — это нормально (российский DPI на пути ноды нет). Модуль полезен как диагностика egress/DNS ноды.
 
 ## Changelog
+
+### v2.2.0
+
+- Простое интерактивное меню на русском (статус-строка + emoji), без обязательного whiptail
+- Модуль `--dpi-check` / пункт меню «Проверка DPI/блокировок» (DNS / TLS / SNI / TCP16-стиль)
+- Симлинк `gorecshit.sh` → `install.sh`
+- Все прежние CLI-флаги сохранены (обратная совместимость)
 
 ### v2.1.0
 
@@ -91,6 +136,7 @@ sudo bash install.sh --panel-ip X.X.X.X --modules ufw,blocklist,hide_ports,anti_
 | `--dry-run` / `--check` | Только план. |
 | `--refresh-lists` | Только обновить ipset-списки. |
 | `--status` | Показать статус. |
+| `--dpi-check` | DNS/TLS/SNI/TCP16 egress-проверка с ноды. |
 | `--rollback` / `--uninstall` | Откат из бэкапа. |
 
 ## Откат
@@ -106,14 +152,16 @@ sudo /root/hardening-backups/<timestamp>/rollback.sh
 - Скрипт **не трогает** панель Remnawave, ключи REALITY, конфиг-профили, DNS и маскировку inbound.
 - Работает на **ноде** (VPS с remnanode), не на сервере панели.
 - На живой ноде Docker **не перезапускается**.
-- Never-block всегда включает панель `188.225.77.137` (когда передана), релеи и текущий `$SSH_CLIENT` — SSH не отрежется.
+- Never-block всегда включает панель (когда передана), релеи и текущий `$SSH_CLIENT` — SSH не отрежется.
 - FireHOL/крупные списки фильтруются: private/bogons, prefixlen&lt;12, пересечение с never-block.
+- `--dpi-check` только диагностирует egress; ничего не меняет и не рестартит сервисы.
 
 ## Требования
 
 - root
 - Debian 11+ или Ubuntu 20.04+
 - Сеть для `apt` и (опционально) загрузки блоклистов; при недоступности GitHub работают jsDelivr-зеркала и `--blocklist-from`
+- Для `--dpi-check`: `curl`, `openssl`, `timeout` (обычно уже есть)
 
 ## Лицензия
 
