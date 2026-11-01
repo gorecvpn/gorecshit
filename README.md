@@ -2,27 +2,38 @@
 
 Однокомандное hardening-окружение для **нод Remnawave** (Debian 11+ / Ubuntu 20.04+).
 
-**Версия: 2.0.0**
+**Версия: 2.1.0**
 
-Скрипт идемпотентен: его можно запускать повторно. IP панели **не зашит** в репозиторий — его нужно передать параметром `--panel-ip`.
+Скрипт идемпотентен: его можно запускать повторно. IP панели **не зашит** в репозиторий — его нужно передать параметром `--panel-ip` (или выбрать в интерактивном меню).
 
 ## Что делает
 
 1. **Preflight** — root, определение ОС, бэкап всех затрагиваемых файлов в `/root/hardening-backups/<timestamp>/` + `rollback.sh`.
-2. **Автодетект remnanode** — `/opt/remnanode/.env` (`NODE_PORT` / `APP_PORT`), docker compose; клиентские порты через `ss` (исключая NODE_PORT, 22, localhost). В режиме `cdn` (есть Caddy) открывает 80/443 и не открывает внутренний порт xray снаружи.
-3. **Пакеты** — `ufw`, `fail2ban`, `ipset`, `chrony`, `curl`; при отключении IPv6 — `Acquire::ForceIPv4`.
-4. **UFW** — deny incoming / allow outgoing; `limit 22/tcp`; клиентские порты; `NODE_PORT` **только с IP панели**; deny публичного `4443/tcp`; whitelist HAProxy-релеев; анти-lockout (текущий `$SSH_CLIENT`, `--allow-ssh-from`, `--relay-ips`).
-5. **DOCKER-USER** — ограничение `NODE_PORT` на bridge-publish (REPLY/ESTABLISHED не ломаются); Docker **не перезапускается**, пока на ноде живы remnanode/xray.
-6. **sysctl** — BBR + `fq` (fallback `fq_codel`), буферы 32MB, `somaxconn`, `tcp_fastopen=3`, `mtu_probing`, `file-max`, conntrack (если модуль есть); опционально отключение IPv6; `nofile` 1048576.
-7. **SSH** — drop-in `/etc/ssh/sshd_config.d/99-hardening.conf`: `DebianBanner no` (если поддерживается), `Banner none`, `MaxAuthTries 3`, `LoginGraceTime 20`, `MaxStartups 10:30:60`. **Парольный и root-логин не отключаются.** Проверка `sshd -t` перед reload.
-8. **fail2ban (sshd)** — bantime 1h, findtime 10m, maxretry 5; `ignoreip`: localhost + панель + SSH-клиент + `--allow-ssh-from` + relay IPs.
-9. **Блоклист сканеров** — `ipset` `hash:net` + systemd service/timer (еженедельно); при ошибке загрузки сохраняется старый список; панель/whitelist/relay никогда не попадают в DROP; хук в `ufw before.rules`.
-10. **Hostname** — нейтральный `web-<6hex>`, `/etc/hosts`, cloud-init `preserve_hostname`; timezone — только если указан `--tz` (`auto` = геолокация по IP).
-11. **Docker / journald / resolv / certbot** — ротация логов в `daemon.json` (merge без рестарта на live node), `SystemMaxUse=200M`; `chmod 600` на `.env`/compose; IPv4-only `resolv.conf` при отключённом IPv6; хуки certbot renew для caddy/nginx.
-12. **Итог / `--check`** — сводка: ufw, DOCKER-USER, nofile, cc/qdisc, listeners, fail2ban, размер blocklist, контейнер ноды. `--check` / `--dry-run` — только план, без изменений.
-13. **`--rollback` / `--uninstall`** — восстановление из последнего бэкапа.
+2. **Автодетект remnanode** — `/opt/remnanode/.env` (`NODE_PORT` / `APP_PORT`), docker compose; клиентские **TCP и UDP** порты через `ss` у процессов xray/rw-core/remnanode/sing-box/hysteria (**без хардкода 443/8443**). Явно: `--client-ports`, `--client-udp-ports`.
+3. **Интерактивное меню (RU)** — при запуске в TTY без `--yes`: пресеты «Всё / Минимум / Выборочно», Проверка, Откат, Обновить списки, Статус (whiptail или обычный read).
+4. **Пакеты** — `ufw`, `fail2ban`, `ipset`, `chrony`, `curl`; при отключении IPv6 — `Acquire::ForceIPv4`.
+5. **UFW** — deny incoming (**DROP**), logging low; `limit 22/tcp`; клиентские TCP/UDP порты; `NODE_PORT` **только с IP панели**; deny публичного `4443/tcp`; whitelist HAProxy-релеев; анти-lockout (`$SSH_CLIENT`, `--allow-ssh-from`, `--relay-ips`).
+6. **Скрытие портов и ping** — ICMP echo-request → DROP; закрытые порты без RST/REJECT (DROP); не светить unreachable.
+7. **Anti-probing** — на **всех** автодетектнутых/указанных клиентских портах: hashlimit/connlimit (CGNAT-friendly: ~60 new/min burst 120, connlimit ~200/32) + recent soft-ban. Не ломает REALITY.
+8. **DOCKER-USER** — ограничение `NODE_PORT` на bridge-publish; Docker **не перезапускается**, пока живы remnanode/xray.
+9. **sysctl** — BBR + `fq`, буферы 32MB; опционально `--tcp-timestamps-off`; IPv6 off; `nofile` 1048576.
+10. **SSH** — Banner none, MaxAuthTries 3, опция `--ssh-port N` (сначала UFW, `sshd -t`, **22 сохраняется**). Парольный и root-логин **не** отключаются. fail2ban sshd + **recidive**; сканеры из ipset режутся до SSH.
+11. **Блоклист сканеров** — ipset + weekly timer; **зеркала** raw.githubusercontent.com → cdn.jsdelivr.net / fastly.jsdelivr.net; таймауты connect 8s / max 20s; параллельные загрузки; `--blocklist-from` (URL / ssh-host / файл); never-block для панели/релеев/`$SSH_CLIENT`/private/bogons.
+12. **Стелс** — нейтральный hostname `web-<hex>`, без баннеров, предупреждение о лишних слушателях, отключение nginx default site; NODE_PORT только с панели.
+13. **`--check` / `--rollback` / `--status` / `--refresh-lists`**.
 
 ## Changelog
+
+### v2.1.0
+
+- Зеркала блоклистов (jsDelivr CDN + fastly), короткие таймауты, параллельные загрузки; `--blocklist-from`
+- Доп. источники (проверены curl 200): FireHOL level1/level2, Spamhaus DROP/EDROP, blocklist.de ssh/all, CINS army, stamparm ipsum/3, C24Be blacklist-v4 (RU AS), CyberOK Skipa (ГРЧЦ/НКЦКИ) + прежние OpenFilters/Xorlent/wdes/traffic-guard
+- Скрытие ping и закрытых портов (DROP, logging low)
+- Anti-probing на всех автодетектнутых клиентских TCP/UDP портах (не только 443/8443)
+- `--ssh-port N`, fail2ban recidive
+- Стелс-модуль (баннеры, default pages, лишние порты, опционально tcp_timestamps=0)
+- Интерактивное русское меню (whiptail/read) + `--modules`
+- `--client-udp-ports`, `--status`, `--refresh-lists`
 
 ### v2.0.0
 
@@ -41,17 +52,10 @@
 bash <(curl -Ls https://raw.githubusercontent.com/gorecvpn/gorecshit/main/install.sh) --panel-ip X.X.X.X --yes
 ```
 
-Интерактивно (спросит IP панели, если не передан):
+Интерактивно (меню на русском, спросит IP панели):
 
 ```bash
 bash <(curl -Ls https://raw.githubusercontent.com/gorecvpn/gorecshit/main/install.sh)
-```
-
-Или скачать и запустить локально:
-
-```bash
-curl -fsSL -o install.sh https://raw.githubusercontent.com/gorecvpn/gorecshit/main/install.sh
-sudo bash install.sh --panel-ip X.X.X.X --yes
 ```
 
 Проверка без изменений:
@@ -60,27 +64,34 @@ sudo bash install.sh --panel-ip X.X.X.X --yes
 sudo bash install.sh --check --panel-ip X.X.X.X
 ```
 
+Только выбранные модули:
+
+```bash
+sudo bash install.sh --panel-ip X.X.X.X --modules ufw,blocklist,hide_ports,anti_probe,ssh,fail2ban,sysctl --yes
+```
+
 ## Флаги
 
 | Флаг | Описание |
 |------|----------|
-| `--panel-ip IP` | **Обязателен** (или переменная `GORECSHIT_PANEL_IP`). Хост панели/управления, с которого разрешён `NODE_PORT`. |
-| `--node-port PORT\|auto` | Порт remnanode API (по умолчанию `auto` из `.env`, иначе `3000`). |
-| `--client-ports LIST\|auto` | Клиентские порты через запятую (по умолчанию автодетект; в `cdn` — `80,443`). |
-| `--mode direct\|cdn` | `direct` — открыть порты xray; `cdn` — 80/443, внутренний xray снаружи закрыт. |
+| `--panel-ip IP` | **Обязателен** в non-interactive (или `GORECSHIT_PANEL_IP`). |
+| `--node-port PORT\|auto` | Порт remnanode API (по умолчанию `auto`). |
+| `--client-ports LIST\|auto` | Клиентские TCP-порты (автодетект xray/rw-core/…; **без хардкода**). |
+| `--client-udp-ports LIST\|auto` | Клиентские UDP-порты (hysteria2 и т.п.). |
+| `--mode direct\|cdn` | `direct` — открыть порты xray; `cdn` — 80/443. |
 | `--allow-ssh-from IP,...` | Доп. IP в whitelist SSH / never-block. |
-| `--relay-ips IP,...` | Extra never-block / ACCEPT (по умолчанию HAProxy-релеи). Env: `GORECSHIT_RELAY_IPS`. |
-| `--no-ipv6-off` | Не отключать IPv6. |
-| `--no-blocklist` | Не ставить ipset-блоклист сканеров. |
-| `--no-hostname` | Не менять hostname. |
-| `--no-docker-user` | Не ставить DOCKER-USER ограничение `NODE_PORT`. |
-| `--no-nofile` | Не поднимать nofile до 1048576. |
-| `--no-resolv-v4` | Оставить IPv6 nameserver в resolv.conf даже при отключённом IPv6. |
-| `--no-certbot-hooks` | Не ставить certbot renew reload hooks для caddy/nginx. |
-| `--tz ZONE\|auto` | Выставить timezone (по умолчанию **не меняет**). `auto` — по IP. |
-| `--yes` | Без подтверждения. |
-| `--dry-run` / `--check` | Только печать действий / проверка плана, без изменений. |
-| `--rollback` / `--uninstall` | Откат из `/root/hardening-backups/`. |
+| `--relay-ips IP,...` | Extra never-block / ACCEPT (по умолчанию HAProxy-релеи). |
+| `--ssh-port N` | Добавить SSH-порт N (22 сохраняется). |
+| `--blocklist-from SRC` | URL / ssh-host / путь — запасной источник blocklist. |
+| `--modules LIST` | `ufw,blocklist,hide_ports,anti_probe,ssh,stealth,fail2ban,sysctl,hostname,docker` или `all`/`minimum`. |
+| `--no-hide-ports` / `--no-anti-probe` / `--no-stealth` | Отключить соответствующие модули. |
+| `--tcp-timestamps-off` | `net.ipv4.tcp_timestamps=0`. |
+| `--no-ipv6-off` / `--no-blocklist` / `--no-hostname` / … | Как в v2.0. |
+| `--yes` | Без подтверждения / без меню. |
+| `--dry-run` / `--check` | Только план. |
+| `--refresh-lists` | Только обновить ipset-списки. |
+| `--status` | Показать статус. |
+| `--rollback` / `--uninstall` | Откат из бэкапа. |
 
 ## Откат
 
@@ -94,15 +105,15 @@ sudo /root/hardening-backups/<timestamp>/rollback.sh
 
 - Скрипт **не трогает** панель Remnawave, ключи REALITY, конфиг-профили, DNS и маскировку inbound.
 - Работает на **ноде** (VPS с remnanode), не на сервере панели.
-- Не коммитьте секреты и не подставляйте реальный IP панели в публичные примеры/форки без нужды.
-- На живой ноде Docker **не перезапускается** (v2); reconnect из‑за `daemon.json` больше не делается, пока крутятся remnanode/xray.
-- Убедитесь, что текущая SSH-сессия не будет отрезана: скрипт добавляет `$SSH_CLIENT`, `--panel-ip` и relay IPs в allow/ignore.
+- На живой ноде Docker **не перезапускается**.
+- Never-block всегда включает панель `188.225.77.137` (когда передана), релеи и текущий `$SSH_CLIENT` — SSH не отрежется.
+- FireHOL/крупные списки фильтруются: private/bogons, prefixlen&lt;12, пересечение с never-block.
 
 ## Требования
 
 - root
 - Debian 11+ или Ubuntu 20.04+
-- Сеть для `apt` и (опционально) загрузки блоклистов сканеров
+- Сеть для `apt` и (опционально) загрузки блоклистов; при недоступности GitHub работают jsDelivr-зеркала и `--blocklist-from`
 
 ## Лицензия
 
