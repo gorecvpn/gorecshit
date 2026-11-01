@@ -2,7 +2,7 @@
 
 Однокомандное hardening-окружение для **нод Remnawave** (Debian 11+ / Ubuntu 20.04+).
 
-**Версия: 2.2.2**
+**Версия: 2.2.3**
 
 Скрипт идемпотентен: его можно запускать повторно. IP панели **не зашит** в репозиторий — его нужно передать параметром `--panel-ip` (или выбрать в интерактивном меню).
 
@@ -63,6 +63,12 @@ sudo bash gorecshit.sh --dpi-check
 
 ## Changelog
 
+### v2.2.3
+
+- `gorecshit.sh` больше **не symlink**, а полный скрипт (как `install.sh`) — `curl …/gorecshit.sh` больше не скачивает строку `install.sh`
+- Установка команды `gorecshit` на каждый root-запуск: `/usr/local/sbin/gorecshit` (полное содержимое) + `/usr/local/bin/gorecshit`; сообщение `[ OK ] Команда gorecshit установлена`
+- `--update` качает полный скрипт (`install.sh` / `gorecshit.sh`, GitHub + jsDelivr)
+
 ### v2.2.2
 
 - Команда **`gorecshit`**: при любом запуске ставится `/usr/local/sbin/gorecshit` + symlink `/usr/local/bin/gorecshit`
@@ -110,7 +116,9 @@ sudo bash gorecshit.sh --dpi-check
 ## Одной командой
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/gorecvpn/gorecshit/main/install.sh) --panel-ip X.X.X.X --yes
+bash <(curl -fsSL https://raw.githubusercontent.com/gorecvpn/gorecshit/main/install.sh) --panel-ip X.X.X.X --yes
+# или то же через gorecshit.sh (полный файл, не symlink):
+# bash <(curl -fsSL https://raw.githubusercontent.com/gorecvpn/gorecshit/main/gorecshit.sh) --panel-ip X.X.X.X --yes
 ```
 
 После первого запуска (или просто `bash install.sh --status`) на сервере доступна команда:
@@ -124,8 +132,9 @@ gorecshit --update     # обновить скрипт с GitHub / jsDelivr
 Интерактивно (меню на русском, спросит IP панели):
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/gorecvpn/gorecshit/main/install.sh)
-# дальше: gorecshit
+curl -fsSL https://raw.githubusercontent.com/gorecvpn/gorecshit/main/gorecshit.sh -o /root/gorecshit.sh
+bash /root/gorecshit.sh
+# дальше на сервере: gorecshit
 ```
 
 Проверка без изменений:

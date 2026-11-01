@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# gorecshit v2.2.2 — one-command hardening for Remnawave VPN node servers (Debian 11+/Ubuntu 20.04+)
+# gorecshit v2.2.3 — one-command hardening for Remnawave VPN node servers (Debian 11+/Ubuntu 20.04+)
 # Usage:
 #   bash install.sh --panel-ip X.X.X.X [--node-port 2222] [--yes]
 #   bash install.sh --check --panel-ip X.X.X.X
@@ -8,7 +8,7 @@
 # Does NOT restart Docker while remnanode/xray is live. Does NOT deploy itself.
 set -Eeuo pipefail
 
-VERSION="2.2.2"
+VERSION="2.2.3"
 SCRIPT_NAME="gorecshit"
 BACKUP_ROOT="/root/hardening-backups"
 TS="$(date +%Y%m%d-%H%M%S)"
@@ -488,7 +488,10 @@ show_status_summary() {
     fail2ban-client status 2>/dev/null || true
   fi
   if remnanode_running; then ok "remnanode/xray контейнер жив"; else warn "remnanode не найден в docker ps"; fi
-  [[ -d "$BACKUP_ROOT" ]] && echo "Бэкапы: $(find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l) шт. в $BACKUP_ROOT"
+  if [[ -d "$BACKUP_ROOT" ]]; then
+    echo "Бэкапы: $(find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l) шт. в $BACKUP_ROOT"
+  fi
+  return 0
 }
 
 # ---------- DPI / DNS / TLS egress checks (bash + curl/openssl/timeout) ----------
@@ -756,8 +759,8 @@ run_dpi_check() {
 }
 
 install_cli_command() {
-  # Install/refresh /usr/local/sbin/gorecshit + /usr/local/bin/gorecshit symlink (no hardening).
-  # Safe to call on every run when root.
+  # Install/refresh /usr/local/sbin/gorecshit (FULL script body) + /usr/local/bin/gorecshit symlink.
+  # Safe to call on every root run (menu, --status, full hardening) — does NOT re-apply hardening.
   if [[ "$(id -u 2>/dev/null || echo 1)" -ne 0 ]]; then
     return 0
   fi
@@ -766,28 +769,38 @@ install_cli_command() {
     return 0
   fi
   local src dest link
-  src="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || realpath "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
+  # Prefer the file being executed (works for bash /path/gorecshit.sh and installed binary)
+  src="${BASH_SOURCE[0]:-$0}"
+  if command -v readlink >/dev/null 2>&1; then
+    src="$(readlink -f "$src" 2>/dev/null || true)"
+  fi
+  if [[ -z "$src" || ! -f "$src" ]]; then
+    src="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)/$(basename "${BASH_SOURCE[0]:-$0}")"
+  fi
   dest="/usr/local/sbin/gorecshit"
   link="/usr/local/bin/gorecshit"
   mkdir -p /usr/local/sbin /usr/local/bin
   if [[ ! -f "$src" ]]; then
-    warn "Не удалось определить путь скрипта для установки CLI"
+    warn "Не удалось определить путь скрипта для установки CLI (BASH_SOURCE=${BASH_SOURCE[0]:-?})"
     return 0
   fi
-  # Avoid no-op copy noise when already identical
-  if ! cmp -s "$src" "$dest" 2>/dev/null; then
-    local tmp
-    tmp="$(mktemp "${dest}.XXXXXX")"
-    cp -f "$src" "$tmp"
-    chmod 755 "$tmp"
-    mv -f "$tmp" "$dest"
-    ok "CLI установлен: $dest (v${VERSION})"
+  # Refuse to install a broken symlink-download stub (content is just "install.sh")
+  local first
+  first="$(head -1 "$src" 2>/dev/null || true)"
+  if [[ "$first" != "#!"* ]]; then
+    warn "Источник CLI не похож на скрипт (первая строка: ${first:0:40}) — пропуск установки команды"
+    return 0
   fi
+  local tmp
+  tmp="$(mktemp /usr/local/sbin/gorecshit.XXXXXX)"
+  cp -f "$src" "$tmp"
+  chmod 755 "$tmp"
+  mv -f "$tmp" "$dest"
+  chmod 755 "$dest"
   ln -sfn "$dest" "$link"
-  # Ensure sbin is preferred; bin symlink for PATH convenience
-  if [[ ! -x "$dest" ]]; then
-    chmod 755 "$dest" || true
-  fi
+  # Make sure common PATHs see it
+  hash -r 2>/dev/null || true
+  ok "Команда gorecshit установлена ($dest → v${VERSION}; symlink $link)"
 }
 
 self_update_from_github() {
@@ -801,8 +814,11 @@ self_update_from_github() {
   fi
   local urls=(
     "https://raw.githubusercontent.com/gorecvpn/gorecshit/main/install.sh"
+    "https://raw.githubusercontent.com/gorecvpn/gorecshit/main/gorecshit.sh"
     "https://cdn.jsdelivr.net/gh/gorecvpn/gorecshit@main/install.sh"
+    "https://cdn.jsdelivr.net/gh/gorecvpn/gorecshit@main/gorecshit.sh"
     "https://fastly.jsdelivr.net/gh/gorecvpn/gorecshit@main/install.sh"
+    "https://fastly.jsdelivr.net/gh/gorecvpn/gorecshit@main/gorecshit.sh"
   )
   local tmp dest="/usr/local/sbin/gorecshit" link="/usr/local/bin/gorecshit" ok_url=""
   tmp="$(mktemp /tmp/gorecshit-update.XXXXXX)"
@@ -842,6 +858,8 @@ self_update_from_github() {
   local newv
   newv="$(grep -E '^VERSION=' "$dest" | head -1 | cut -d= -f2 | tr -d '"')"
   ok "Обновлено из $ok_url → $dest (VERSION=${newv:-?})"
+  ln -sfn "$dest" "$link"
+  ok "Команда gorecshit установлена ($dest → v${newv:-?}; symlink $link)"
   ok "Запуск: gorecshit   |   gorecshit --status   |   gorecshit --update"
 }
 
@@ -2609,6 +2627,7 @@ run_hardening() {
   configure_docker_journal
   configure_certbot_hooks
   final_verify
+  install_cli_command  # ensure CLI after hardening
 }
 
 main() {
@@ -2637,7 +2656,7 @@ main() {
   fi
 
   if [[ "$DO_STATUS_ONLY" -eq 1 ]]; then
-    show_status_summary
+    show_status_summary || true
     exit 0
   fi
 
