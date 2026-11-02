@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# gorecshit v2.2.9 — one-command hardening for Remnawave VPN node servers (Debian 11+/Ubuntu 20.04+)
+# gorecshit v2.3.0 — one-command hardening for Remnawave VPN node servers (Debian 11+/Ubuntu 20.04+)
 # Usage:
 #   bash install.sh --panel-ip X.X.X.X [--node-port 2222] [--yes]
 #   bash install.sh --check --panel-ip X.X.X.X
@@ -8,7 +8,7 @@
 # Does NOT restart Docker while remnanode/xray is live. Does NOT deploy itself.
 set -Eeuo pipefail
 
-VERSION="2.2.9"
+VERSION="2.3.0"
 SCRIPT_NAME="gorecshit"
 BACKUP_ROOT="/root/hardening-backups"
 
@@ -80,6 +80,7 @@ DO_ROLLBACK=0
 DO_REFRESH_LISTS_ONLY=0
 DO_STATUS_ONLY=0
 DO_DPI_CHECK=0
+DO_AUDIT=0
 DO_UPDATE_ONLY=0
 INTERACTIVE=0
 LOG_FILE="/var/log/gorecshit.log"
@@ -195,6 +196,7 @@ Usage:
   install.sh --status                # show hardening status
   install.sh --version               # print version
   install.sh --dpi-check             # outbound DPI / DNS / TLS checks (node egress)
+  install.sh --audit                 # RU reachability + detectability self-audit (read-only)
 
 Required (non-interactive apply):
   --panel-ip IP              Management/panel host allowed to reach NODE_PORT
@@ -232,6 +234,7 @@ Options:
   --update                   Self-update from GitHub by commit SHA (jsDelivr / cache-buster fallback)
   --version                  Print script version and exit
   --dpi-check                Check DPI/DNS/TLS from this node (egress diagnostics)
+  --audit                    RU block check (check-host) + xray/server detectability audit
   --rollback / --uninstall   Restore latest backup under /root/hardening-backups/
   -h, --help                 Show this help
 
@@ -397,6 +400,7 @@ parse_args() {
       --update) DO_UPDATE_ONLY=1; shift ;;
       --version|-V) printf '%s\n' "$VERSION"; exit 0 ;;
       --dpi-check) DO_DPI_CHECK=1; shift ;;
+      --audit) DO_AUDIT=1; shift ;;
       --rollback|--uninstall) DO_ROLLBACK=1; shift ;;
       -h|--help) usage; exit 0 ;;
       *) err "Unknown option: $1"; usage; exit 2 ;;
@@ -431,7 +435,7 @@ parse_args() {
 
 prompt_panel_ip() {
   if [[ -n "$PANEL_IP" ]]; then return 0; fi
-  if [[ "$DO_ROLLBACK" -eq 1 || "$DO_STATUS_ONLY" -eq 1 || "$DO_REFRESH_LISTS_ONLY" -eq 1 || "$DO_DPI_CHECK" -eq 1 || "$DO_UPDATE_ONLY" -eq 1 ]]; then return 0; fi
+  if [[ "$DO_ROLLBACK" -eq 1 || "$DO_STATUS_ONLY" -eq 1 || "$DO_REFRESH_LISTS_ONLY" -eq 1 || "$DO_DPI_CHECK" -eq 1 || "$DO_AUDIT" -eq 1 || "$DO_UPDATE_ONLY" -eq 1 ]]; then return 0; fi
   if [[ "$ASSUME_YES" -eq 1 ]]; then
     err "--panel-ip is required (or set GORECSHIT_PANEL_IP). Refusing non-interactive without it."
     exit 2
@@ -865,6 +869,785 @@ run_dpi_check() {
   echo "Если DETECTED/TLS DROP на EU-ноде — смотрите firewall/маршрут хостера, не «российский DPI»."
 }
 
+# ---------- Node block / detectability audit (read-only; --audit / menu 8) ----------
+# Uses public check-host.net API + local xray config. Changes nothing (no UFW/iptables/sysctl).
+
+_audit_ok()   { printf '  %b✅%b %s\n' "${C_GRN}" "${C_RESET}" "$*"; }
+_audit_warn() { printf '  %b⚠️%b  %s\n' "${C_YEL}" "${C_RESET}" "$*"; }
+_audit_info() { printf '  %b•%b  %s\n' "${C_CYN}" "${C_RESET}" "$*"; }
+_audit_err()  { printf '  %b❌%b %s\n' "${C_RED}" "${C_RESET}" "$*"; }
+
+_audit_http_get() {
+  # usage: _audit_http_get URL [timeout_sec]
+  local url="$1" t="${2:-15}"
+  curl -fsS --connect-timeout 5 --max-time "$t" \
+    -H 'Accept: application/json' -A 'gorecshit-audit/2.3.0' \
+    "$url" 2>/dev/null || true
+}
+
+_audit_detect_public_ipv4() {
+  local ip="" src
+  for src in \
+    'https://api.ipify.org' \
+    'https://ifconfig.me/ip' \
+    'https://ipv4.icanhazip.com' \
+    'https://checkip.amazonaws.com'; do
+    ip="$(curl -fsS --connect-timeout 4 --max-time 8 -A 'gorecshit-audit/2.3.0' "$src" 2>/dev/null | tr -d '[:space:]' || true)"
+    if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      printf '%s\n' "$ip"
+      return 0
+    fi
+  done
+  # last resort: default route iface
+  if command -v ip >/dev/null 2>&1; then
+    ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)"
+    if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      printf '%s\n' "$ip"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+_audit_ensure_client_ports() {
+  # Fill DETECTED_CLIENT_PORTS if empty (reuse existing detectors; read-only).
+  if [[ ${#DETECTED_CLIENT_PORTS[@]} -gt 0 ]]; then
+    return 0
+  fi
+  load_ephemeral_port_range
+  local exclude_port=3000 np
+  if [[ -n "${NODE_PORT:-}" && "${NODE_PORT}" =~ ^[0-9]+$ && "${NODE_PORT}" != "auto" ]]; then
+    exclude_port="$NODE_PORT"
+  elif [[ -f /opt/remnanode/.env ]]; then
+    np="$(grep -E '^(NODE_PORT|APP_PORT)=' /opt/remnanode/.env 2>/dev/null | head -1 | cut -d= -f2- | tr -d '\"\r' || true)"
+    [[ "$np" =~ ^[0-9]+$ ]] && exclude_port="$np"
+  fi
+  DETECTED_NODE_PORT="${DETECTED_NODE_PORT:-$exclude_port}"
+  DETECTED_CLIENT_PORTS=()
+  DETECTED_CLIENT_UDP_PORTS=()
+  detect_ports_from_inbounds_config || true
+  if [[ ${#DETECTED_CLIENT_PORTS[@]} -eq 0 ]]; then
+    detect_ports_from_ss_filtered "$exclude_port" 0 || true
+  fi
+  if [[ ${#DETECTED_CLIENT_PORTS[@]} -gt 0 ]]; then
+    mapfile -t DETECTED_CLIENT_PORTS < <(printf '%s\n' "${DETECTED_CLIENT_PORTS[@]}" | sort -n -u)
+  fi
+  if [[ ${#DETECTED_CLIENT_PORTS[@]} -eq 0 && -n "${CLIENT_PORTS:-}" && "${CLIENT_PORTS}" != "auto" ]]; then
+    local p
+    IFS=',' read -ra _ap <<< "$CLIENT_PORTS"
+    for p in "${_ap[@]}"; do
+      p="$(echo "$p" | tr -d '[:space:]')"
+      [[ "$p" =~ ^[0-9]+$ ]] && DETECTED_CLIENT_PORTS+=("$p")
+    done
+  fi
+}
+
+_audit_json_get() {
+  # Very small JSON helpers: prefer python3, then jq, then grep/sed.
+  # _audit_json_get FIELD_PATH stdin — prints value or empty
+  local expr="$1"
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c '
+import json,sys
+raw=sys.stdin.read()
+try:
+  d=json.loads(raw)
+except Exception:
+  sys.exit(0)
+path=sys.argv[1].split(".")
+cur=d
+for p in path:
+  if isinstance(cur, dict) and p in cur:
+    cur=cur[p]
+  else:
+    sys.exit(0)
+if cur is None:
+  sys.exit(0)
+if isinstance(cur,(dict,list)):
+  print(json.dumps(cur,ensure_ascii=False))
+else:
+  print(cur)
+' "$expr" 2>/dev/null || true
+  elif command -v jq >/dev/null 2>&1; then
+    jq -r ".$expr // empty" 2>/dev/null || true
+  else
+    # crude fallback for request_id / ok
+    case "$expr" in
+      request_id) grep -oE '"request_id"[[:space:]]*:[[:space:]]*"[^"]+"' | head -1 | sed -E 's/.*"([^"]+)"/\1/' ;;
+      ok) grep -oE '"ok"[[:space:]]*:[[:space:]]*[0-9]+' | head -1 | sed -E 's/.*://;s/ //g' ;;
+      *) return 0 ;;
+    esac
+  fi
+}
+
+_audit_pick_checkhost_nodes() {
+  # Sets AUDIT_RU_NODES and AUDIT_FOREIGN_NODES (bash arrays) from nodes/hosts
+  AUDIT_RU_NODES=()
+  AUDIT_FOREIGN_NODES=()
+  local body
+  body="$(_audit_http_get 'https://check-host.net/nodes/hosts' 20)"
+  [[ -n "$body" ]] || return 1
+  if command -v python3 >/dev/null 2>&1; then
+    local picked
+    picked="$(printf '%s' "$body" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+nodes=d.get("nodes") or {}
+ru=[]; foreign=[]
+pref=["de","nl","fi","pl","se","fr","gb","uk","us","cz","at","ch"]
+for k,v in nodes.items():
+  loc=v.get("location") if isinstance(v,dict) else None
+  if not (isinstance(loc,list) and loc):
+    continue
+  cc=str(loc[0]).lower()
+  if cc=="ru":
+    ru.append(k)
+# foreign: prefer western EU/US, skip ir/ru
+seen=set()
+for cc in pref:
+  for k,v in nodes.items():
+    loc=v.get("location") if isinstance(v,dict) else None
+    if not (isinstance(loc,list) and loc):
+      continue
+    if str(loc[0]).lower()!=cc: continue
+    if k in seen: continue
+    foreign.append(k); seen.add(k)
+    if len(foreign)>=3: break
+  if len(foreign)>=3: break
+if len(foreign)<2:
+  for k,v in nodes.items():
+    loc=v.get("location") if isinstance(v,dict) else None
+    if not (isinstance(loc,list) and loc): continue
+    cc=str(loc[0]).lower()
+    if cc in ("ru","ir"): continue
+    if k in seen: continue
+    foreign.append(k); seen.add(k)
+    if len(foreign)>=3: break
+print("RU "+(" ".join(ru)))
+print("FR "+(" ".join(foreign[:3])))
+' 2>/dev/null || true)"
+    local line
+    while IFS= read -r line; do
+      case "$line" in
+        RU\ *) read -ra AUDIT_RU_NODES <<< "${line#RU }" ;;
+        FR\ *) read -ra AUDIT_FOREIGN_NODES <<< "${line#FR }" ;;
+      esac
+    done <<<"$picked"
+  else
+    # grep fallback: node names start with country code
+    mapfile -t AUDIT_RU_NODES < <(printf '%s' "$body" | grep -oE '"ru[0-9]+\.node\.check-host\.net"' | tr -d '"' | sort -u)
+    mapfile -t AUDIT_FOREIGN_NODES < <(printf '%s' "$body" | grep -oE '"(de|nl|pl|se|fr|us)[0-9]+\.node\.check-host\.net"' | tr -d '"' | sort -u | head -3)
+  fi
+  [[ ${#AUDIT_RU_NODES[@]} -gt 0 || ${#AUDIT_FOREIGN_NODES[@]} -gt 0 ]]
+}
+
+_audit_checkhost_start() {
+  # _audit_checkhost_start KIND TARGET  where KIND=tcp|ping, TARGET=ip:port or ip
+  # prints request_id or empty
+  local kind="$1" target="$2"
+  shift 2
+  local -a nodes=("$@")
+  local qs="" n url body
+  for n in "${nodes[@]}"; do
+    [[ -n "$n" ]] || continue
+    qs="${qs}&node=${n}"
+  done
+  [[ -n "$qs" ]] || return 1
+  case "$kind" in
+    tcp) url="https://check-host.net/check-tcp?host=${target}${qs}" ;;
+    ping) url="https://check-host.net/check-ping?host=${target}${qs}" ;;
+    *) return 1 ;;
+  esac
+  body="$(_audit_http_get "$url" 20)"
+  [[ -n "$body" ]] || return 1
+  if printf '%s' "$body" | grep -q 'limit_exceeded\|"error"'; then
+    if printf '%s' "$body" | grep -q 'limit_exceeded'; then
+      echo "LIMIT" >&2
+    fi
+    # still try to extract request_id if present
+  fi
+  local rid
+  rid="$(printf '%s' "$body" | _audit_json_get request_id)"
+  [[ -z "$rid" ]] && rid="$(printf '%s' "$body" | grep -oE '"request_id"[[:space:]]*:[[:space:]]*"[^"]+"' | head -1 | sed -E 's/.*"([^"]+)"/\1/')"
+  [[ -n "$rid" ]] || return 1
+  printf '%s\n' "$rid"
+}
+
+_audit_checkhost_poll() {
+  # _audit_checkhost_poll REQUEST_ID DEADLINE_EPOCH
+  # prints raw JSON result (may still contain nulls if timed out)
+  local rid="$1" deadline="$2"
+  local body="" now
+  while true; do
+    now="$(date +%s)"
+    (( now >= deadline )) && break
+    body="$(_audit_http_get "https://check-host.net/check-result/${rid}" 10)"
+    if [[ -n "$body" && "$body" != "null" ]]; then
+      # unfinished nodes are null values — wait until none left or deadline
+      if command -v python3 >/dev/null 2>&1; then
+        if printf '%s' "$body" | python3 -c '
+import json,sys
+try:
+  d=json.load(sys.stdin)
+except Exception:
+  raise SystemExit(1)
+if not isinstance(d,dict) or not d:
+  raise SystemExit(1)
+# pending if any value is null
+for v in d.values():
+  if v is None:
+    raise SystemExit(2)
+raise SystemExit(0)
+' 2>/dev/null; then
+          printf '%s\n' "$body"
+          return 0
+        fi
+      else
+        # no python: if no ":null" left, done
+        if ! printf '%s' "$body" | grep -qE '":\s*null'; then
+          printf '%s\n' "$body"
+          return 0
+        fi
+      fi
+    fi
+    sleep 1
+  done
+  [[ -n "$body" && "$body" != "null" ]] && printf '%s\n' "$body"
+  return 0
+}
+
+_audit_summarize_tcp_result() {
+  # stdin: check-result JSON; args: space-separated RU nodes, then --, then foreign nodes
+  # prints: ru_ok ru_total foreign_ok foreign_total
+  local -a ru_nodes=() fr_nodes=()
+  local mode=ru
+  local a
+  for a in "$@"; do
+    if [[ "$a" == "--" ]]; then mode=fr; continue; fi
+    if [[ "$mode" == "ru" ]]; then ru_nodes+=("$a"); else fr_nodes+=("$a"); fi
+  done
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c '
+import json,sys
+raw=sys.stdin.read()
+try:
+  d=json.loads(raw) if raw.strip() else {}
+except Exception:
+  d={}
+ru=sys.argv[1].split(",") if sys.argv[1] else []
+fr=sys.argv[2].split(",") if sys.argv[2] else []
+def ok(v):
+  if v is None: return None  # pending/unknown
+  if isinstance(v,list) and v:
+    item=v[0]
+    if isinstance(item,dict):
+      if "error" in item: return False
+      if "time" in item or "address" in item: return True
+      return False
+    if isinstance(item,list) and item:
+      # ping: ["OK", latency, addr] / ["TIMEOUT", ...]
+      return str(item[0]).upper() in ("OK","OK!")
+  return False
+def count(keys):
+  o=t=0
+  for k in keys:
+    if not k or k not in d: continue
+    r=ok(d.get(k))
+    if r is None: continue
+    t+=1
+    if r: o+=1
+  return o,t
+ro,rt=count(ru); fo,ft=count(fr)
+print(f"{ro} {rt} {fo} {ft}")
+' "$(IFS=,; echo "${ru_nodes[*]}")" "$(IFS=,; echo "${fr_nodes[*]}")" 2>/dev/null || echo "0 0 0 0"
+  else
+    # crude: count nodes without "error" near their key — best-effort
+    echo "0 0 0 0"
+  fi
+}
+
+_audit_reachability_from_russia() {
+  local pub_ip="$1"
+  shift
+  local -a ports=("$@")
+  local deadline=$(( $(date +%s) + 55 ))
+  local started_at
+  started_at="$(date +%s)"
+
+  step "Доступность IP из России (check-host.net)"
+  _audit_info "Публичный IPv4: ${pub_ip}"
+  if [[ ${#ports[@]} -eq 0 ]]; then
+    _audit_warn "Клиентские TCP-порты не найдены — TCP-проверку пропускаем (задайте --client-ports)"
+  else
+    _audit_info "Клиентские TCP-порты: $(IFS=,; echo "${ports[*]}")"
+  fi
+
+  if ! _audit_pick_checkhost_nodes; then
+    _audit_err "Не удалось получить список узлов check-host.net — пропускаем внешнюю проверку"
+    return 0
+  fi
+  _audit_info "Узлы РФ: ${AUDIT_RU_NODES[*]:-—}"
+  _audit_info "Узлы зарубежье: ${AUDIT_FOREIGN_NODES[*]:-—}"
+
+  local -a all_nodes=("${AUDIT_RU_NODES[@]}" "${AUDIT_FOREIGN_NODES[@]}")
+  local port rid body ru_ok ru_tot fr_ok fr_tot verdict
+  local any_ru_fail=0 any_fr_ok=0 limit_hit=0
+
+  for port in "${ports[@]}"; do
+    [[ "$port" =~ ^[0-9]+$ ]] || continue
+    now="$(date +%s)"
+    if (( now >= deadline )); then
+      _audit_warn "Лимит времени (~60с) — остальные порты не проверяем"
+      break
+    fi
+    echo
+    printf '%bПорт %s/tcp:%b\n' "${C_BOLD}" "$port" "${C_RESET}"
+    rid="$(_audit_checkhost_start tcp "${pub_ip}:${port}" "${all_nodes[@]}" 2>/tmp/gorecshit-audit-ch.err || true)"
+    if grep -q LIMIT /tmp/gorecshit-audit-ch.err 2>/dev/null; then
+      limit_hit=1
+    fi
+    if [[ -z "$rid" ]]; then
+      if [[ "$limit_hit" -eq 1 ]]; then
+        _audit_warn "API check-host.net: limit_exceeded — повторите позже"
+      else
+        _audit_warn "Не удалось запустить check-tcp для ${pub_ip}:${port}"
+      fi
+      continue
+    fi
+    body="$(_audit_checkhost_poll "$rid" "$deadline")"
+    if [[ -z "$body" ]]; then
+      _audit_warn "Нет результата check-tcp (таймаут/ошибка API)"
+      continue
+    fi
+    read -r ru_ok ru_tot fr_ok fr_tot < <(printf '%s' "$body" | _audit_summarize_tcp_result "${AUDIT_RU_NODES[@]}" -- "${AUDIT_FOREIGN_NODES[@]}")
+    ru_ok="${ru_ok:-0}"; ru_tot="${ru_tot:-0}"; fr_ok="${fr_ok:-0}"; fr_tot="${fr_tot:-0}"
+    _audit_info "из России: доступен ${ru_ok}/${ru_tot} узлов"
+    _audit_info "из-за рубежа: доступен ${fr_ok}/${fr_tot} узлов"
+    verdict=""
+    if (( fr_tot > 0 && fr_ok > 0 && ru_tot > 0 && ru_ok == 0 )); then
+      verdict="IP, вероятно, заблокирован в РФ (ТСПУ)"
+      any_ru_fail=1
+      any_fr_ok=1
+      _audit_warn "$verdict"
+    elif (( ru_tot > 0 && ru_ok > 0 )); then
+      _audit_ok "из России порт отвечает (не похоже на полную блокировку IP/порта)"
+    elif (( fr_tot > 0 && fr_ok == 0 && ru_tot > 0 && ru_ok == 0 )); then
+      _audit_warn "Порт недоступен ни из РФ, ни из-за рубежа (фильтр/не слушает/файрвол хостера?)"
+    else
+      _audit_warn "Недостаточно данных для вердикта по порту ${port}"
+    fi
+    (( fr_ok > 0 )) && any_fr_ok=1
+    (( ru_tot > 0 && ru_ok == 0 && fr_ok > 0 )) && any_ru_fail=1
+  done
+
+  # Ping comparison (one shot) if time left
+  now="$(date +%s)"
+  if (( now + 8 < deadline )) && [[ "$limit_hit" -eq 0 ]]; then
+    echo
+    printf '%bICMP ping (check-host):%b\n' "${C_BOLD}" "${C_RESET}"
+    rid="$(_audit_checkhost_start ping "${pub_ip}" "${all_nodes[@]}" 2>/tmp/gorecshit-audit-ch.err || true)"
+    if [[ -n "$rid" ]]; then
+      body="$(_audit_checkhost_poll "$rid" "$deadline")"
+      if [[ -n "$body" ]]; then
+        read -r ru_ok ru_tot fr_ok fr_tot < <(printf '%s' "$body" | _audit_summarize_tcp_result "${AUDIT_RU_NODES[@]}" -- "${AUDIT_FOREIGN_NODES[@]}")
+        _audit_info "ping из России: ${ru_ok:-0}/${ru_tot:-0} узлов"
+        _audit_info "ping из-за рубежа: ${fr_ok:-0}/${fr_tot:-0} узлов"
+      else
+        _audit_warn "Нет результата check-ping"
+      fi
+    else
+      if grep -q LIMIT /tmp/gorecshit-audit-ch.err 2>/dev/null; then
+        _audit_warn "API check-host.net: limit_exceeded на ping — пропуск"
+      else
+        _audit_warn "Не удалось запустить check-ping"
+      fi
+    fi
+  fi
+
+  echo
+  if (( any_ru_fail == 1 && any_fr_ok == 1 )); then
+    _audit_warn "Итог доступности: зарубежье видит ноду, РФ — нет → вероятна блокировка IP в РФ (ТСПУ). Смените IP/хостера или используйте CDN/relay."
+  fi
+  local elapsed=$(( $(date +%s) - started_at ))
+  _audit_info "Внешняя проверка заняла ~${elapsed}с (лимит ~60с)"
+}
+
+_audit_reality_dest_quality() {
+  # stdin unused; args: serverNames/dest strings — prints good|ru|small|unknown
+  local s="$1"
+  s="$(printf '%s' "$s" | tr '[:upper:]' '[:lower:]')"
+  case "$s" in
+    *cdn-apple.com*|*mzstatic.com*|*gstatic.com*|*googleapis.com*|*google.com*|*microsoftonline.com*|*edge.microsoft*|*windows.net*|*office.com*|*microsoft.com*|*icloud.com*|*apple.com*|*cloudflare-dns.com*|*cloudflare.com*|*amazonaws.com*|*amazon.com*|*fbcdn.net*|*facebook.com*|*yimg.com*|*yahoo.com*|*bing.com*|*live.com*|*akamai*)
+      echo good; return ;;
+  esac
+  case "$s" in
+    *.ru|*.su|*.xn--p1ai|*mail.ru*|*yandex.*|*vk.com*|*ok.ru*|*sber*|*rt.ru*|*mts.ru*|*megafon*)
+      echo ru; return ;;
+  esac
+  # short / odd looking host
+  local host="${s%%/*}"
+  host="${host#*://}"
+  host="${host%%:*}"
+  if [[ ${#host} -le 8 || "$host" =~ ^[0-9.]+$ ]]; then
+    echo small; return
+  fi
+  echo unknown
+}
+
+_audit_openssl_dest() {
+  # Check dest reachable via TLS1.3 + h2 from this server. Args: host [port=443]
+  local host="$1" port="${2:-443}"
+  host="${host%%/*}"; host="${host#*://}"; host="${host%%:*}"
+  [[ -n "$host" ]] || { echo fail; return; }
+  command -v openssl >/dev/null 2>&1 || { echo no_openssl; return; }
+  local out
+  out="$(timeout 8 openssl s_client -connect "${host}:${port}" -servername "$host" -tls1_3 -alpn h2 </dev/null 2>/dev/null | tr -d '\0' || true)"
+  if printf '%s' "$out" | grep -qiE 'ALPN[[:space:]]+protocol:[[:space:]]*h2|Protocol[[:space:]]*:[[:space:]]*TLSv1\.3'; then
+    if printf '%s' "$out" | grep -q 'ALPN' && printf '%s' "$out" | grep -qi 'h2'; then
+      echo ok
+      return
+    fi
+    # TLS1.3 without confirmed h2 — still partial ok
+    if printf '%s' "$out" | grep -qi 'Protocol.*TLSv1\.3'; then
+      echo tls13
+      return
+    fi
+  fi
+  # retry without forcing alpn to see any TLS
+  out="$(timeout 8 openssl s_client -connect "${host}:${port}" -servername "$host" -tls1_3 </dev/null 2>/dev/null | tr -d '\0' || true)"
+  if printf '%s' "$out" | grep -qi 'Protocol.*TLSv1\.3'; then
+    echo tls13
+  else
+    echo fail
+  fi
+}
+
+_audit_xray_self() {
+  step "Самоаудит палевности (локальный xray / REALITY)"
+  local json
+  json="$(collect_xray_config_json 2>/dev/null || true)"
+  if [[ -z "$json" ]] || ! printf '%s' "$json" | grep -q '"inbounds"'; then
+    _audit_warn "Конфиг xray недоступен (docker exec remnanode / файлы) — пропускаем разбор inbounds"
+    _audit_info "Подсказка: контейнер remnanode должен быть запущен; конфиг обычно в /var/lib/remnanode/xray/config.json"
+    return 0
+  fi
+  _audit_ok "Конфиг xray прочитан (только чтение)"
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    _audit_warn "python3 нет — детальный разбор inbounds ограничен"
+    # minimal grep checks
+    if printf '%s' "$json" | grep -qi 'xtls-rprx-vision'; then
+      _audit_ok "Встречается flow xtls-rprx-vision"
+    else
+      _audit_warn "flow xtls-rprx-vision не найден — для VLESS+REALITY лучше vision"
+    fi
+    if printf '%s' "$json" | grep -qi 'bittorrent\|BitTorrent\|protocol.*bittorrent'; then
+      _audit_ok "Похоже есть правило блокировки bittorrent"
+    else
+      _audit_warn "Нет явного block bittorrent в routing — добавьте block torrent (меньше жалоб хостеру)"
+    fi
+    return 0
+  fi
+
+  local report
+  report="$(printf '%s' "$json" | python3 -c '
+import json,sys,re
+cfg=json.load(sys.stdin)
+inbounds=cfg.get("inbounds") or []
+if isinstance(inbounds,dict):
+  inbounds=list(inbounds.values())
+routing=cfg.get("routing") or {}
+rules=routing.get("rules") or []
+bt=False
+for r in rules:
+  if not isinstance(r,dict):
+    continue
+  proto=r.get("protocol") or r.get("protocols") or []
+  if isinstance(proto,str): proto=[proto]
+  joined=" ".join(str(x).lower() for x in proto)
+  if "bittorrent" in joined or "bit torrent" in joined:
+    bt=True
+  outbound=(r.get("outboundTag") or r.get("outbound_tag") or "")
+  # also match domain/keyword style
+  s=json.dumps(r).lower()
+  if "bittorrent" in s and ("blocked" in str(outbound).lower() or "blackhole" in str(outbound).lower() or r.get("type")=="field"):
+    bt=True
+print("BT", "yes" if bt else "no")
+idx=0
+for ib in inbounds:
+  if not isinstance(ib,dict):
+    continue
+  tag=str(ib.get("tag") or "")
+  if tag.lower() in ("api","metrics","stats"):
+    continue
+  proto=(ib.get("protocol") or "").lower()
+  if proto not in ("vless","vmess","trojan","shadowsocks"):
+    continue
+  port=ib.get("port")
+  ss=ib.get("streamSettings") or ib.get("stream_settings") or {}
+  security=(ss.get("security") or "").lower()
+  network=(ss.get("network") or ib.get("network") or "tcp").lower()
+  rs=ss.get("realitySettings") or ss.get("reality_settings") or {}
+  ts=ss.get("tlsSettings") or ss.get("tls_settings") or {}
+  ws=ss.get("wsSettings") or ss.get("ws_settings") or {}
+  clients=((ib.get("settings") or {}).get("clients")) or []
+  flows=[]
+  for c in clients:
+    if isinstance(c,dict) and c.get("flow"):
+      flows.append(str(c.get("flow")))
+  flow=",".join(flows) if flows else ""
+  sni=""
+  dest=""
+  short_ids=[]
+  if security=="reality" or rs:
+    sni=",".join(str(x) for x in (rs.get("serverNames") or rs.get("server_names") or [])[:6])
+    dest=str(rs.get("dest") or rs.get("target") or "")
+    short_ids=rs.get("shortIds") or rs.get("short_ids") or []
+  elif security in ("tls","xtls"):
+    sni=",".join(str(x) for x in (ts.get("serverName") or ts.get("serverNames") or [])[:6] if x) if isinstance(ts.get("serverNames"),list) else str(ts.get("serverName") or "")
+  idx+=1
+  sid_empty = (not short_ids) or (isinstance(short_ids,list) and all(not str(x) for x in short_ids))
+  print("|".join([
+    "IB", str(idx), proto, str(port or ""), security or "none", network,
+    flow or "-", sni or "-", dest or "-",
+    "sid_empty" if sid_empty else "sid_ok",
+    "reality" if (security=="reality" or rs) else "other",
+  ]))
+' 2>/dev/null || true)"
+
+  if [[ -z "$report" ]]; then
+    _audit_warn "Не удалось разобрать JSON inbounds"
+    return 0
+  fi
+
+  local bt_line ib_count=0
+  bt_line="$(printf '%s\n' "$report" | grep '^BT ' | head -1 || true)"
+  if [[ "$bt_line" == "BT yes" ]]; then
+    _audit_ok "Есть routing-правило блокировки bittorrent"
+  else
+    _audit_warn "Нет block bittorrent в routing — рекомендуется blackhole/blocked для protocol bittorrent"
+  fi
+
+  local line _tag idx proto port security network flow sni dest sid_flag kind
+  local dest_host dest_port q tls_res
+  while IFS= read -r line; do
+    case "$line" in IB\|*) ;; *) continue ;; esac
+    ib_count=$((ib_count+1))
+    IFS="|" read -r _tag idx proto port security network flow sni dest sid_flag kind <<<"$line"
+    echo
+    printf '%bInbound #%s (%s port %s):%b\n' "${C_BOLD}" "${idx}" "$proto" "${port:-?}" "${C_RESET}"
+
+    if [[ "$kind" == "reality" ]]; then
+      if [[ "$port" == "443" ]]; then
+        _audit_ok "Порт 443 — хорошо маскируется под HTTPS"
+      else
+        _audit_warn "Порт ${port:-?} ≠ 443 — для REALITY лучше слушать 443 (меньше палевности)"
+      fi
+      if [[ "$flow" == *xtls-rprx-vision* ]]; then
+        _audit_ok "flow=xtls-rprx-vision"
+      else
+        _audit_warn "flow «${flow}» — для VLESS+REALITY рекомендуют xtls-rprx-vision"
+      fi
+      if [[ "$sid_flag" == "sid_empty" ]]; then
+        _audit_warn "shortIds пустые — задайте несколько shortId (сложнее зондировать REALITY)"
+      else
+        _audit_ok "shortIds заданы"
+      fi
+      q="$(_audit_reality_dest_quality "${dest}|${sni}")"
+      case "$q" in
+        good) _audit_ok "dest/serverNames выглядят как крупный зарубежный сайт (${dest:-$sni}) — хорошо" ;;
+        ru)   _audit_warn "dest/SNI российский (${dest:-$sni}) — лучше gstatic/microsoft/apple/cloudflare" ;;
+        small) _audit_warn "dest/SNI мелкий/подозрительный (${dest:-$sni}) — возьмите крупный зарубежный домен" ;;
+        *)    _audit_warn "dest/SNI «${dest:-$sni}» — предпочтительны gstatic.com / www.microsoft.com / apple.com" ;;
+      esac
+      dest_host="${dest%%:*}"
+      dest_port=443
+      if [[ "$dest" == *:* ]]; then
+        dest_port="${dest##*:}"
+        [[ "$dest_port" =~ ^[0-9]+$ ]] || dest_port=443
+      fi
+      if [[ -n "$dest_host" && "$dest_host" != "-" ]]; then
+        tls_res="$(_audit_openssl_dest "$dest_host" "$dest_port")"
+        case "$tls_res" in
+          ok) _audit_ok "dest ${dest_host}:${dest_port} доступен (TLS1.3 + h2) с этой ноды" ;;
+          tls13) _audit_warn "dest ${dest_host}:${dest_port} отвечает TLS1.3, но ALPN h2 не подтверждён — проверьте dest" ;;
+          no_openssl) _audit_warn "openssl нет — проверку dest TLS пропустили" ;;
+          *) _audit_warn "dest ${dest_host}:${dest_port} не открылся по TLS1.3/h2 с ноды — смените dest на живой сайт" ;;
+        esac
+      fi
+    else
+      # non-REALITY
+      if [[ "$security" == "none" || "$security" == "-" || -z "$security" ]]; then
+        _audit_warn "Нет REALITY/TLS (${proto}/${network}) — трафик легче классифицировать как VPN"
+      elif [[ "$network" == "ws" || "$network" == "websocket" ]]; then
+        _audit_warn "Обычный TLS/WS без CDN — для РФ лучше REALITY или CDN (Cloudflare) перед нодой"
+      else
+        _audit_warn "Не REALITY (security=${security}, network=${network}) — выше риск палевности без CDN"
+      fi
+      if [[ "$port" != "443" && "$port" != "80" ]]; then
+        _audit_warn "Порт ${port:-?} не 443/80 — заметнее для сканеров"
+      fi
+    fi
+  done <<<"$report"
+
+  if [[ "$ib_count" -eq 0 ]]; then
+    _audit_warn "VLESS/VMESS/Trojan inbounds не найдены в конфиге"
+  fi
+}
+
+_audit_server_level() {
+  step "Сервер: признаки «палевной» ноды (только проверка)"
+  # ICMP echo answered? (we send to self public IP or local stack via ping -c1 to pub ip from outside perspective is hard;
+  # check locally whether icmp echo-request is DROPped in iptables/ufw/raw — and/or ping 127.0.0.1 is always ok.
+  # Better: see if INPUT/DOCKER drops icmp echo; also try listening: use check from earlier ping section.
+  # Local heuristic: iptables/nft/ufw rules for icmp)
+  local icmp_drop=0
+  if command -v iptables >/dev/null 2>&1; then
+    if iptables -S 2>/dev/null | grep -qiE 'icmp-type[[:space:]]*8.*DROP|DROP.*icmp-type[[:space:]]*8|icmp[[:space:]]+--icmp-type[[:space:]]+8[[:space:]]+-j[[:space:]]+DROP'; then
+      icmp_drop=1
+    fi
+    if iptables -S INPUT 2>/dev/null | grep -qiE '\-p icmp .*-j DROP'; then
+      icmp_drop=1
+    fi
+  fi
+  if command -v ufw >/dev/null 2>&1; then
+    if ufw status verbose 2>/dev/null | grep -qiE 'ICMP.*(deny|DROP)|deny[[:space:]]+\(v6\)?[[:space:]]*$'; then
+      :
+    fi
+  fi
+  # Also: gorecshit stealth often writes icmp DROP in /etc/ufw/before.rules — detect comment/rules
+  if [[ -f /etc/ufw/before.rules ]] && grep -qE 'icmp-type 8|ECHO REQUEST' /etc/ufw/before.rules 2>/dev/null; then
+    if grep -A1 -E 'ECHO REQUEST|icmp-type 8' /etc/ufw/before.rules 2>/dev/null | grep -q DROP; then
+      icmp_drop=1
+    fi
+  fi
+  if [[ "$icmp_drop" -eq 1 ]]; then
+    _audit_ok "ICMP echo-request, похоже, режется — ping снаружи не светит ноду"
+  else
+    # active probe: does kernel answer echo on a non-loopback? Use sysctl ignore?
+    local ignore=0
+    if [[ -r /proc/sys/net/ipv4/icmp_echo_ignore_all ]] && [[ "$(cat /proc/sys/net/ipv4/icmp_echo_ignore_all)" == "1" ]]; then
+      ignore=1
+    fi
+    if [[ "$ignore" -eq 1 ]]; then
+      _audit_ok "icmp_echo_ignore_all=1 — echo не отвечает"
+    else
+      _audit_warn "ICMP echo, похоже, отвечает — для стелса лучше DROP echo-request (не трогаем сами)"
+    fi
+  fi
+
+  # SSH on 22
+  local ssh22=0
+  if command -v ss >/dev/null 2>&1; then
+    if ss -lntp 2>/dev/null | awk 'NR>1' | grep -E ':22\b' | grep -qiE 'sshd|ssh'; then
+      ssh22=1
+    elif ss -lntp 2>/dev/null | awk 'NR>1' | grep -qE '[:.]22\s'; then
+      # port 22 listen even without process name
+      if ss -lntp '( sport = :22 )' 2>/dev/null | awk 'NR>1{print; exit}' | grep -q .; then
+        ssh22=1
+      fi
+    fi
+  fi
+  if [[ "$ssh22" -eq 1 ]]; then
+    _audit_warn "SSH слушает порт 22 — классический маркер; лучше --ssh-port N (оставив 22 до проверки)"
+  else
+    _audit_ok "SSH не на 22 (или не обнаружен) — меньше шаблонности"
+  fi
+
+  # ufw inactive
+  local ufw_active=0
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qiE 'Status:\s*active'; then
+    ufw_active=1
+  fi
+  if [[ "$ufw_active" -eq 1 ]]; then
+    _audit_ok "UFW активен"
+  else
+    _audit_warn "UFW неактивен — публичная поверхность шире; включите защиту (пункт меню 1)"
+  fi
+
+  # Extra listening public ports besides SSH / clients / panel-port
+  load_ephemeral_port_range
+  local node_ex="${DETECTED_NODE_PORT:-3000}"
+  if [[ -f /opt/remnanode/.env ]]; then
+    local np
+    np="$(grep -E '^(NODE_PORT|APP_PORT)=' /opt/remnanode/.env 2>/dev/null | head -1 | cut -d= -f2- | tr -d '\"\r' || true)"
+    [[ "$np" =~ ^[0-9]+$ ]] && node_ex="$np"
+  fi
+  local -a allowed=() extras=()
+  local p
+  for p in "${DETECTED_CLIENT_PORTS[@]:-}"; do
+    [[ "$p" =~ ^[0-9]+$ ]] && allowed+=("$p")
+  done
+  allowed+=("22" "80" "443" "$node_ex")
+  [[ -n "${SSH_PORT_NEW:-}" ]] && allowed+=("$SSH_PORT_NEW")
+  # also common ssh alt from ss
+  local line addr port proc
+  if command -v ss >/dev/null 2>&1; then
+    while IFS= read -r line; do
+      addr="$(ss_local_addr "$line")"
+      port="${addr##*:}"; port="${port%%]*}"
+      [[ "$port" =~ ^[0-9]+$ ]] || continue
+      ss_is_loopback_addr "$addr" && continue
+      is_ephemeral_port "$port" && continue
+      # skip allowed
+      local skip=0 a
+      for a in "${allowed[@]}"; do
+        [[ "$port" == "$a" ]] && skip=1 && break
+      done
+      (( skip == 1 )) && continue
+      # skip excluded service ports that are "expected" infra? We WANT to flag extras.
+      # ignore dns/dhcp-ish
+      case "$port" in
+        53|68|323) continue ;;
+      esac
+      proc=""
+      if [[ "$line" == *'users:(('* ]]; then
+        proc="$(sed -n 's/.*users:(("\([^"]*\).*/\1/p' <<<"$line" | head -1 || true)"
+      fi
+      extras+=("${port}:${proc:-?}")
+    done < <(ss -lntp 2>/dev/null | awk 'NR>1' || true)
+  fi
+  if [[ ${#extras[@]} -eq 0 ]]; then
+    _audit_ok "Лишних публичных TCP-слушателей кроме SSH/клиентов/панели не видно"
+  else
+    local show
+    show="$(printf '%s\n' "${extras[@]}" | head -12 | paste -sd ', ' -)"
+    _audit_warn "Лишние публичные порты: ${show} — закройте или уберите сервисы (не трогаем сами)"
+  fi
+}
+
+run_node_audit() {
+  step "Проверка на блокировку и палевность ноды (read-only)"
+  echo "Ничего не меняем: без правок firewall/sysctl/docker, без влияния на скорость клиентов."
+  menu_sep
+
+  local pub_ip=""
+  if ! pub_ip="$(_audit_detect_public_ipv4)"; then
+    _audit_err "Не удалось определить публичный IPv4 — внешнюю проверку пропускаем"
+    pub_ip=""
+  fi
+
+  _audit_ensure_client_ports
+  local -a ports=()
+  if [[ ${#DETECTED_CLIENT_PORTS[@]} -gt 0 ]]; then
+    ports=("${DETECTED_CLIENT_PORTS[@]}")
+  fi
+
+  if [[ -n "$pub_ip" ]]; then
+    _audit_reachability_from_russia "$pub_ip" "${ports[@]}"
+  fi
+
+  echo
+  _audit_xray_self
+  echo
+  _audit_server_level
+
+  echo
+  menu_sep
+  ok "Аудит завершён (read-only). Рекомендации выше — применяйте вручную / пунктом установки защиты."
+  echo "Повтор: gorecshit --audit   |   пункт меню «Проверка на блокировку и палевность ноды»"
+}
+
 _cli_script_looks_valid() {
   # $1 = path; require shebang+bash and bash -n
   local f="$1" first
@@ -1106,13 +1889,14 @@ interactive_menu() {
     printf '  %b5)%b 🔍 Проверка DPI/блокировок\n' "${C_BOLD}" "${C_RESET}"
     printf '  %b6)%b ↩️  Откат\n' "${C_BOLD}" "${C_RESET}"
     printf '  %b7)%b ⬆️  Обновить gorecshit (GitHub)\n' "${C_BOLD}" "${C_RESET}"
+    printf '  %b8)%b 🛡️  Проверка на блокировку и палевность ноды\n' "${C_BOLD}" "${C_RESET}"
     menu_sep
     printf '  %b0)%b 🚪 Выход\n' "${C_BOLD}" "${C_RESET}"
-    printf '%bCLI: gorecshit [--status|--update|--yes|--modules …]%b\n' "${C_GREY}" "${C_RESET}"
+    printf '%bCLI: gorecshit [--status|--update|--audit|--yes|--modules …]%b\n' "${C_GREY}" "${C_RESET}"
     if [[ -w /dev/tty ]]; then
-      printf '%bВыберите пункт [0-7]:%b ' "${C_BOLD}" "${C_RESET}" > /dev/tty
+      printf '%bВыберите пункт [0-8]:%b ' "${C_BOLD}" "${C_RESET}" > /dev/tty
     else
-      printf '%bВыберите пункт [0-7]:%b ' "${C_BOLD}" "${C_RESET}"
+      printf '%bВыберите пункт [0-8]:%b ' "${C_BOLD}" "${C_RESET}"
     fi
     read_user_input choice
     case "$choice" in
@@ -1153,6 +1937,9 @@ interactive_menu() {
           exec gorecshit
         fi
         warn "Обновление записано, но re-exec не удался — перезапустите: gorecshit"
+        ;;
+      8)
+        run_node_audit
         ;;
       0|q|Q)
         exit 0
@@ -3354,6 +4141,7 @@ main() {
   # Also open menu when invoked as `gorecshit` with zero args (even if not a TTY? require TTY)
   if [[ "$ASSUME_YES" -eq 0 && "$DO_ROLLBACK" -eq 0 && "$CHECK_ONLY" -eq 0 \
         && "$DO_REFRESH_LISTS_ONLY" -eq 0 && "$DO_STATUS_ONLY" -eq 0 && "$DO_DPI_CHECK" -eq 0 \
+        && "$DO_AUDIT" -eq 0 \
         && "$DO_UPDATE_ONLY" -eq 0 \
         && -t 0 && -t 1 ]]; then
     interactive_menu
@@ -3366,6 +4154,11 @@ main() {
 
   if [[ "$DO_DPI_CHECK" -eq 1 ]]; then
     run_dpi_check
+    exit 0
+  fi
+
+  if [[ "$DO_AUDIT" -eq 1 ]]; then
+    run_node_audit
     exit 0
   fi
 

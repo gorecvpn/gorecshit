@@ -2,11 +2,11 @@
 
 Однокомандное hardening-окружение для **нод Remnawave** (Debian 11+ / Ubuntu 20.04+).
 
-**Версия: 2.2.9**
+**Версия: 2.3.0**
 
 Скрипт идемпотентен: его можно запускать повторно. IP панели **не зашит** в репозиторий — его нужно передать параметром `--panel-ip` (или выбрать в интерактивном меню).
 
-Точка входа: `install.sh` (симлинк `gorecshit.sh` → тот же скрипт).
+Точка входа: `install.sh` и `gorecshit.sh` — **идентичные полные файлы** (не symlink в репозитории).
 
 ## Что делает
 
@@ -22,7 +22,7 @@
 10. **SSH** — Banner none, MaxAuthTries 3, опция `--ssh-port N` (сначала UFW, `sshd -t`, **22 сохраняется**). Парольный и root-логин **не** отключаются. fail2ban sshd + **recidive**; сканеры из ipset режутся до SSH.
 11. **Блоклист сканеров** — ipset + weekly timer; **зеркала** raw.githubusercontent.com → cdn.jsdelivr.net / fastly.jsdelivr.net; `--blocklist-from`; never-block для панели/релеев/`$SSH_CLIENT`/private/bogons.
 12. **Стелс** — нейтральный hostname `web-<hex>`, без баннеров, предупреждение о лишних слушателях, отключение nginx default site; NODE_PORT только с панели.
-13. **`--check` / `--rollback` / `--status` / `--version` / `--refresh-lists` / `--dpi-check` / `--update`**.
+13. **`--check` / `--rollback` / `--status` / `--version` / `--refresh-lists` / `--dpi-check` / `--audit` / `--update`**.
 
 ## Меню (TTY)
 
@@ -37,10 +37,11 @@
   5) 🔍 Проверка DPI/блокировок
   6) ↩️  Откат
   7) ⬆️  Обновить gorecshit (GitHub)
+  8) 🛡️  Проверка на блокировку и палевность ноды
 ────────────────────────────────────────
   0) 🚪 Выход
-CLI: gorecshit [--status|--update|--yes|--modules …]
-Выберите пункт [0-7]:
+CLI: gorecshit [--status|--update|--audit|--yes|--modules …]
+Выберите пункт [0-8]:
 ```
 
 ## Проверка DPI/блокировок
@@ -61,7 +62,26 @@ sudo bash gorecshit.sh --dpi-check
 
 На зарубежной VPS обычно всё OK — это нормально (российский DPI на пути ноды нет). Модуль полезен как диагностика egress/DNS ноды.
 
+## Проверка на блокировку и палевность ноды
+
+Read-only аудит (меню «8» / `--audit`): **ничего не меняет**, firewall/скорость не трогает.
+
+1. **Доступность из России** — публичный IPv4 ноды + клиентские TCP-порты (тот же детект, что из xray inbounds). Через API [check-host.net](https://check-host.net) (`check-tcp` / `check-ping`, узлы `country=RU` + несколько зарубежных для сравнения). По каждому порту: «из России: доступен N/M», «из-за рубежа: …»; если зарубежье OK, а РФ нет → «IP, вероятно, заблокирован в РФ (ТСПУ)». Таймаут/ошибки API обрабатываются мягко (~60с общий лимит). Нужен `curl` (jq необязателен; есть fallback на python3 / grep).
+2. **Палевность** — чтение конфига xray из `docker exec remnanode` (или локальных путей). Для VLESS/REALITY: порт ≠443, flow ≠ vision, «плохой» dest/SNI, dest без TLS1.3+h2, пустые shortIds, нет block bittorrent, plain TLS/WS без CDN. Сервер: отвечает ли ICMP echo, лишние публичные порты, SSH на 22, UFW выключен. Строки ✅/⚠️ с короткой рекомендацией на русском.
+
+```bash
+sudo bash install.sh --audit
+# или
+gorecshit --audit
+```
+
 ## Changelog
+
+### v2.3.0
+
+- Меню «8» / `--audit`: проверка доступности IP:PORT из РФ через check-host.net (RU + зарубежные узлы, ping) и self-audit палевности xray/REALITY + серверных маркеров (ICMP, лишние порты, SSH/22, UFW)
+- Только чтение: без правок firewall/sysctl/docker; общий лимит внешней проверки ~60с; `curl` обязателен, jq/python3 опциональны
+- Версия **2.3.0**; `install.sh` и `gorecshit.sh` — идентичные полные файлы
 
 ### v2.2.9
 
@@ -203,6 +223,7 @@ sudo bash install.sh --panel-ip X.X.X.X --modules ufw,blocklist,hide_ports,anti_
 | `--refresh-lists` | Только обновить ipset-списки. |
 | `--status` | Показать статус. |
 | `--dpi-check` | DNS/TLS/SNI/TCP16 egress-проверка с ноды. |
+| `--audit` | Доступность из РФ (check-host) + аудит палевности xray/сервера (read-only). |
 | `--update` | Самообновление `install.sh` → `/usr/local/sbin/gorecshit` (GitHub, fallback jsDelivr). |
 | `--rollback` / `--uninstall` | Откат из бэкапа. |
 
@@ -229,6 +250,7 @@ sudo /root/hardening-backups/<timestamp>/rollback.sh
 - Debian 11+ или Ubuntu 20.04+
 - Сеть для `apt` и (опционально) загрузки блоклистов; при недоступности GitHub работают jsDelivr-зеркала и `--blocklist-from`
 - Для `--dpi-check`: `curl`, `openssl`, `timeout` (обычно уже есть)
+- Для `--audit`: `curl` (+ желательно `python3`/`openssl`); check-host.net должен быть доступен с ноды
 
 ## Лицензия
 
