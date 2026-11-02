@@ -2,7 +2,7 @@
 
 Однокомандное hardening-окружение для **нод Remnawave** (Debian 11+ / Ubuntu 20.04+).
 
-**Версия: 2.3.0**
+**Версия: 2.3.1**
 
 Скрипт идемпотентен: его можно запускать повторно. IP панели **не зашит** в репозиторий — его нужно передать параметром `--panel-ip` (или выбрать в интерактивном меню).
 
@@ -67,7 +67,7 @@ sudo bash gorecshit.sh --dpi-check
 Read-only аудит (меню «8» / `--audit`): **ничего не меняет**, firewall/скорость не трогает.
 
 1. **Доступность из России** — публичный IPv4 ноды + клиентские TCP-порты (тот же детект, что из xray inbounds). Через API [check-host.net](https://check-host.net) (`check-tcp` / `check-ping`, узлы `country=RU` + несколько зарубежных для сравнения). По каждому порту: «из России: доступен N/M», «из-за рубежа: …»; если зарубежье OK, а РФ нет → «IP, вероятно, заблокирован в РФ (ТСПУ)». Таймаут/ошибки API обрабатываются мягко (~60с общий лимит). Нужен `curl` (jq необязателен; есть fallback на python3 / grep).
-2. **Палевность** — чтение конфига xray из `docker exec remnanode` (или локальных путей). Для VLESS/REALITY: порт ≠443, flow ≠ vision, «плохой» dest/SNI, dest без TLS1.3+h2, пустые shortIds, нет block bittorrent, plain TLS/WS без CDN. Сервер: отвечает ли ICMP echo, лишние публичные порты, SSH на 22, UFW выключен. Строки ✅/⚠️ с короткой рекомендацией на русском.
+2. **Палевность** — чтение конфига xray из контейнера `remnawave/node` / remnanode (файлы, `/proc` `-config`, xray API); если конфиг только в runtime/stdin — пассивный TLS/REALITY-зонд локальных портов (CN/SAN маскировки). Для VLESS/REALITY: порт ≠443, flow ≠ vision, «плохой» dest/SNI, dest без TLS1.3+h2, пустые shortIds, нет block bittorrent, plain TLS/WS без CDN. Сервер: отвечает ли ICMP echo, лишние публичные порты, SSH на 22, UFW выключен. Строки ✅/⚠️ с короткой рекомендацией на русском.
 
 ```bash
 sudo bash install.sh --audit
@@ -76,6 +76,12 @@ gorecshit --audit
 ```
 
 ## Changelog
+
+### v2.3.1
+
+- `--audit`: устойчивый поиск конфига xray (docker image `remnawave/node`, имя контейнера, `/proc/.../cmdline -config`, xray API, find json); если файла нет (stdin/runtime от панели) — пассивный REALITY/TLS-зонд по клиентским портам (CN/SAN, TLS1.3, h2)
+- ICMP: приоритет у результата check-host ping (0/N → ✅ скрыт); локальные iptables/nft/ufw/sysctl — только fallback
+- UFW inactive: явное «защита gorecshit не установлена/выключена»
 
 ### v2.3.0
 

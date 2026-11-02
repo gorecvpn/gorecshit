@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# gorecshit v2.3.0 — one-command hardening for Remnawave VPN node servers (Debian 11+/Ubuntu 20.04+)
+# gorecshit v2.3.1 — one-command hardening for Remnawave VPN node servers (Debian 11+/Ubuntu 20.04+)
 # Usage:
 #   bash install.sh --panel-ip X.X.X.X [--node-port 2222] [--yes]
 #   bash install.sh --check --panel-ip X.X.X.X
@@ -8,7 +8,7 @@
 # Does NOT restart Docker while remnanode/xray is live. Does NOT deploy itself.
 set -Eeuo pipefail
 
-VERSION="2.3.0"
+VERSION="2.3.1"
 SCRIPT_NAME="gorecshit"
 BACKUP_ROOT="/root/hardening-backups"
 
@@ -82,6 +82,15 @@ DO_STATUS_ONLY=0
 DO_DPI_CHECK=0
 DO_AUDIT=0
 DO_UPDATE_ONLY=0
+# audit reachability side-channel (ICMP via check-host)
+AUDIT_PING_DONE=0
+AUDIT_PING_RU_OK=0
+AUDIT_PING_RU_TOT=0
+AUDIT_PING_FR_OK=0
+AUDIT_PING_FR_TOT=0
+AUDIT_XRAY_STDIN_CONFIG=0
+AUDIT_XRAY_PID=""
+
 INTERACTIVE=0
 LOG_FILE="/var/log/gorecshit.log"
 
@@ -881,7 +890,7 @@ _audit_http_get() {
   # usage: _audit_http_get URL [timeout_sec]
   local url="$1" t="${2:-15}"
   curl -fsS --connect-timeout 5 --max-time "$t" \
-    -H 'Accept: application/json' -A 'gorecshit-audit/2.3.0' \
+    -H 'Accept: application/json' -A 'gorecshit-audit/2.3.1' \
     "$url" 2>/dev/null || true
 }
 
@@ -892,7 +901,7 @@ _audit_detect_public_ipv4() {
     'https://ifconfig.me/ip' \
     'https://ipv4.icanhazip.com' \
     'https://checkip.amazonaws.com'; do
-    ip="$(curl -fsS --connect-timeout 4 --max-time 8 -A 'gorecshit-audit/2.3.0' "$src" 2>/dev/null | tr -d '[:space:]' || true)"
+    ip="$(curl -fsS --connect-timeout 4 --max-time 8 -A 'gorecshit-audit/2.3.1' "$src" 2>/dev/null | tr -d '[:space:]' || true)"
     if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
       printf '%s\n' "$ip"
       return 0
@@ -1174,6 +1183,9 @@ _audit_reachability_from_russia() {
   local started_at
   started_at="$(date +%s)"
 
+  AUDIT_PING_DONE=0
+  AUDIT_PING_RU_OK=0; AUDIT_PING_RU_TOT=0
+  AUDIT_PING_FR_OK=0; AUDIT_PING_FR_TOT=0
   step "Доступность IP из России (check-host.net)"
   _audit_info "Публичный IPv4: ${pub_ip}"
   if [[ ${#ports[@]} -eq 0 ]]; then
@@ -1250,8 +1262,13 @@ _audit_reachability_from_russia() {
       body="$(_audit_checkhost_poll "$rid" "$deadline")"
       if [[ -n "$body" ]]; then
         read -r ru_ok ru_tot fr_ok fr_tot < <(printf '%s' "$body" | _audit_summarize_tcp_result "${AUDIT_RU_NODES[@]}" -- "${AUDIT_FOREIGN_NODES[@]}")
-        _audit_info "ping из России: ${ru_ok:-0}/${ru_tot:-0} узлов"
-        _audit_info "ping из-за рубежа: ${fr_ok:-0}/${fr_tot:-0} узлов"
+        AUDIT_PING_RU_OK="${ru_ok:-0}"
+        AUDIT_PING_RU_TOT="${ru_tot:-0}"
+        AUDIT_PING_FR_OK="${fr_ok:-0}"
+        AUDIT_PING_FR_TOT="${fr_tot:-0}"
+        AUDIT_PING_DONE=1
+        _audit_info "ping из России: ${AUDIT_PING_RU_OK}/${AUDIT_PING_RU_TOT} узлов"
+        _audit_info "ping из-за рубежа: ${AUDIT_PING_FR_OK}/${AUDIT_PING_FR_TOT} узлов"
       else
         _audit_warn "Нет результата check-ping"
       fi
@@ -1322,20 +1339,114 @@ _audit_openssl_dest() {
   fi
 }
 
-_audit_xray_self() {
-  step "Самоаудит палевности (локальный xray / REALITY)"
-  local json
-  json="$(collect_xray_config_json 2>/dev/null || true)"
-  if [[ -z "$json" ]] || ! printf '%s' "$json" | grep -q '"inbounds"'; then
-    _audit_warn "Конфиг xray недоступен (docker exec remnanode / файлы) — пропускаем разбор inbounds"
-    _audit_info "Подсказка: контейнер remnanode должен быть запущен; конфиг обычно в /var/lib/remnanode/xray/config.json"
+
+_audit_passive_reality_probe() {
+  # Fallback when xray config is not readable: probe local client ports with openssl.
+  # REALITY typically falls through to dest cert for unauthenticated probes.
+  step "Пассивный REALITY/TLS-зонд (конфиг xray недоступен)"
+  _audit_info "Конфиг из панели в runtime часто без файла — смотрим сертификат/ALPN на локальных клиентских портах (read-only)"
+  command -v openssl >/dev/null 2>&1 || {
+    _audit_warn "openssl нет — пассивный зонд невозможен"
+    return 0
+  }
+  local -a ports=()
+  if [[ ${#DETECTED_CLIENT_PORTS[@]} -gt 0 ]]; then
+    ports=("${DETECTED_CLIENT_PORTS[@]}")
+  fi
+  if [[ ${#ports[@]} -eq 0 ]]; then
+    _audit_warn "Нет клиентских портов для зонда (задайте --client-ports)"
     return 0
   fi
-  _audit_ok "Конфиг xray прочитан (только чтение)"
+  local -a snis=(
+    www.microsoft.com www.cloudflare.com www.google.com dl.google.com
+    www.apple.com www.yahoo.com www.bing.com gateway.icloud.com
+  )
+  local port sni out proto alpn subj sans cn masked q
+  local any=0
+  for port in "${ports[@]}"; do
+    [[ "$port" =~ ^[0-9]+$ ]] || continue
+    any=1
+    echo
+    printf '%bПорт %s (локальный TLS-зонд):%b\n' "${C_BOLD}" "$port" "${C_RESET}"
+    if [[ "$port" == "443" ]]; then
+      _audit_ok "Порт 443 — хорошо маскируется под HTTPS"
+    else
+      _audit_warn "Порт ${port} ≠ 443 — для REALITY лучше 443 (меньше палевности)"
+    fi
+    out=""
+    masked=""
+    proto=""
+    alpn=""
+    for sni in "${snis[@]}" ""; do
+      if [[ -n "$sni" ]]; then
+        out="$(timeout 6 openssl s_client -connect "127.0.0.1:${port}" -servername "$sni" -tls1_3 -alpn h2 </dev/null 2>/dev/null | tr -d '\0' || true)"
+      else
+        out="$(timeout 6 openssl s_client -connect "127.0.0.1:${port}" -tls1_3 -alpn h2 </dev/null 2>/dev/null | tr -d '\0' || true)"
+      fi
+      if printf '%s' "$out" | grep -qiE 'BEGIN CERTIFICATE|subject=|Protocol  *:'; then
+        break
+      fi
+      out=""
+    done
+    if [[ -z "$out" ]]; then
+      # retry without forcing tls1.3
+      out="$(timeout 6 openssl s_client -connect "127.0.0.1:${port}" -servername www.microsoft.com -alpn h2 </dev/null 2>/dev/null | tr -d '\0' || true)"
+    fi
+    if [[ -z "$out" ]] || ! printf '%s' "$out" | grep -qiE 'BEGIN CERTIFICATE|subject='; then
+      _audit_warn "TLS-ответ на 127.0.0.1:${port} не получен — порт не TLS/закрыт локально или нужен REALITY shortId"
+      continue
+    fi
+    proto="$(printf '%s' "$out" | grep -iE '^[[:space:]]*Protocol[[:space:]]*:' | head -1 | sed -E 's/.*:[[:space:]]*//' | tr -d '\r')"
+    alpn="$(printf '%s' "$out" | grep -iE 'ALPN[[:space:]]+protocol:' | head -1 | sed -E 's/.*:[[:space:]]*//' | tr -d '\r')"
+    subj="$(printf '%s' "$out" | grep -iE '^subject=' | head -1 | tr -d '\r')"
+    cn="$(printf '%s' "$subj" | sed -nE 's/.*CN[[:space:]]*=[[:space:]]*([^/,]+).*/\1/p' | head -1)"
+    sans="$(printf '%s' "$out" | grep -i 'DNS:' | head -3 | tr '\n' ' ' | tr -d '\r')"
+    masked="${cn:-}"
+    if [[ -z "$masked" && -n "$sans" ]]; then
+      masked="$(printf '%s' "$sans" | grep -oE 'DNS:[^, ]+' | head -1 | sed 's/DNS://')"
+    fi
+    if [[ -n "$masked" ]]; then
+      _audit_info "Маскировочный сертификат/домен: ${masked}"
+      [[ -n "$sans" ]] && _audit_info "SAN: ${sans}"
+      q="$(_audit_reality_dest_quality "$masked")"
+      case "$q" in
+        good) _audit_ok "CN/SAN похож на крупный зарубежный сайт — хорошо для REALITY" ;;
+        ru)   _audit_warn "CN/SAN российский (${masked}) — лучше gstatic/microsoft/apple" ;;
+        small) _audit_warn "CN/SAN мелкий/подозрительный (${masked})" ;;
+        *)    _audit_warn "CN/SAN «${masked}» — предпочтительны крупные зарубежные домены" ;;
+      esac
+      # dest reachability from this server
+      local tls_res
+      tls_res="$(_audit_openssl_dest "$masked" 443)"
+      case "$tls_res" in
+        ok) _audit_ok "Маскировочный домен ${masked}:443 доступен (TLS1.3 + h2) с ноды" ;;
+        tls13) _audit_warn "Маскировочный домен ${masked}:443 — TLS1.3 есть, h2 не подтверждён" ;;
+        no_openssl) : ;;
+        *) _audit_warn "Маскировочный домен ${masked}:443 не открылся по TLS1.3/h2 с ноды" ;;
+      esac
+    else
+      _audit_warn "Не удалось извлечь CN/SAN из сертификата на порту ${port}"
+    fi
+    if printf '%s' "$proto" | grep -qi 'TLSv1\.3'; then
+      _audit_ok "TLS ${proto:-1.3}"
+    else
+      _audit_warn "Протокол «${proto:-unknown}» — для REALITY ожидается TLS1.3"
+    fi
+    if printf '%s' "$alpn" | grep -qi 'h2'; then
+      _audit_ok "ALPN h2"
+    else
+      _audit_warn "ALPN «${alpn:-нет}» — желателен h2 (как у обычного HTTPS)"
+    fi
+  done
+  [[ "$any" -eq 1 ]] || _audit_warn "Нечего зондировать"
+  _audit_info "Полный разбор flow/shortIds/bittorrent без конфига недоступен — настройки панели не трогаем"
+}
 
+_audit_report_inbounds_from_json() {
+  # Shared reporter used when JSON config is available (stdin: json).
+  local json="$1"
   if ! command -v python3 >/dev/null 2>&1; then
     _audit_warn "python3 нет — детальный разбор inbounds ограничен"
-    # minimal grep checks
     if printf '%s' "$json" | grep -qi 'xtls-rprx-vision'; then
       _audit_ok "Встречается flow xtls-rprx-vision"
     else
@@ -1356,7 +1467,10 @@ cfg=json.load(sys.stdin)
 inbounds=cfg.get("inbounds") or []
 if isinstance(inbounds,dict):
   inbounds=list(inbounds.values())
-routing=cfg.get("routing") or {}
+# API lsi sometimes returns {"inbounds":[...]} or a bare list
+if isinstance(cfg,list):
+  inbounds=cfg
+routing=cfg.get("routing") or {} if isinstance(cfg,dict) else {}
 rules=routing.get("rules") or []
 bt=False
 for r in rules:
@@ -1368,7 +1482,6 @@ for r in rules:
   if "bittorrent" in joined or "bit torrent" in joined:
     bt=True
   outbound=(r.get("outboundTag") or r.get("outbound_tag") or "")
-  # also match domain/keyword style
   s=json.dumps(r).lower()
   if "bittorrent" in s and ("blocked" in str(outbound).lower() or "blackhole" in str(outbound).lower() or r.get("type")=="field"):
     bt=True
@@ -1389,7 +1502,6 @@ for ib in inbounds:
   network=(ss.get("network") or ib.get("network") or "tcp").lower()
   rs=ss.get("realitySettings") or ss.get("reality_settings") or {}
   ts=ss.get("tlsSettings") or ss.get("tls_settings") or {}
-  ws=ss.get("wsSettings") or ss.get("ws_settings") or {}
   clients=((ib.get("settings") or {}).get("clients")) or []
   flows=[]
   for c in clients:
@@ -1417,6 +1529,7 @@ for ib in inbounds:
 
   if [[ -z "$report" ]]; then
     _audit_warn "Не удалось разобрать JSON inbounds"
+    _audit_passive_reality_probe
     return 0
   fi
 
@@ -1476,7 +1589,6 @@ for ib in inbounds:
         esac
       fi
     else
-      # non-REALITY
       if [[ "$security" == "none" || "$security" == "-" || -z "$security" ]]; then
         _audit_warn "Нет REALITY/TLS (${proto}/${network}) — трафик легче классифицировать как VPN"
       elif [[ "$network" == "ws" || "$network" == "websocket" ]]; then
@@ -1491,48 +1603,88 @@ for ib in inbounds:
   done <<<"$report"
 
   if [[ "$ib_count" -eq 0 ]]; then
-    _audit_warn "VLESS/VMESS/Trojan inbounds не найдены в конфиге"
+    _audit_warn "VLESS/VMESS/Trojan inbounds не найдены в конфиге — пробуем пассивный зонд"
+    _audit_passive_reality_probe
   fi
 }
 
+
+_audit_xray_self() {
+  step "Самоаудит палевности (локальный xray / REALITY)"
+  local json
+  json="$(collect_xray_config_json 2>/dev/null || true)"
+  if [[ -n "$json" ]] && printf '%s' "$json" | grep -q '"inbounds"'; then
+    _audit_ok "Конфиг xray прочитан (только чтение)"
+    _audit_report_inbounds_from_json "$json"
+    return 0
+  fi
+  _audit_warn "Статический конфиг xray недоступен (Remnawave часто отдаёт конфиг из панели в runtime / stdin)"
+  if [[ "${AUDIT_XRAY_STDIN_CONFIG:-0}" -eq 1 ]]; then
+    _audit_info "Обнаружен запуск xray с -config stdin: — пробуем API/зонд"
+  fi
+  # one more API attempt after discovery side-effects
+  local cname cjson
+  cname="$(_find_remnanode_container 2>/dev/null || true)"
+  cjson="$(_try_xray_api_inbounds_json "${cname:-}" "${AUDIT_XRAY_PID:-}" 2>/dev/null || true)"
+  if [[ -n "$cjson" ]] && printf '%s' "$cjson" | grep -q '"inbounds"'; then
+    _audit_ok "Конфиг получен через xray API (read-only)"
+    _audit_report_inbounds_from_json "$cjson"
+    return 0
+  fi
+  _audit_passive_reality_probe
+}
+
+
 _audit_server_level() {
   step "Сервер: признаки «палевной» ноды (только проверка)"
-  # ICMP echo answered? (we send to self public IP or local stack via ping -c1 to pub ip from outside perspective is hard;
-  # check locally whether icmp echo-request is DROPped in iptables/ufw/raw — and/or ping 127.0.0.1 is always ok.
-  # Better: see if INPUT/DOCKER drops icmp echo; also try listening: use check from earlier ping section.
-  # Local heuristic: iptables/nft/ufw rules for icmp)
-  local icmp_drop=0
-  if command -v iptables >/dev/null 2>&1; then
-    if iptables -S 2>/dev/null | grep -qiE 'icmp-type[[:space:]]*8.*DROP|DROP.*icmp-type[[:space:]]*8|icmp[[:space:]]+--icmp-type[[:space:]]+8[[:space:]]+-j[[:space:]]+DROP'; then
-      icmp_drop=1
-    fi
-    if iptables -S INPUT 2>/dev/null | grep -qiE '\-p icmp .*-j DROP'; then
-      icmp_drop=1
-    fi
-  fi
-  if command -v ufw >/dev/null 2>&1; then
-    if ufw status verbose 2>/dev/null | grep -qiE 'ICMP.*(deny|DROP)|deny[[:space:]]+\(v6\)?[[:space:]]*$'; then
-      :
+  # Prefer external check-host ping (ground truth from the internet). Local heuristics only as fallback.
+  local icmp_hidden=-1  # -1 unknown, 1 hidden, 0 visible
+  if [[ "${AUDIT_PING_DONE:-0}" -eq 1 ]]; then
+    local _ptot=$(( ${AUDIT_PING_RU_TOT:-0} + ${AUDIT_PING_FR_TOT:-0} ))
+    local _pok=$(( ${AUDIT_PING_RU_OK:-0} + ${AUDIT_PING_FR_OK:-0} ))
+    if (( _ptot > 0 )); then
+      if (( _pok == 0 )); then
+        icmp_hidden=1
+        _audit_ok "ICMP снаружи скрыт (check-host ping ${_pok}/${_ptot} узлов) — нода не светится ping'ом"
+      else
+        icmp_hidden=0
+        _audit_warn "ICMP снаружи отвечает (check-host ping ${_pok}/${_ptot}) — для стелса лучше DROP echo-request (не трогаем сами)"
+      fi
     fi
   fi
-  # Also: gorecshit stealth often writes icmp DROP in /etc/ufw/before.rules — detect comment/rules
-  if [[ -f /etc/ufw/before.rules ]] && grep -qE 'icmp-type 8|ECHO REQUEST' /etc/ufw/before.rules 2>/dev/null; then
-    if grep -A1 -E 'ECHO REQUEST|icmp-type 8' /etc/ufw/before.rules 2>/dev/null | grep -q DROP; then
-      icmp_drop=1
-    fi
-  fi
-  if [[ "$icmp_drop" -eq 1 ]]; then
-    _audit_ok "ICMP echo-request, похоже, режется — ping снаружи не светит ноду"
-  else
-    # active probe: does kernel answer echo on a non-loopback? Use sysctl ignore?
-    local ignore=0
-    if [[ -r /proc/sys/net/ipv4/icmp_echo_ignore_all ]] && [[ "$(cat /proc/sys/net/ipv4/icmp_echo_ignore_all)" == "1" ]]; then
+  if [[ "$icmp_hidden" -eq -1 ]]; then
+    local icmp_drop=0 ignore=0
+    if [[ -r /proc/sys/net/ipv4/icmp_echo_ignore_all ]] && [[ "$(cat /proc/sys/net/ipv4/icmp_echo_ignore_all 2>/dev/null)" == "1" ]]; then
       ignore=1
+      icmp_drop=1
     fi
-    if [[ "$ignore" -eq 1 ]]; then
-      _audit_ok "icmp_echo_ignore_all=1 — echo не отвечает"
+    if command -v iptables >/dev/null 2>&1; then
+      if iptables -S 2>/dev/null | grep -qiE 'icmp-type[[:space:]]*8.*DROP|DROP.*icmp-type[[:space:]]*8|icmp[[:space:]]+--icmp-type[[:space:]]+8[[:space:]]+-j[[:space:]]+DROP'; then
+        icmp_drop=1
+      fi
+      if iptables -S INPUT 2>/dev/null | grep -qiE '\-p icmp .*(-j DROP|-j REJECT)'; then
+        icmp_drop=1
+      fi
+    fi
+    if command -v nft >/dev/null 2>&1; then
+      if nft list ruleset 2>/dev/null | grep -qiE 'icmp.*(type[[:space:]]*)?(echo-request|8).*drop|drop.*icmp.*(echo-request|type 8)'; then
+        icmp_drop=1
+      fi
+    fi
+    if [[ -f /etc/ufw/before.rules ]]; then
+      if grep -A2 -E 'ECHO REQUEST|icmp-type 8|icmp --icmp-type 8' /etc/ufw/before.rules 2>/dev/null | grep -qiE 'DROP|REJECT'; then
+        icmp_drop=1
+      fi
+    fi
+    if [[ -f /etc/ufw/before6.rules ]]; then
+      if grep -A2 -E 'ECHO REQUEST|icmpv6-type.*(128|echo-request)' /etc/ufw/before6.rules 2>/dev/null | grep -qiE 'DROP|REJECT'; then
+        icmp_drop=1
+      fi
+    fi
+    if [[ "$icmp_drop" -eq 1 || "$ignore" -eq 1 ]]; then
+      _audit_ok "ICMP echo-request, похоже, режется локально (iptables/nft/ufw/sysctl) — внешний check-host ping недоступен для подтверждения"
     else
-      _audit_warn "ICMP echo, похоже, отвечает — для стелса лучше DROP echo-request (не трогаем сами)"
+      _audit_warn "Локально ICMP echo не выглядит отключённым (и нет данных check-host) — для стелса лучше DROP echo-request (не трогаем сами)"
     fi
   fi
 
@@ -1562,7 +1714,7 @@ _audit_server_level() {
   if [[ "$ufw_active" -eq 1 ]]; then
     _audit_ok "UFW активен"
   else
-    _audit_warn "UFW неактивен — публичная поверхность шире; включите защиту (пункт меню 1)"
+    _audit_warn "UFW неактивен — защита gorecshit не установлена/выключена; публичная поверхность шире (пункт меню 1)"
   fi
 
   # Extra listening public ports besides SSH / clients / panel-port
@@ -2127,10 +2279,154 @@ for ib in inbounds:
 ' 2>/dev/null || true
 }
 
+_find_remnanode_container() {
+  # Print best-effort running container name/id for Remnawave node (read-only).
+  command -v docker >/dev/null 2>&1 || return 1
+  local line id image names
+  # Prefer image remnawave/node, then name remnanode / *node*
+  while IFS=$'\t' read -r id image names; do
+    [[ -n "$image" ]] || continue
+    if printf '%s' "$image" | grep -qiE 'remnawave/node|remnanode'; then
+      printf '%s\n' "${names%%,*}"
+      return 0
+    fi
+  done < <(docker ps --format '{{.ID}}\t{{.Image}}\t{{.Names}}' 2>/dev/null || true)
+  while IFS=$'\t' read -r id image names; do
+    [[ -n "$names" ]] || continue
+    if printf '%s' "$names" | grep -qiE 'remnanode|remnawave'; then
+      printf '%s\n' "${names%%,*}"
+      return 0
+    fi
+  done < <(docker ps --format '{{.ID}}\t{{.Image}}\t{{.Names}}' 2>/dev/null || true)
+  while IFS=$'\t' read -r id image names; do
+    [[ -n "$names" ]] || continue
+    if printf '%s' "$names" | grep -qiE '(^|[-_])node($|[-_,])' \
+      && ! printf '%s' "$names" | grep -qiE 'watchtower|portainer|nginx|caddy|postgres|redis|mariadb'; then
+      printf '%s\n' "${names%%,*}"
+      return 0
+    fi
+    if printf '%s' "$image" | grep -qiE 'remnawave'; then
+      printf '%s\n' "${names%%,*}"
+      return 0
+    fi
+  done < <(docker ps --format '{{.ID}}\t{{.Image}}\t{{.Names}}' 2>/dev/null || true)
+  return 1
+}
+
+_xray_json_looks_valid() {
+  local s="$1"
+  [[ -n "$s" ]] || return 1
+  printf '%s' "$s" | grep -q '"inbounds"' || return 1
+  # reject tiny stubs
+  [[ ${#s} -gt 40 ]] || return 1
+  return 0
+}
+
+_read_config_via_proc_cmdline() {
+  # Find xray/rw-core pid, parse -config / --config=, read file (host or /proc/pid/root).
+  local pid cmdline arg next="" cfg="" cand
+  for pid in $(pgrep -f 'xray|rw-core' 2>/dev/null || true); do
+    [[ -r "/proc/$pid/cmdline" ]] || continue
+    cmdline="$(tr '\0' '\n' <"/proc/$pid/cmdline" 2>/dev/null || true)"
+    next=""
+    while IFS= read -r arg; do
+      if [[ -n "$next" ]]; then
+        cfg="$arg"
+        next=""
+        break
+      fi
+      case "$arg" in
+        -config|--config)
+          next=1
+          ;;
+        -config=*|--config=*)
+          cfg="${arg#*=}"
+          break
+          ;;
+      esac
+    done <<<"$cmdline"
+    [[ -n "$cfg" ]] || continue
+    case "$cfg" in
+      stdin:|stdin|/dev/stdin|-|"" )
+        # signal stdin-config via special return text on fd3? use global
+        AUDIT_XRAY_STDIN_CONFIG=1
+        AUDIT_XRAY_PID="$pid"
+        continue
+        ;;
+    esac
+    for cand in "$cfg" "/proc/$pid/root$cfg" "/proc/$pid/root/${cfg#/}"; do
+      if [[ -f "$cand" ]] && grep -q '"inbounds"' "$cand" 2>/dev/null; then
+        cat "$cand"
+        return 0
+      fi
+    done
+  done
+  return 1
+}
+
+_try_xray_api_inbounds_json() {
+  # Best-effort: docker exec xray api / curl local API. Prints JSON with inbounds or fails.
+  local cname="${1:-}" pid="${2:-}" 
+  local api_addr="" envline out cmd bin
+  # Discover API listen from env / cmdline
+  if [[ -n "$cname" ]]; then
+    envline="$(docker exec "$cname" sh -c 'printenv | grep -iE "XRAY_API|API_PORT|XRAY_API_PORT|API_HOST" 2>/dev/null' 2>/dev/null || true)"
+    if printf '%s' "$envline" | grep -qoE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+'; then
+      api_addr="$(printf '%s' "$envline" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+' | head -1)"
+    elif printf '%s' "$envline" | grep -qoE '(^|[^0-9])([1-9][0-9]{3,4})([^0-9]|$)'; then
+      api_addr="127.0.0.1:$(printf '%s' "$envline" | grep -oE '[1-9][0-9]{3,4}' | head -1)"
+    fi
+    # cmdline inside container
+    if [[ -z "$api_addr" ]]; then
+      local cm
+      cm="$(docker exec "$cname" sh -c 'tr "\0" " " < /proc/1/cmdline 2>/dev/null; for p in /proc/[0-9]*; do tr "\0" " " < $p/cmdline 2>/dev/null; echo; done | grep -iE "xray|rw-core" | head -3' 2>/dev/null || true)"
+      if printf '%s' "$cm" | grep -qoE '([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:)?[1-9][0-9]{3,4}'; then
+        # look specifically for api flag patterns
+        api_addr="$(printf '%s' "$cm" | grep -oE '\-api[= ][^ ]+' | head -1 | sed -E 's/^-api[= ]//')"
+      fi
+    fi
+    # common remnawave/xray local API ports
+    local try_addr
+    for try_addr in ${api_addr:+$api_addr} 127.0.0.1:8080 127.0.0.1:10085 127.0.0.1:11111 127.0.0.1:62789; do
+      [[ -n "$try_addr" ]] || continue
+      for bin in xray /usr/local/bin/xray /usr/bin/xray rw-core; do
+        out="$(docker exec "$cname" sh -c "command -v $bin >/dev/null 2>&1 && $bin api lsi --server=$try_addr 2>/dev/null" 2>/dev/null || true)"
+        if _xray_json_looks_valid "$out"; then
+          printf '%s\n' "$out"
+          return 0
+        fi
+        out="$(docker exec "$cname" sh -c "command -v $bin >/dev/null 2>&1 && $bin api inbound --server=$try_addr 2>/dev/null" 2>/dev/null || true)"
+        if _xray_json_looks_valid "$out"; then
+          printf '%s\n' "$out"
+          return 0
+        fi
+        out="$(docker exec "$cname" sh -c "command -v $bin >/dev/null 2>&1 && $bin api adi --server=$try_addr 2>/dev/null" 2>/dev/null || true)"
+        # adi may not be full config; skip unless inbounds present
+        if _xray_json_looks_valid "$out"; then
+          printf '%s\n' "$out"
+          return 0
+        fi
+      done
+    done
+    # dump running config if binary supports it
+    out="$(docker exec "$cname" sh -c 'command -v xray >/dev/null && xray run -test -c /dev/null 2>/dev/null; ls /tmp /run /var/tmp 2>/dev/null | head' 2>/dev/null || true)"
+  fi
+  if [[ -n "$pid" && -r "/proc/$pid/cmdline" ]]; then
+    :
+  fi
+  return 1
+}
+
 collect_xray_config_json() {
-  local cjson="" cand cname f
+  local cjson="" cand cname f pid
+  AUDIT_XRAY_STDIN_CONFIG="${AUDIT_XRAY_STDIN_CONFIG:-0}"
+  AUDIT_XRAY_PID="${AUDIT_XRAY_PID:-}"
+
   if command -v docker >/dev/null 2>&1; then
-    cname="$(docker ps --format '{{.Names}}' 2>/dev/null | grep -iE 'remnanode' | head -1 || true)"
+    cname="$(_find_remnanode_container || true)"
+    if [[ -z "$cname" ]]; then
+      cname="$(docker ps --format '{{.Names}}' 2>/dev/null | grep -iE 'remnanode' | head -1 || true)"
+    fi
     if [[ -n "$cname" ]]; then
       for cand in \
         /var/lib/remnanode/xray/config.json \
@@ -2138,45 +2434,89 @@ collect_xray_config_json() {
         /etc/xray/config.json \
         /usr/local/etc/xray/config.json \
         /tmp/xray/config.json \
-        /opt/xray/config.json; do
+        /tmp/config.json \
+        /run/xray/config.json \
+        /opt/xray/config.json \
+        /app/config.json \
+        /app/xray/config.json; do
         cjson="$(docker exec "$cname" sh -c "test -f '$cand' && cat '$cand'" 2>/dev/null || true)"
-        if printf '%s' "$cjson" | grep -q '"inbounds"'; then
+        if _xray_json_looks_valid "$cjson"; then
           printf '%s\n' "$cjson"
           return 0
         fi
       done
-      cand="$(docker exec "$cname" sh -c 'find /var/lib /etc /tmp /run /opt -name "config.json" 2>/dev/null | head -20' 2>/dev/null || true)"
+      # limited-depth find for any json with inbounds
+      cand="$(docker exec "$cname" sh -c 'find /var/lib /etc /tmp /run /opt /app /usr/local/etc -maxdepth 4 -type f \( -name "config.json" -o -name "*.json" \) 2>/dev/null | head -40' 2>/dev/null || true)"
       while IFS= read -r f; do
         [[ -n "$f" ]] || continue
-        cjson="$(docker exec "$cname" sh -c "cat '$f' 2>/dev/null" 2>/dev/null || true)"
-        if printf '%s' "$cjson" | grep -q '"inbounds"'; then
+        cjson="$(docker exec "$cname" sh -c "grep -l '\"inbounds\"' '$f' >/dev/null 2>&1 && cat '$f'" 2>/dev/null || true)"
+        if _xray_json_looks_valid "$cjson"; then
           printf '%s\n' "$cjson"
           return 0
         fi
       done <<<"$cand"
+      # xray API inside container (stdin-config case)
+      cjson="$(_try_xray_api_inbounds_json "$cname" || true)"
+      if _xray_json_looks_valid "$cjson"; then
+        printf '%s\n' "$cjson"
+        return 0
+      fi
     fi
   fi
+
   for cand in \
     /var/lib/remnanode/xray/config.json \
+    /var/lib/remnanode/config.json \
     /usr/local/etc/xray/config.json \
-    /etc/xray/config.json; do
+    /etc/xray/config.json \
+    /tmp/xray/config.json \
+    /run/xray/config.json; do
     if [[ -f "$cand" ]] && grep -q '"inbounds"' "$cand" 2>/dev/null; then
       cat "$cand"
       return 0
     fi
   done
-  local pid
+
+  # /proc cmdline -config
+  if cjson="$(_read_config_via_proc_cmdline)"; then
+    if _xray_json_looks_valid "$cjson"; then
+      printf '%s\n' "$cjson"
+      return 0
+    fi
+  fi
+
   pid="$(pgrep -n rw-core 2>/dev/null || pgrep -n xray 2>/dev/null || true)"
   if [[ -n "$pid" && -d "/proc/$pid/root" ]]; then
     for cand in \
       "/proc/$pid/root/var/lib/remnanode/xray/config.json" \
+      "/proc/$pid/root/var/lib/remnanode/config.json" \
       "/proc/$pid/root/etc/xray/config.json" \
-      "/proc/$pid/root/usr/local/etc/xray/config.json"; do
+      "/proc/$pid/root/usr/local/etc/xray/config.json" \
+      "/proc/$pid/root/tmp/xray/config.json" \
+      "/proc/$pid/root/run/xray/config.json"; do
       if [[ -f "$cand" ]] && grep -q '"inbounds"' "$cand" 2>/dev/null; then
         cat "$cand"
         return 0
       fi
     done
+    # limited find under proc root
+    while IFS= read -r f; do
+      [[ -n "$f" ]] || continue
+      if grep -q '"inbounds"' "$f" 2>/dev/null; then
+        cat "$f"
+        return 0
+      fi
+    done < <(find "/proc/$pid/root/var/lib" "/proc/$pid/root/etc" "/proc/$pid/root/tmp" "/proc/$pid/root/run" -maxdepth 4 -type f -name '*.json' 2>/dev/null | head -40 || true)
+  fi
+
+  # last: API without known container (host xray)
+  if [[ "${AUDIT_XRAY_STDIN_CONFIG:-0}" -eq 1 ]]; then
+    cname="$(_find_remnanode_container || true)"
+    cjson="$(_try_xray_api_inbounds_json "${cname:-}" "${AUDIT_XRAY_PID:-}" || true)"
+    if _xray_json_looks_valid "$cjson"; then
+      printf '%s\n' "$cjson"
+      return 0
+    fi
   fi
   return 1
 }
