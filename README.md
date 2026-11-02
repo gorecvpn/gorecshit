@@ -2,7 +2,7 @@
 
 Однокомандное hardening-окружение для **нод Remnawave** (Debian 11+ / Ubuntu 20.04+).
 
-**Версия: 2.2.8**
+**Версия: 2.2.9**
 
 Скрипт идемпотентен: его можно запускать повторно. IP панели **не зашит** в репозиторий — его нужно передать параметром `--panel-ip` (или выбрать в интерактивном меню).
 
@@ -22,7 +22,7 @@
 10. **SSH** — Banner none, MaxAuthTries 3, опция `--ssh-port N` (сначала UFW, `sshd -t`, **22 сохраняется**). Парольный и root-логин **не** отключаются. fail2ban sshd + **recidive**; сканеры из ipset режутся до SSH.
 11. **Блоклист сканеров** — ipset + weekly timer; **зеркала** raw.githubusercontent.com → cdn.jsdelivr.net / fastly.jsdelivr.net; `--blocklist-from`; never-block для панели/релеев/`$SSH_CLIENT`/private/bogons.
 12. **Стелс** — нейтральный hostname `web-<hex>`, без баннеров, предупреждение о лишних слушателях, отключение nginx default site; NODE_PORT только с панели.
-13. **`--check` / `--rollback` / `--status` / `--refresh-lists` / `--dpi-check`**.
+13. **`--check` / `--rollback` / `--status` / `--version` / `--refresh-lists` / `--dpi-check` / `--update`**.
 
 ## Меню (TTY)
 
@@ -63,7 +63,14 @@ sudo bash gorecshit.sh --dpi-check
 
 ## Changelog
 
+### v2.2.9
+
+- `--update` / меню «7»: SHA tip `main` через `api.github.com/.../commits/main` (без jq) → `raw/<sha>/install.sh`, затем jsDelivr `@<sha>`, затем `raw/main?t=…` cache-buster; сравнение версий `Уже последняя версия` / `X → Y`; после обновления re-exec меню
+- Статус-строка меню: порты через тот же фильтр, что install (без `ip_local_port_range` / служебных) — не показывает эфемерные TCP вроде 33934…
+- Флаг `--version` / `-V`
+
 ### v2.2.8
+
 
 - Перед `apt-get`: ожидание dpkg/apt lock до 600с (сообщение каждые 15с), `DPkg::Lock::Timeout=600`, до 3 попыток — фикс падений на свежей Ubuntu 24.04 из‑за `unattended-upgrades`
 - Подсказка отката: `gorecshit --rollback` (не `/dev/fd/63 --rollback` при `bash <(curl)`)

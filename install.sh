@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# gorecshit v2.2.8 — one-command hardening for Remnawave VPN node servers (Debian 11+/Ubuntu 20.04+)
+# gorecshit v2.2.9 — one-command hardening for Remnawave VPN node servers (Debian 11+/Ubuntu 20.04+)
 # Usage:
 #   bash install.sh --panel-ip X.X.X.X [--node-port 2222] [--yes]
 #   bash install.sh --check --panel-ip X.X.X.X
@@ -8,7 +8,7 @@
 # Does NOT restart Docker while remnanode/xray is live. Does NOT deploy itself.
 set -Eeuo pipefail
 
-VERSION="2.2.8"
+VERSION="2.2.9"
 SCRIPT_NAME="gorecshit"
 BACKUP_ROOT="/root/hardening-backups"
 
@@ -193,6 +193,7 @@ Usage:
   install.sh --dry-run --panel-ip X.X.X.X [options]
   install.sh --refresh-lists         # only refresh scanner blocklist
   install.sh --status                # show hardening status
+  install.sh --version               # print version
   install.sh --dpi-check             # outbound DPI / DNS / TLS checks (node egress)
 
 Required (non-interactive apply):
@@ -228,7 +229,8 @@ Options:
   --dry-run, --check         Print actions / verify plan only; make no changes
   --refresh-lists            Only run scanner-block refresh
   --status                   Show current hardening status
-  --update                   Self-update from GitHub (jsDelivr fallback); installs gorecshit command
+  --update                   Self-update from GitHub by commit SHA (jsDelivr / cache-buster fallback)
+  --version                  Print script version and exit
   --dpi-check                Check DPI/DNS/TLS from this node (egress diagnostics)
   --rollback / --uninstall   Restore latest backup under /root/hardening-backups/
   -h, --help                 Show this help
@@ -393,6 +395,7 @@ parse_args() {
       --refresh-lists) DO_REFRESH_LISTS_ONLY=1; shift ;;
       --status) DO_STATUS_ONLY=1; shift ;;
       --update) DO_UPDATE_ONLY=1; shift ;;
+      --version|-V) printf '%s\n' "$VERSION"; exit 0 ;;
       --dpi-check) DO_DPI_CHECK=1; shift ;;
       --rollback|--uninstall) DO_ROLLBACK=1; shift ;;
       -h|--help) usage; exit 0 ;;
@@ -514,15 +517,39 @@ print_menu_status_line() {
     active=0
   fi
 
-  # Client ports: prefer live VPN process listeners; else UFW client-* rules; else —
-  ports="$(
-    { ss -lntup 2>/dev/null || true; } \
-      | grep -E 'xray|rw-core|remnanode|sing-box|hysteria|xhttp' \
-      | grep -oE ':[0-9]+' | tr -d ':' | sort -nu | head -8 | tr '\n' ',' | sed 's/,$//' || true
-  )"
-  if [[ -z "$ports" ]] && command -v ufw >/dev/null 2>&1; then
+  # Client ports: same filters as install (exclude ephemeral ip_local_port_range + service ports)
+  load_ephemeral_port_range
+  local node_ex=3000 np line addr port proc
+  if [[ -n "${NODE_PORT:-}" && "${NODE_PORT}" =~ ^[0-9]+$ ]]; then
+    node_ex="$NODE_PORT"
+  elif [[ -f /opt/remnanode/.env ]]; then
+    np="$(grep -E '^(NODE_PORT|APP_PORT)=' /opt/remnanode/.env 2>/dev/null | head -1 | cut -d= -f2- | tr -d '\"\r' || true)"
+    [[ "$np" =~ ^[0-9]+$ ]] && node_ex="$np"
+  fi
+  local -a _menu_ports=()
+  if command -v ss >/dev/null 2>&1; then
+    while IFS= read -r line; do
+      addr="$(ss_local_addr "$line")"
+      port="${addr##*:}"; port="${port%%]*}"
+      [[ "$port" =~ ^[0-9]+$ ]] || continue
+      is_excluded_service_port "$port" "$node_ex" && continue
+      ss_is_loopback_addr "$addr" && continue
+      is_ephemeral_port "$port" && continue
+      proc=""
+      if [[ "$line" == *'users:(('* ]]; then
+        proc="$(sed -n 's/.*users:(("\([^"]*\).*/\1/p' <<<"$line" | head -1 || true)"
+      fi
+      case "$proc" in
+        xray|rw-core|remnanode|rw-node|Xray|sing-box|singbox|hysteria|hysteria2|hy2|xhttp)
+          _menu_ports+=("$port") ;;
+      esac
+    done < <(ss -lntp 2>/dev/null | awk 'NR>1' || true)
+  fi
+  if [[ ${#_menu_ports[@]} -gt 0 ]]; then
+    ports="$(printf '%s\n' "${_menu_ports[@]}" | sort -n -u | head -8 | paste -sd, -)"
+  elif command -v ufw >/dev/null 2>&1; then
     ports="$(
-      ufw status 2>/dev/null | grep -oE 'client-[0-9]+' | grep -oE '[0-9]+' | sort -nu | head -8 | tr '\n' ',' | sed 's/,$//' || true
+      ufw status 2>/dev/null | grep -oE 'client-[0-9]+' | grep -oE '[0-9]+' | sort -nu | head -8 | paste -sd, - || true
     )"
   fi
   if [[ -z "$ports" ]]; then
@@ -852,35 +879,76 @@ _cli_script_looks_valid() {
   return 0
 }
 
+_http_get_to() {
+  # _http_get_to URL OUT — curl/wget; return 0 on HTTP success
+  local url="$1" out="$2"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --connect-timeout 8 --max-time 60 \
+      -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' \
+      -A 'gorecshit-updater' \
+      "$url" -o "$out"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q -T 60 --no-cache -U 'gorecshit-updater' -O "$out" "$url"
+  else
+    return 1
+  fi
+}
+
+_http_get_body() {
+  # stdout body; empty on failure
+  local url="$1"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --connect-timeout 8 --max-time 20 \
+      -H 'Accept: application/vnd.github+json' -A 'gorecshit-updater' "$url" 2>/dev/null || true
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q -T 20 -U 'gorecshit-updater' -O - "$url" 2>/dev/null || true
+  fi
+}
+
+github_main_sha() {
+  # Resolve tip of main via GitHub API (no jq). Prints 40-hex SHA or empty.
+  local body sha
+  body="$(_http_get_body 'https://api.github.com/repos/gorecvpn/gorecshit/commits/main')"
+  [[ -n "$body" ]] || return 1
+  sha="$(printf '%s' "$body" | grep -oE '"sha"[[:space:]]*:[[:space:]]*"[0-9a-f]{40}"' | head -1 | grep -oE '[0-9a-f]{40}' || true)"
+  [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  printf '%s\n' "$sha"
+}
+
+_latest_script_urls() {
+  # Prints candidate URLs (newest-first): raw/<sha>, jsDelivr@sha, raw main?cachebust, @main mirrors
+  local sha="${1:-}" bust
+  bust="$(date +%s 2>/dev/null || echo 0)"
+  if [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "https://raw.githubusercontent.com/gorecvpn/gorecshit/${sha}/install.sh"
+    echo "https://cdn.jsdelivr.net/gh/gorecvpn/gorecshit@${sha}/install.sh"
+    echo "https://fastly.jsdelivr.net/gh/gorecvpn/gorecshit@${sha}/install.sh"
+    echo "https://raw.githubusercontent.com/gorecvpn/gorecshit/${sha}/gorecshit.sh"
+    echo "https://cdn.jsdelivr.net/gh/gorecvpn/gorecshit@${sha}/gorecshit.sh"
+    echo "https://fastly.jsdelivr.net/gh/gorecvpn/gorecshit@${sha}/gorecshit.sh"
+  fi
+  echo "https://raw.githubusercontent.com/gorecvpn/gorecshit/main/install.sh?t=${bust}"
+  echo "https://raw.githubusercontent.com/gorecvpn/gorecshit/main/gorecshit.sh?t=${bust}"
+  echo "https://cdn.jsdelivr.net/gh/gorecvpn/gorecshit@main/install.sh"
+  echo "https://fastly.jsdelivr.net/gh/gorecvpn/gorecshit@main/install.sh"
+  echo "https://cdn.jsdelivr.net/gh/gorecvpn/gorecshit@main/gorecshit.sh"
+  echo "https://fastly.jsdelivr.net/gh/gorecvpn/gorecshit@main/gorecshit.sh"
+}
+
 _cli_download_full_script_to() {
-  # Download full install.sh into $1 (tmp path). Echo used URL on success via global _CLI_DL_URL
-  local out="$1" u
-  local urls=(
-    "https://raw.githubusercontent.com/gorecvpn/gorecshit/main/install.sh"
-    "https://cdn.jsdelivr.net/gh/gorecvpn/gorecshit@main/install.sh"
-    "https://fastly.jsdelivr.net/gh/gorecvpn/gorecshit@main/install.sh"
-    "https://raw.githubusercontent.com/gorecvpn/gorecshit/main/gorecshit.sh"
-    "https://cdn.jsdelivr.net/gh/gorecvpn/gorecshit@main/gorecshit.sh"
-  )
+  # Download full install.sh into $1 (tmp path). Sets global _CLI_DL_URL on success
+  local out="$1" u sha=""
   _CLI_DL_URL=""
-  for u in "${urls[@]}"; do
-    if command -v curl >/dev/null 2>&1; then
-      if curl -fsSL --connect-timeout 8 --max-time 60 "$u" -o "$out"; then
-        if _cli_script_looks_valid "$out"; then
-          _CLI_DL_URL="$u"
-          return 0
-        fi
-      fi
-    elif command -v wget >/dev/null 2>&1; then
-      if wget -q -T 60 -O "$out" "$u"; then
-        if _cli_script_looks_valid "$out"; then
-          _CLI_DL_URL="$u"
-          return 0
-        fi
-      fi
+  sha="$(github_main_sha 2>/dev/null || true)"
+  while IFS= read -r u; do
+    [[ -n "$u" ]] || continue
+    rm -f "$out"
+    if _http_get_to "$u" "$out" 2>/dev/null && _cli_script_looks_valid "$out"; then
+      _CLI_DL_URL="$u"
+      return 0
     fi
     rm -f "$out"
-  done
+  done < <(_latest_script_urls "$sha")
   return 1
 }
 
@@ -961,35 +1029,36 @@ self_update_from_github() {
     err "Обновление требует root"; exit 1
   fi
   if [[ "$DRY_RUN" -eq 1 ]]; then
-    printf '%b[DRY]%b curl GitHub/jsDelivr -> /usr/local/sbin/gorecshit\n' "${C_YEL}" "${C_RESET}"
+    printf '%b[DRY]%b curl GitHub API SHA → raw/<sha>/install.sh → /usr/local/sbin/gorecshit\n' "${C_YEL}" "${C_RESET}"
     return 0
   fi
-  local urls=(
-    "https://raw.githubusercontent.com/gorecvpn/gorecshit/main/install.sh"
-    "https://raw.githubusercontent.com/gorecvpn/gorecshit/main/gorecshit.sh"
-    "https://cdn.jsdelivr.net/gh/gorecvpn/gorecshit@main/install.sh"
-    "https://cdn.jsdelivr.net/gh/gorecvpn/gorecshit@main/gorecshit.sh"
-    "https://fastly.jsdelivr.net/gh/gorecvpn/gorecshit@main/install.sh"
-    "https://fastly.jsdelivr.net/gh/gorecvpn/gorecshit@main/gorecshit.sh"
-  )
-  local tmp dest="/usr/local/sbin/gorecshit" link="/usr/local/bin/gorecshit" ok_url=""
+  local oldv="$VERSION" newv="" sha="" u ok_url=""
+  local tmp dest="/usr/local/sbin/gorecshit" link="/usr/local/bin/gorecshit"
   tmp="$(mktemp /tmp/gorecshit-update.XXXXXX)"
-  local u
-  for u in "${urls[@]}"; do
+
+  sha="$(github_main_sha 2>/dev/null || true)"
+  if [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+    log "Последний commit main: ${sha:0:12}…"
+  else
+    warn "Не удалось получить SHA с api.github.com — fallback raw/main + cache-buster / jsDelivr"
+    sha=""
+  fi
+
+  while IFS= read -r u; do
+    [[ -n "$u" ]] || continue
     log "Пробую: $u"
-    if command -v curl >/dev/null 2>&1; then
-      if curl -fsSL --connect-timeout 8 --max-time 60 "$u" -o "$tmp"; then
-        ok_url="$u"; break
-      fi
-    elif command -v wget >/dev/null 2>&1; then
-      if wget -q -T 60 -O "$tmp" "$u"; then
-        ok_url="$u"; break
+    rm -f "$tmp"
+    if _http_get_to "$u" "$tmp" 2>/dev/null; then
+      if head -1 "$tmp" | grep -qE '^#!.*bash' && bash -n "$tmp" 2>/tmp/gorecshit-bashn.err; then
+        ok_url="$u"
+        break
       fi
     fi
-  done
+  done < <(_latest_script_urls "$sha")
+
   if [[ -z "$ok_url" ]]; then
     rm -f "$tmp"
-    err "Не удалось скачать install.sh (GitHub и jsDelivr недоступны). Скопируйте файл вручную."
+    err "Не удалось скачать install.sh (GitHub API/raw и jsDelivr недоступны). Скопируйте файл вручную."
     exit 1
   fi
   if ! head -1 "$tmp" | grep -qE '^#!.*bash'; then
@@ -1003,16 +1072,24 @@ self_update_from_github() {
     rm -f "$tmp"
     exit 1
   fi
+
+  newv="$(grep -E '^VERSION=' "$tmp" | head -1 | cut -d= -f2 | tr -d '"')"
+  newv="${newv:-?}"
+
   mkdir -p /usr/local/sbin /usr/local/bin
   chmod 755 "$tmp"
   mv -f "$tmp" "$dest"
+  chmod 755 "$dest"
   ln -sfn "$dest" "$link"
-  local newv
-  newv="$(grep -E '^VERSION=' "$dest" | head -1 | cut -d= -f2 | tr -d '"')"
-  ok "Обновлено из $ok_url → $dest (VERSION=${newv:-?})"
-  ln -sfn "$dest" "$link"
-  ok "Команда gorecshit установлена ($dest → v${newv:-?}; symlink $link)"
-  ok "Запуск: gorecshit   |   gorecshit --status   |   gorecshit --update"
+  hash -r 2>/dev/null || true
+
+  if [[ "$newv" == "$oldv" ]]; then
+    ok "Уже последняя версия (${oldv}) ← $ok_url"
+  else
+    ok "Обновлено: ${oldv} → ${newv} ← $ok_url"
+  fi
+  ok "Команда gorecshit установлена ($dest → v${newv}; symlink $link)"
+  ok "Запуск: gorecshit   |   gorecshit --status   |   gorecshit --update   |   gorecshit --version"
 }
 
 interactive_menu() {
@@ -1069,10 +1146,13 @@ interactive_menu() {
         ;;
       7)
         self_update_from_github
-        # re-exec updated binary into menu
+        # re-exec NEW script into menu (fresh VERSION / status line)
         if [[ -x /usr/local/sbin/gorecshit ]]; then
           exec /usr/local/sbin/gorecshit
+        elif command -v gorecshit >/dev/null 2>&1; then
+          exec gorecshit
         fi
+        warn "Обновление записано, но re-exec не удался — перезапустите: gorecshit"
         ;;
       0|q|Q)
         exit 0
