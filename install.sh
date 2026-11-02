@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# gorecshit v2.3.1 — one-command hardening for Remnawave VPN node servers (Debian 11+/Ubuntu 20.04+)
+# gorecshit v2.4.0 — one-command hardening for Remnawave VPN node servers (Debian 11+/Ubuntu 20.04+)
 # Usage:
 #   bash install.sh --panel-ip X.X.X.X [--node-port 2222] [--yes]
 #   bash install.sh --check --panel-ip X.X.X.X
@@ -8,7 +8,7 @@
 # Does NOT restart Docker while remnanode/xray is live. Does NOT deploy itself.
 set -Eeuo pipefail
 
-VERSION="2.3.1"
+VERSION="2.4.0"
 SCRIPT_NAME="gorecshit"
 BACKUP_ROOT="/root/hardening-backups"
 
@@ -81,6 +81,7 @@ DO_REFRESH_LISTS_ONLY=0
 DO_STATUS_ONLY=0
 DO_DPI_CHECK=0
 DO_AUDIT=0
+DO_FINGERPRINT_ONLY=0
 DO_UPDATE_ONLY=0
 # audit reachability side-channel (ICMP via check-host)
 AUDIT_PING_DONE=0
@@ -206,6 +207,7 @@ Usage:
   install.sh --version               # print version
   install.sh --dpi-check             # outbound DPI / DNS / TLS checks (node egress)
   install.sh --audit                 # RU reachability + detectability self-audit (read-only)
+  install.sh --stealth               # hide server fingerprints (banners/MOTD/ICMP FP/…)
 
 Required (non-interactive apply):
   --panel-ip IP              Management/panel host allowed to reach NODE_PORT
@@ -244,6 +246,7 @@ Options:
   --version                  Print script version and exit
   --dpi-check                Check DPI/DNS/TLS from this node (egress diagnostics)
   --audit                    RU block check (check-host) + xray/server detectability audit
+  --stealth                  Hide server fingerprints (SSH banner/MOTD/TTL/ICMP FP; ask before risky)
   --rollback / --uninstall   Restore latest backup under /root/hardening-backups/
   -h, --help                 Show this help
 
@@ -410,6 +413,7 @@ parse_args() {
       --version|-V) printf '%s\n' "$VERSION"; exit 0 ;;
       --dpi-check) DO_DPI_CHECK=1; shift ;;
       --audit) DO_AUDIT=1; shift ;;
+      --stealth) DO_FINGERPRINT_ONLY=1; shift ;;
       --rollback|--uninstall) DO_ROLLBACK=1; shift ;;
       -h|--help) usage; exit 0 ;;
       *) err "Unknown option: $1"; usage; exit 2 ;;
@@ -444,7 +448,7 @@ parse_args() {
 
 prompt_panel_ip() {
   if [[ -n "$PANEL_IP" ]]; then return 0; fi
-  if [[ "$DO_ROLLBACK" -eq 1 || "$DO_STATUS_ONLY" -eq 1 || "$DO_REFRESH_LISTS_ONLY" -eq 1 || "$DO_DPI_CHECK" -eq 1 || "$DO_AUDIT" -eq 1 || "$DO_UPDATE_ONLY" -eq 1 ]]; then return 0; fi
+  if [[ "$DO_ROLLBACK" -eq 1 || "$DO_STATUS_ONLY" -eq 1 || "$DO_REFRESH_LISTS_ONLY" -eq 1 || "$DO_DPI_CHECK" -eq 1 || "$DO_AUDIT" -eq 1 || "$DO_FINGERPRINT_ONLY" -eq 1 || "$DO_UPDATE_ONLY" -eq 1 ]]; then return 0; fi
   if [[ "$ASSUME_YES" -eq 1 ]]; then
     err "--panel-ip is required (or set GORECSHIT_PANEL_IP). Refusing non-interactive without it."
     exit 2
@@ -890,7 +894,7 @@ _audit_http_get() {
   # usage: _audit_http_get URL [timeout_sec]
   local url="$1" t="${2:-15}"
   curl -fsS --connect-timeout 5 --max-time "$t" \
-    -H 'Accept: application/json' -A 'gorecshit-audit/2.3.1' \
+    -H 'Accept: application/json' -A 'gorecshit-audit/2.4.0' \
     "$url" 2>/dev/null || true
 }
 
@@ -901,7 +905,7 @@ _audit_detect_public_ipv4() {
     'https://ifconfig.me/ip' \
     'https://ipv4.icanhazip.com' \
     'https://checkip.amazonaws.com'; do
-    ip="$(curl -fsS --connect-timeout 4 --max-time 8 -A 'gorecshit-audit/2.3.1' "$src" 2>/dev/null | tr -d '[:space:]' || true)"
+    ip="$(curl -fsS --connect-timeout 4 --max-time 8 -A 'gorecshit-audit/2.4.0' "$src" 2>/dev/null | tr -d '[:space:]' || true)"
     if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
       printf '%s\n' "$ip"
       return 0
@@ -1766,6 +1770,71 @@ _audit_server_level() {
     show="$(printf '%s\n' "${extras[@]}" | head -12 | paste -sd ', ' -)"
     _audit_warn "Лишние публичные порты: ${show} — закройте или уберите сервисы (не трогаем сами)"
   fi
+
+  # ---- Fingerprint / stealth markers (read-only) ----
+  step "Отпечатки сервера (аудит)"
+  local host_now ttl_now
+  host_now="$(hostname -s 2>/dev/null || hostname 2>/dev/null || true)"
+  if declare -F _fp_hostname_suspicious >/dev/null 2>&1 && _fp_hostname_suspicious "$host_now"; then
+    _audit_warn "Hostname «${host_now}» похож на шаблон VPN/провайдера — меню «9» / --stealth"
+  else
+    _audit_ok "Hostname «${host_now}»"
+  fi
+  if [[ -f /etc/ssh/sshd_config.d/99-gorecshit-fingerprint.conf ]] || grep -RqiE '^\s*DebianBanner\s+no' /etc/ssh/sshd_config /etc/ssh/sshd_config.d 2>/dev/null; then
+    _audit_ok "SSH Banner/DebianBanner скрытия настроены"
+  else
+    _audit_warn "SSH Banner/DebianBanner не скрыты — gorecshit --stealth"
+  fi
+  if [[ -f /etc/default/motd-news ]] && grep -qE '^ENABLED=0' /etc/default/motd-news 2>/dev/null; then
+    _audit_ok "motd-news выключен"
+  elif [[ -x /etc/update-motd.d/10-help-text || -x /etc/update-motd.d/50-motd-news ]]; then
+    _audit_warn "update-motd help/news ещё исполняемые"
+  else
+    _audit_ok "motd ads не активны (или отсутствуют)"
+  fi
+  ttl_now="$(sysctl -n net.ipv4.ip_default_ttl 2>/dev/null || echo '?')"
+  if [[ "$ttl_now" == "64" ]]; then
+    _audit_ok "ip_default_ttl=${ttl_now}"
+  else
+    _audit_warn "ip_default_ttl=${ttl_now} (обычно 64)"
+  fi
+  if [[ "$(sysctl -n net.ipv4.conf.all.send_redirects 2>/dev/null || echo 1)" == "0" ]]; then
+    _audit_ok "send_redirects=0"
+  else
+    _audit_warn "send_redirects включены"
+  fi
+  if [[ "$(sysctl -n net.ipv4.icmp_echo_ignore_broadcasts 2>/dev/null || echo 0)" == "1" ]]; then
+    _audit_ok "icmp_echo_ignore_broadcasts=1"
+  else
+    _audit_warn "icmp_echo_ignore_broadcasts не 1"
+  fi
+  if command -v iptables >/dev/null 2>&1 && iptables -L GORECSHIT-FP -n >/dev/null 2>&1; then
+    _audit_ok "Цепочка GORECSHIT-FP (ICMP timestamp/mask DROP) есть"
+  else
+    _audit_warn "Нет GORECSHIT-FP — ICMP timestamp/address-mask могут отвечать (--stealth)"
+  fi
+  if [[ -f /var/lib/gorecshit/fingerprint.done ]]; then
+    _audit_ok "Маркер fingerprint.done есть"
+  else
+    _audit_warn "fingerprint.done нет — «Скрыть отпечатки» ещё не запускали"
+  fi
+  if ss -lntp 2>/dev/null | grep -qE '[:.]2375[[:space:]]|[:.]2376[[:space:]]'; then
+    _audit_warn "Docker API на 2375/2376 слушает — закройте"
+  else
+    _audit_ok "Docker 2375/2376 не слушает"
+  fi
+  local _svc
+  for _svc in rpcbind avahi-daemon cups snmpd; do
+    if systemctl is-active --quiet "${_svc}.service" 2>/dev/null; then
+      _audit_warn "Сервис ${_svc} активен — светит ОС"
+    fi
+  done
+  if [[ -d /etc/nginx ]] && grep -RqiE '^\s*server_tokens\s+off' /etc/nginx 2>/dev/null; then
+    _audit_ok "nginx server_tokens off"
+  elif [[ -d /etc/nginx ]]; then
+    _audit_warn "nginx есть, server_tokens off не найден"
+  fi
+
 }
 
 run_node_audit() {
@@ -2042,13 +2111,14 @@ interactive_menu() {
     printf '  %b6)%b ↩️  Откат\n' "${C_BOLD}" "${C_RESET}"
     printf '  %b7)%b ⬆️  Обновить gorecshit (GitHub)\n' "${C_BOLD}" "${C_RESET}"
     printf '  %b8)%b 🛡️  Проверка на блокировку и палевность ноды\n' "${C_BOLD}" "${C_RESET}"
+    printf '  %b9)%b 🕵️  Скрыть отпечатки сервера\n' "${C_BOLD}" "${C_RESET}"
     menu_sep
     printf '  %b0)%b 🚪 Выход\n' "${C_BOLD}" "${C_RESET}"
-    printf '%bCLI: gorecshit [--status|--update|--audit|--yes|--modules …]%b\n' "${C_GREY}" "${C_RESET}"
+    printf '%bCLI: gorecshit [--status|--update|--audit|--stealth|--yes|--modules …]%b\n' "${C_GREY}" "${C_RESET}"
     if [[ -w /dev/tty ]]; then
-      printf '%bВыберите пункт [0-8]:%b ' "${C_BOLD}" "${C_RESET}" > /dev/tty
+      printf '%bВыберите пункт [0-9]:%b ' "${C_BOLD}" "${C_RESET}" > /dev/tty
     else
-      printf '%bВыберите пункт [0-8]:%b ' "${C_BOLD}" "${C_RESET}"
+      printf '%bВыберите пункт [0-9]:%b ' "${C_BOLD}" "${C_RESET}"
     fi
     read_user_input choice
     case "$choice" in
@@ -2092,6 +2162,10 @@ interactive_menu() {
         ;;
       8)
         run_node_audit
+        ;;
+      9)
+        DO_FINGERPRINT_ONLY=1
+        return 0
         ;;
       0|q|Q)
         exit 0
@@ -3865,6 +3939,438 @@ EOF
 }
 
 
+# ---------- Hide server fingerprints (menu «Скрыть отпечатки» / --stealth) ----------
+# Safe: no speed knobs, no IPv6 flip, no client-port/firewall rewrite, no panel edits.
+# Risky stops/renames ask via /dev/tty (default No).
+
+_fp_ask_yn() {
+  # _fp_ask_yn "question" default_no=1 -> returns 0 if yes
+  local q="$1" def_no="${2:-1}" ans=""
+  if ! can_prompt_user; then
+    # non-interactive: skip risky actions
+    return 1
+  fi
+  if [[ "$def_no" -eq 1 ]]; then
+    prompt_user "${q} [y/N] " ans
+    [[ "$ans" =~ ^[Yy]$ ]]
+  else
+    prompt_user "${q} [Y/n] " ans
+    [[ -z "$ans" || "$ans" =~ ^[Yy]$ ]]
+  fi
+}
+
+_fp_hostname_suspicious() {
+  local h="$1"
+  h="$(printf '%s' "$h" | tr '[:upper:]' '[:lower:]')"
+  case "$h" in
+    *vpn*|*node*|*xray*|*vless*|*reality*|*proxy*|*remna*|*v2ray*|*singbox*|*sing-box*|*hysteria*|*trojan*)
+      return 0 ;;
+  esac
+  case "$h" in
+    vm-*|vps-*|server-*|cloud-*|ubuntu-*|debian-*|centos-*|rocky-*|alma-*|host-*|dedicated-*|kvm-*|lxc-*|openvz-*)
+      return 0 ;;
+  esac
+  # ip-style / bare numeric hostnames
+  if [[ "$h" =~ ^ip-[0-9]+-[0-9]+-[0-9]+-[0-9]+ ]]; then return 0; fi
+  if [[ "$h" =~ ^[0-9]+-[0-9]+-[0-9]+-[0-9]+ ]]; then return 0; fi
+  if [[ "$h" =~ ^(host|srv|s|n)[0-9]{2,}$ ]]; then return 0; fi
+  return 1
+}
+
+_fp_note_masked_service() {
+  local s="$1"
+  [[ -n "$s" ]] || return 0
+  mkdir -p "$BACKUP_DIR" 2>/dev/null || true
+  if [[ "$DRY_RUN" -eq 0 ]]; then
+    grep -qxF "$s" "${BACKUP_DIR}/fingerprint-masked-services.txt" 2>/dev/null || \
+      echo "$s" >>"${BACKUP_DIR}/fingerprint-masked-services.txt"
+  fi
+}
+
+_fp_ensure_rollback_extras() {
+  # Append fingerprint restore helpers into rollback.sh (idempotent marker).
+  [[ "$DRY_RUN" -eq 0 ]] || return 0
+  local rb="${BACKUP_DIR}/rollback.sh"
+  [[ -f "$rb" ]] || return 0
+  if grep -q 'gorecshit-fingerprint-restore' "$rb" 2>/dev/null; then
+    return 0
+  fi
+  cat >>"$rb" <<'RBEOF'
+
+# gorecshit-fingerprint-restore
+if [[ -f "$BACKUP_DIR/fingerprint-masked-services.txt" ]]; then
+  while IFS= read -r _svc; do
+    [[ -n "$_svc" ]] || continue
+    systemctl unmask "$_svc" 2>/dev/null || true
+  done < "$BACKUP_DIR/fingerprint-masked-services.txt"
+fi
+if [[ -f /etc/hostname ]]; then
+  hostnamectl set-hostname "$(tr -d ' \t\r\n' </etc/hostname)" 2>/dev/null || true
+fi
+# reload ssh after banner restore
+systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
+RBEOF
+}
+
+configure_fingerprint_hiding() {
+  step "Скрытие отпечатков сервера (без потери скорости)"
+  echo "Не трогаем: IPv6, клиентские порты UFW, Docker compose, настройки панели, tcp_timestamps."
+  local -a done_msgs=()
+
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    printf '%b[DRY]%b fingerprint: SSH banners/motd, optional hostname, TTL/ICMP fingerprint sysctl, closed-port DROP tip, mask noisy services (ask), docker listen report, server_tokens\n' "${C_YEL}" "${C_RESET}"
+    return 0
+  fi
+
+  mkdir -p "$BACKUP_DIR" "$MARKER_DIR" 2>/dev/null || true
+
+  # ---- SSH banners / MOTD ----
+  step "SSH / MOTD: убрать версию и рекламу"
+  backup_file /etc/ssh/sshd_config
+  backup_file /etc/ssh/sshd_config.d/99-hardening.conf
+  backup_file /etc/ssh/sshd_config.d/99-gorecshit-fingerprint.conf
+  backup_file /etc/issue.net
+  backup_file /etc/issue
+  backup_file /etc/motd
+
+  local ssh_fp="/etc/ssh/sshd_config.d/99-gorecshit-fingerprint.conf"
+  local ssh_body="# Managed by ${SCRIPT_NAME} ${VERSION} — fingerprint hide (Banner/DebianBanner)
+Banner none
+DebianBanner no
+"
+  # Validate DebianBanner support
+  local testconf
+  testconf="$(mktemp)"
+  printf '%s\n' "$ssh_body" >"$testconf"
+  if ! sshd -t -f "$testconf" 2>/dev/null; then
+    ssh_body="# Managed by ${SCRIPT_NAME} ${VERSION}
+Banner none
+"
+    warn "DebianBanner не поддерживается этим sshd — только Banner none"
+  fi
+  rm -f "$testconf"
+  write_content "$ssh_fp" "$ssh_body"
+  if sshd -t 2>/dev/null; then
+    systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
+    ok "SSH: Banner none, DebianBanner no (если поддерживается)"
+    done_msgs+=("SSH-баннер версии скрыт")
+  else
+    warn "sshd -t после fingerprint drop-in не прошёл — откатываю drop-in"
+    rm -f "$ssh_fp"
+    if [[ -f "${BACKUP_DIR}${ssh_fp}" ]]; then
+      cp -a "${BACKUP_DIR}${ssh_fp}" "$ssh_fp" 2>/dev/null || true
+    fi
+  fi
+
+  # Clear issue.net / issue ads (keep empty file so Banner none still fine)
+  if [[ -f /etc/issue.net ]]; then
+    if [[ -s /etc/issue.net ]]; then
+      : >/etc/issue.net
+      ok "Очищен /etc/issue.net"
+      done_msgs+=("очищен /etc/issue.net")
+    fi
+  fi
+  if [[ -f /etc/motd ]] && [[ -s /etc/motd ]]; then
+    # only blank if looks like vendor ad
+    if grep -qiE 'ubuntu|debian|welcome|authorized|legal|cloud' /etc/motd 2>/dev/null; then
+      : >/etc/motd
+      ok "Очищен /etc/motd"
+      done_msgs+=("очищен /etc/motd")
+    fi
+  fi
+
+  # Disable update-motd news/ads (chmod -x, don't delete — reversible via backup)
+  local motd_f
+  for motd_f in \
+    /etc/update-motd.d/10-help-text \
+    /etc/update-motd.d/50-motd-news \
+    /etc/update-motd.d/80-livepatch \
+    /etc/update-motd.d/91-release-upgrade \
+    /etc/update-motd.d/91-contract-ua-esm-status \
+    /etc/update-motd.d/92-unattended-upgrade \
+    /etc/update-motd.d/95-hwe-eol \
+    /etc/update-motd.d/97-overlayroot \
+    /etc/update-motd.d/98-fsck-at-reboot \
+    /etc/update-motd.d/98-reboot-required; do
+    if [[ -f "$motd_f" && -x "$motd_f" ]]; then
+      backup_file "$motd_f"
+      chmod a-x "$motd_f" 2>/dev/null || true
+    fi
+  done
+  if [[ -f /etc/default/motd-news ]]; then
+    backup_file /etc/default/motd-news
+    if grep -qE '^ENABLED=' /etc/default/motd-news; then
+      sed -i 's/^ENABLED=.*/ENABLED=0/' /etc/default/motd-news
+    else
+      echo 'ENABLED=0' >>/etc/default/motd-news
+    fi
+    ok "motd-news отключён"
+    done_msgs+=("motd-news/update-motd ads отключены")
+  else
+    ok "Скрипты update-motd (help/news) отключены при наличии"
+    done_msgs+=("update-motd help/news отключены")
+  fi
+
+  # ---- Hostname (ask, default No) ----
+  step "Hostname"
+  local cur_host
+  cur_host="$(hostname -s 2>/dev/null || hostname 2>/dev/null || cat /etc/hostname 2>/dev/null || echo unknown)"
+  if _fp_hostname_suspicious "$cur_host"; then
+    warn "Hostname «${cur_host}» похож на шаблон провайдера/VPN"
+    if _fp_ask_yn "Переименовать в нейтральный web-<random>? (по умолчанию нет)" 1; then
+      local hex newhost
+      hex="$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n' | head -c 6)"
+      newhost="web-${hex}"
+      backup_file /etc/hostname
+      backup_file /etc/hosts
+      backup_file /etc/cloud/cloud.cfg
+      hostnamectl set-hostname "$newhost" 2>/dev/null || echo "$newhost" >/etc/hostname
+      if grep -qE '^127\.0\.1\.1' /etc/hosts; then
+        sed -i -E "s/^127\\.0\\.1\\.1.*/127.0.1.1\t${newhost}/" /etc/hosts
+      else
+        echo -e "127.0.1.1\t${newhost}" >>/etc/hosts
+      fi
+      if [[ -f /etc/cloud/cloud.cfg ]]; then
+        if grep -q '^preserve_hostname:' /etc/cloud/cloud.cfg; then
+          sed -i 's/^preserve_hostname:.*/preserve_hostname: true/' /etc/cloud/cloud.cfg
+        else
+          echo 'preserve_hostname: true' >>/etc/cloud/cloud.cfg
+        fi
+      fi
+      mkdir -p /etc/cloud/cloud.cfg.d
+      backup_file /etc/cloud/cloud.cfg.d/99-gorecshit-hostname.cfg
+      echo 'preserve_hostname: true' >/etc/cloud/cloud.cfg.d/99-gorecshit-hostname.cfg
+      ok "Hostname: ${cur_host} → ${newhost}"
+      done_msgs+=("hostname ${cur_host} → ${newhost}")
+    else
+      log "Hostname оставлен: ${cur_host}"
+    fi
+  else
+    ok "Hostname «${cur_host}» выглядит нейтрально — не меняем"
+  fi
+
+  # ---- TCP/IP fingerprint sysctl (no tcp_timestamps change) ----
+  step "TCP/IP / ICMP fingerprint (без tcp_timestamps)"
+  backup_file /etc/sysctl.d/99-gorecshit-fingerprint.conf
+  local cur_ttl
+  cur_ttl="$(sysctl -n net.ipv4.ip_default_ttl 2>/dev/null || echo 64)"
+  local ttl_line="net.ipv4.ip_default_ttl = 64"
+  if [[ "$cur_ttl" == "64" ]]; then
+    log "ip_default_ttl уже 64"
+  fi
+  write_content /etc/sysctl.d/99-gorecshit-fingerprint.conf \
+"# Managed by ${SCRIPT_NAME} ${VERSION} — OS fingerprint soften (speed-safe)
+# Do NOT set tcp_timestamps=0 here (скорость/PAWS).
+${ttl_line}
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.icmp_ignore_bogus_error_responses = 1
+"
+  sysctl -p /etc/sysctl.d/99-gorecshit-fingerprint.conf >/dev/null 2>&1 || true
+  ok "sysctl: ttl=64, ignore broadcasts, no send/accept redirects"
+  done_msgs+=("sysctl fingerprint (TTL/ICMP redirects/broadcasts)")
+
+  # ICMP timestamp (13/14) and address-mask (17/18) DROP — dedicated chain, does not touch echo policy beyond existing
+  if command -v iptables >/dev/null 2>&1; then
+    iptables -N GORECSHIT-FP 2>/dev/null || iptables -F GORECSHIT-FP 2>/dev/null || true
+    iptables -C GORECSHIT-FP -p icmp --icmp-type timestamp-request -j DROP 2>/dev/null || \
+      iptables -A GORECSHIT-FP -p icmp --icmp-type timestamp-request -j DROP 2>/dev/null || true
+    iptables -C GORECSHIT-FP -p icmp --icmp-type timestamp-reply -j DROP 2>/dev/null || \
+      iptables -A GORECSHIT-FP -p icmp --icmp-type timestamp-reply -j DROP 2>/dev/null || true
+    iptables -C GORECSHIT-FP -p icmp --icmp-type address-mask-request -j DROP 2>/dev/null || \
+      iptables -A GORECSHIT-FP -p icmp --icmp-type address-mask-request -j DROP 2>/dev/null || true
+    iptables -C GORECSHIT-FP -p icmp --icmp-type address-mask-reply -j DROP 2>/dev/null || \
+      iptables -A GORECSHIT-FP -p icmp --icmp-type address-mask-reply -j DROP 2>/dev/null || true
+    # Hook once at top of INPUT for icmp only
+    iptables -C INPUT -p icmp -j GORECSHIT-FP 2>/dev/null || \
+      iptables -I INPUT 1 -p icmp -j GORECSHIT-FP 2>/dev/null || true
+    ok "iptables: DROP ICMP timestamp/address-mask (echo не трогаем здесь)"
+    done_msgs+=("ICMP timestamp/address-mask DROP")
+
+    # Persist via simple oneshot (no UFW client-port changes)
+    local fp_script="/usr/local/sbin/gorecshit-fingerprint-net.sh"
+    local fp_unit="/etc/systemd/system/gorecshit-fingerprint-net.service"
+    backup_file "$fp_script"
+    backup_file "$fp_unit"
+    write_content "$fp_script" \
+'#!/usr/bin/env bash
+# Managed by gorecshit — restore ICMP fingerprint DROP chain (idempotent)
+set -euo pipefail
+command -v iptables >/dev/null 2>&1 || exit 0
+iptables -N GORECSHIT-FP 2>/dev/null || true
+iptables -F GORECSHIT-FP 2>/dev/null || true
+iptables -A GORECSHIT-FP -p icmp --icmp-type timestamp-request -j DROP
+iptables -A GORECSHIT-FP -p icmp --icmp-type timestamp-reply -j DROP
+iptables -A GORECSHIT-FP -p icmp --icmp-type address-mask-request -j DROP
+iptables -A GORECSHIT-FP -p icmp --icmp-type address-mask-reply -j DROP
+iptables -C INPUT -p icmp -j GORECSHIT-FP 2>/dev/null || iptables -I INPUT 1 -p icmp -j GORECSHIT-FP
+'
+    chmod 755 "$fp_script"
+    write_content "$fp_unit" \
+"[Unit]
+Description=gorecshit fingerprint ICMP hide (timestamp/address-mask DROP)
+After=network-pre.target ufw.service
+Before=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/gorecshit-fingerprint-net.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+"
+    systemctl daemon-reload
+    systemctl enable --now gorecshit-fingerprint-net.service >/dev/null 2>&1 || true
+  fi
+
+  # Closed TCP ports: silent DROP if UFW present (no RST). Do not rewrite client allows.
+  step "Закрытые TCP-порты (DROP без RST)"
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qiE 'Status:\s*active'; then
+    backup_file /etc/default/ufw
+    if grep -q '^DEFAULT_INPUT_POLICY=' /etc/default/ufw 2>/dev/null; then
+      sed -i 's/^DEFAULT_INPUT_POLICY=.*/DEFAULT_INPUT_POLICY="DROP"/' /etc/default/ufw || true
+    fi
+    if iptables -L ufw-reject-input -n >/dev/null 2>&1; then
+      iptables -C ufw-reject-input -j DROP 2>/dev/null || iptables -I ufw-reject-input 1 -j DROP 2>/dev/null || true
+    fi
+    ok "UFW INPUT policy DROP; ufw-reject-input → DROP (ESTABLISHED/клиентские правила не трогали)"
+    done_msgs+=("закрытые порты: DROP вместо RST (через UFW)")
+  else
+    warn "UFW неактивен — полную тишину закрытых портов без риска для SSH даёт пункт меню 1; пропускаем смену INPUT policy"
+  fi
+
+  # ---- Noisy services (ask) ----
+  step "Сервисы, светящие ОС (только если установлены)"
+  local svc unit_state
+  for svc in rpcbind avahi-daemon cups cups-browsed snmpd exim4 postfix; do
+    if systemctl list-unit-files "${svc}.service" 2>/dev/null | grep -q "${svc}.service"; then
+      unit_state="$(systemctl is-enabled "${svc}.service" 2>/dev/null || true)"
+      if systemctl is-active --quiet "${svc}.service" 2>/dev/null || [[ "$unit_state" == "enabled" ]]; then
+        # skip postfix/exim if clearly only localhost — still ask
+        warn "Обнаружен сервис ${svc} (enabled/active)"
+        if _fp_ask_yn "Остановить и mask ${svc}? (может убрать лишний отпечаток; по умолчанию нет)" 1; then
+          backup_file "/etc/systemd/system/${svc}.service"
+          systemctl stop "${svc}.service" 2>/dev/null || true
+          systemctl disable "${svc}.service" 2>/dev/null || true
+          systemctl mask "${svc}.service" 2>/dev/null || true
+          _fp_note_masked_service "${svc}.service"
+          ok "Сервис ${svc}: stop+mask"
+          done_msgs+=("mask ${svc}")
+        else
+          log "Сервис ${svc} оставлен"
+        fi
+      fi
+    fi
+  done
+
+  # ---- Docker report only ----
+  step "Docker: отчёт (без правок compose)"
+  if command -v docker >/dev/null 2>&1; then
+    local dhost pub
+    dhost="$(docker info --format '{{.ListenerSecurity}}' 2>/dev/null || true)"
+    # Check dockerd listening on 2375/2376
+    if ss -lntp 2>/dev/null | grep -qE '[:.]2375\s|[:.]2376\s'; then
+      warn "Docker API слушает 2375/2376 публично — закройте (не меняем daemon.json здесь)"
+      done_msgs+=("WARN: docker 2375/2376 открыт (только отчёт)")
+    else
+      ok "Docker API 2375/2376 не слушает публично"
+    fi
+    # Published ports report
+    pub="$(docker ps --format '{{.Names}} {{.Ports}}' 2>/dev/null | grep -E '0\.0\.0\.0:|:::' || true)"
+    if [[ -n "$pub" ]]; then
+      log "Публикации контейнеров (только отчёт, compose не трогаем):"
+      printf '%s\n' "$pub" | head -20 | while IFS= read -r line; do
+        _audit_info 2>/dev/null || log "  $line"
+        # _audit_info may not exist if called outside audit context — use log
+      done
+      # re-print with log for reliability
+      printf '%s\n' "$pub" | head -20 | while IFS= read -r line; do log "  publish: $line"; done
+    else
+      ok "Лишних publish 0.0.0.0 у контейнеров не видно (или docker ps пуст)"
+    fi
+  else
+    log "Docker не установлен — пропуск"
+  fi
+
+  # ---- nginx/apache server_tokens ----
+  step "Web: server_tokens / ServerTokens"
+  if [[ -d /etc/nginx ]]; then
+    local ng
+    while IFS= read -r ng; do
+      [[ -f "$ng" ]] || continue
+      backup_file "$ng"
+      if grep -qE '^\s*server_tokens\s+' "$ng" 2>/dev/null; then
+        sed -i -E 's/^\s*server_tokens\s+.*/    server_tokens off;/' "$ng" || true
+      else
+        # inject into http {} if this is nginx.conf
+        if [[ "$ng" == */nginx.conf ]] && grep -qE '^\s*http\s*\{' "$ng"; then
+          sed -i '/^\s*http\s*{/a\    server_tokens off;' "$ng" || true
+        fi
+      fi
+    done < <(find /etc/nginx -type f \( -name 'nginx.conf' -o -name '*.conf' \) 2>/dev/null | head -40)
+    if command -v nginx >/dev/null 2>&1 && nginx -t 2>/dev/null; then
+      systemctl reload nginx 2>/dev/null || true
+      ok "nginx: server_tokens off"
+      done_msgs+=("nginx server_tokens off")
+    else
+      warn "nginx -t не прошёл или nginx нет в PATH — правки conf оставлены, reload пропущен"
+    fi
+  fi
+  if [[ -d /etc/apache2 ]] || [[ -d /etc/httpd ]]; then
+    local ac
+    for ac in /etc/apache2/conf-available/security.conf /etc/apache2/conf-enabled/security.conf \
+              /etc/httpd/conf/httpd.conf /etc/httpd/conf.d/security.conf; do
+      [[ -f "$ac" ]] || continue
+      backup_file "$ac"
+      if grep -qE '^\s*ServerTokens\s+' "$ac"; then
+        sed -i -E 's/^\s*ServerTokens\s+.*/ServerTokens Prod/' "$ac" || true
+      else
+        echo 'ServerTokens Prod' >>"$ac"
+      fi
+      if grep -qE '^\s*ServerSignature\s+' "$ac"; then
+        sed -i -E 's/^\s*ServerSignature\s+.*/ServerSignature Off/' "$ac" || true
+      else
+        echo 'ServerSignature Off' >>"$ac"
+      fi
+    done
+    systemctl reload apache2 2>/dev/null || systemctl reload httpd 2>/dev/null || true
+    ok "Apache: ServerTokens Prod / ServerSignature Off (если был)"
+    done_msgs+=("apache ServerTokens Prod")
+  fi
+
+  # Marker
+  echo "version=${VERSION}" >"${MARKER_DIR}/fingerprint.done"
+  echo "ts=$(date -Iseconds)" >>"${MARKER_DIR}/fingerprint.done"
+  backup_file "${MARKER_DIR}/fingerprint.done"
+  _fp_ensure_rollback_extras
+
+  echo
+  menu_sep
+  ok "Скрытие отпечатков завершено (read/write локально, панель не трогали)."
+  local m
+  printf '%bСделано:%b\n' "${C_BOLD}" "${C_RESET}"
+  for m in "${done_msgs[@]}"; do
+    printf '  • %s\n' "$m"
+  done
+  [[ ${#done_msgs[@]} -eq 0 ]] && echo "  • (существенных изменений не потребовалось / всё уже было)"
+  echo "Откат: $(rollback_hint_cmd)  или  ${BACKUP_DIR}/rollback.sh"
+}
+
+run_fingerprint_only() {
+  if [[ "$(id -u)" -ne 0 && "$DRY_RUN" -eq 0 ]]; then
+    err "Нужен root для --stealth / «Скрыть отпечатки»"
+    exit 1
+  fi
+  preflight
+  write_rollback_script
+  configure_fingerprint_hiding
+  install_cli_command
+}
+
 configure_stealth() {
   if [[ "$DO_STEALTH" -eq 0 ]]; then
     log "Stealth-модуль пропущен"
@@ -3876,7 +4382,9 @@ configure_stealth() {
     return 0
   fi
 
-  # SSH banners already Banner none / DebianBanner no in configure_ssh
+  # Extended fingerprint hiding (banners/MOTD/TTL/ICMP FP/services/…)
+  configure_fingerprint_hiding
+
   # Disable nginx default site if present (do not restart docker)
   if [[ -d /etc/nginx ]]; then
     backup_file /etc/nginx/sites-enabled/default
@@ -4482,6 +4990,7 @@ main() {
   if [[ "$ASSUME_YES" -eq 0 && "$DO_ROLLBACK" -eq 0 && "$CHECK_ONLY" -eq 0 \
         && "$DO_REFRESH_LISTS_ONLY" -eq 0 && "$DO_STATUS_ONLY" -eq 0 && "$DO_DPI_CHECK" -eq 0 \
         && "$DO_AUDIT" -eq 0 \
+        && "$DO_FINGERPRINT_ONLY" -eq 0 \
         && "$DO_UPDATE_ONLY" -eq 0 \
         && -t 0 && -t 1 ]]; then
     interactive_menu
@@ -4499,6 +5008,11 @@ main() {
 
   if [[ "$DO_AUDIT" -eq 1 ]]; then
     run_node_audit
+    exit 0
+  fi
+
+  if [[ "$DO_FINGERPRINT_ONLY" -eq 1 ]]; then
+    run_fingerprint_only
     exit 0
   fi
 

@@ -2,7 +2,7 @@
 
 Однокомандное hardening-окружение для **нод Remnawave** (Debian 11+ / Ubuntu 20.04+).
 
-**Версия: 2.3.1**
+**Версия: 2.4.0**
 
 Скрипт идемпотентен: его можно запускать повторно. IP панели **не зашит** в репозиторий — его нужно передать параметром `--panel-ip` (или выбрать в интерактивном меню).
 
@@ -22,7 +22,7 @@
 10. **SSH** — Banner none, MaxAuthTries 3, опция `--ssh-port N` (сначала UFW, `sshd -t`, **22 сохраняется**). Парольный и root-логин **не** отключаются. fail2ban sshd + **recidive**; сканеры из ipset режутся до SSH.
 11. **Блоклист сканеров** — ipset + weekly timer; **зеркала** raw.githubusercontent.com → cdn.jsdelivr.net / fastly.jsdelivr.net; `--blocklist-from`; never-block для панели/релеев/`$SSH_CLIENT`/private/bogons.
 12. **Стелс** — нейтральный hostname `web-<hex>`, без баннеров, предупреждение о лишних слушателях, отключение nginx default site; NODE_PORT только с панели.
-13. **`--check` / `--rollback` / `--status` / `--version` / `--refresh-lists` / `--dpi-check` / `--audit` / `--update`**.
+13. **`--check` / `--rollback` / `--status` / `--version` / `--refresh-lists` / `--dpi-check` / `--audit` / `--stealth` / `--update`**.
 
 ## Меню (TTY)
 
@@ -38,10 +38,11 @@
   6) ↩️  Откат
   7) ⬆️  Обновить gorecshit (GitHub)
   8) 🛡️  Проверка на блокировку и палевность ноды
+  9) 🕵️  Скрыть отпечатки сервера
 ────────────────────────────────────────
   0) 🚪 Выход
-CLI: gorecshit [--status|--update|--audit|--yes|--modules …]
-Выберите пункт [0-8]:
+CLI: gorecshit [--status|--update|--audit|--stealth|--yes|--modules …]
+Выберите пункт [0-9]:
 ```
 
 ## Проверка DPI/блокировок
@@ -75,7 +76,29 @@ sudo bash install.sh --audit
 gorecshit --audit
 ```
 
+## Скрытие отпечатков сервера
+
+Опциональный модуль (меню «9» / `--stealth`), также вызывается из stealth при полной установке. **Не снижает скорость**, не трогает IPv6, клиентские порты firewall, Docker compose и настройки панели. Рискованные шаги (hostname, stop сервисов) спрашивают через `/dev/tty` (по умолчанию нет). Бэкап + откат через `--rollback`.
+
+- SSH: `Banner none`, `DebianBanner no`, очистка issue.net/motd, отключение update-motd news/ads
+- Hostname: если похож на vpn/node/xray/… или vm-/vps-/ubuntu-/ip-* — предложение `web-<random>` (спросит)
+- TCP/IP: `ip_default_ttl=64`, ICMP timestamp/address-mask DROP, ignore broadcasts, `send_redirects=0` (**без** `tcp_timestamps=0`)
+- Закрытые TCP: DROP без RST при активном UFW (не меняет allow клиентских портов)
+- Сервисы rpcbind/avahi/cups/snmpd/exim/postfix — stop+mask только после подтверждения
+- Docker 2375/2376 и publish — только отчёт
+- nginx `server_tokens off` / Apache `ServerTokens Prod`
+- `--audit` показывает эти маркеры
+
+```bash
+sudo gorecshit --stealth
+```
+
 ## Changelog
+
+### v2.4.0
+
+- Меню «9» / `--stealth`: скрытие отпечатков сервера (SSH/MOTD, TTL/ICMP FP, UFW DROP для закрытых портов, опциональный hostname и mask сервисов с подтверждением, отчёт Docker, server_tokens); бэкап+rollback; без потери скорости и без правок панели/IPv6/клиентских портов
+- `--audit` дополнен проверками fingerprint-маркеров
 
 ### v2.3.1
 
@@ -230,6 +253,7 @@ sudo bash install.sh --panel-ip X.X.X.X --modules ufw,blocklist,hide_ports,anti_
 | `--status` | Показать статус. |
 | `--dpi-check` | DNS/TLS/SNI/TCP16 egress-проверка с ноды. |
 | `--audit` | Доступность из РФ (check-host) + аудит палевности xray/сервера (read-only). |
+| `--stealth` | Скрыть отпечатки сервера (баннеры/MOTD/ICMP FP/…); спросит перед рискованным. |
 | `--update` | Самообновление `install.sh` → `/usr/local/sbin/gorecshit` (GitHub, fallback jsDelivr). |
 | `--rollback` / `--uninstall` | Откат из бэкапа. |
 
