@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# gorecshit v2.2.7 — one-command hardening for Remnawave VPN node servers (Debian 11+/Ubuntu 20.04+)
+# gorecshit v2.2.8 — one-command hardening for Remnawave VPN node servers (Debian 11+/Ubuntu 20.04+)
 # Usage:
 #   bash install.sh --panel-ip X.X.X.X [--node-port 2222] [--yes]
 #   bash install.sh --check --panel-ip X.X.X.X
@@ -8,7 +8,7 @@
 # Does NOT restart Docker while remnanode/xray is live. Does NOT deploy itself.
 set -Eeuo pipefail
 
-VERSION="2.2.7"
+VERSION="2.2.8"
 SCRIPT_NAME="gorecshit"
 BACKUP_ROOT="/root/hardening-backups"
 
@@ -153,10 +153,29 @@ prompt_user() {
   read_user_input "$__var"
 }
 
+rollback_hint_cmd() {
+  # Prefer installed CLI; avoid printing /dev/fd/63 from bash <(curl)
+  if [[ -x /usr/local/sbin/gorecshit ]] || command -v gorecshit >/dev/null 2>&1; then
+    printf 'gorecshit --rollback'
+  elif [[ -f /usr/local/sbin/gorecshit ]]; then
+    printf 'bash /usr/local/sbin/gorecshit --rollback'
+  else
+    local src="${BASH_SOURCE[0]:-$0}"
+    case "$src" in
+      /dev/fd/*|/proc/self/fd/*|/proc/*/fd/*|-|'')
+        printf 'bash install.sh --rollback   # или: curl … | bash — затем gorecshit --rollback'
+        ;;
+      *)
+        printf 'bash %q --rollback' "$src"
+        ;;
+    esac
+  fi
+}
+
 on_error() {
   local ec=$?
   err "Failed at line ${BASH_LINENO[0]} (exit ${ec}). Backups: ${BACKUP_DIR:-n/a}"
-  err "Restore with: $0 --rollback   (or run ${BACKUP_DIR}/rollback.sh if present)"
+  err "Откат: $(rollback_hint_cmd)   (или ${BACKUP_DIR:-/root/hardening-backups/<ts>}/rollback.sh)"
   exit "$ec"
 }
 trap on_error ERR
@@ -1536,6 +1555,96 @@ EOF
   } >"${BACKUP_DIR}/MANIFEST.txt"
 }
 
+
+wait_for_apt_locks() {
+  # Wait until dpkg/apt locks are free (unattended-upgrades on fresh Ubuntu).
+  local timeout="${1:-600}" elapsed=0 next_msg=0
+  local locks=(
+    /var/lib/dpkg/lock-frontend
+    /var/lib/dpkg/lock
+    /var/lib/apt/lists/lock
+    /var/cache/apt/archives/lock
+  )
+  local busy reason
+  while (( elapsed < timeout )); do
+    busy=0
+    reason=""
+    local lk
+    for lk in "${locks[@]}"; do
+      [[ -e "$lk" ]] || continue
+      if command -v fuser >/dev/null 2>&1; then
+        if fuser "$lk" >/dev/null 2>&1; then
+          busy=1
+          reason="lock $lk"
+          break
+        fi
+      elif command -v lsof >/dev/null 2>&1; then
+        if lsof "$lk" >/dev/null 2>&1; then
+          busy=1
+          reason="lock $lk"
+          break
+        fi
+      fi
+    done
+    if [[ "$busy" -eq 0 ]] && [[ "$(id -u 2>/dev/null || echo 1)" -eq 0 ]] \
+        && [[ -e /var/lib/dpkg/lock-frontend ]] && command -v flock >/dev/null 2>&1; then
+      # Root-only flock probe (non-root gets EACCES → false busy)
+      if ! flock -n /var/lib/dpkg/lock-frontend -c true 2>/dev/null; then
+        busy=1
+        reason="flock /var/lib/dpkg/lock-frontend"
+      fi
+    fi
+    if [[ "$busy" -eq 0 ]]; then
+      if pgrep -x unattended-upgr >/dev/null 2>&1 \
+        || pgrep -x apt-get >/dev/null 2>&1 \
+        || pgrep -x apt >/dev/null 2>&1 \
+        || pgrep -x dpkg >/dev/null 2>&1 \
+        || pgrep -f '/usr/bin/unattended-upgrade' >/dev/null 2>&1; then
+        busy=1
+        reason="процесс apt/dpkg/unattended-upgrades"
+      fi
+    fi
+    if [[ "$busy" -eq 0 ]]; then
+      if (( elapsed > 0 )); then
+        ok "apt/dpkg свободен (ждали ${elapsed}с)"
+      fi
+      return 0
+    fi
+    if (( elapsed >= next_msg )); then
+      log "Ожидание apt/dpkg (${reason}; ${elapsed}/${timeout}с) — часто unattended-upgrades на свежей Ubuntu…"
+      next_msg=$((elapsed + 15))
+    fi
+    sleep 5
+    elapsed=$((elapsed + 5))
+  done
+  warn "Таймаут ${timeout}с ожидания apt/dpkg (${reason:-busy}) — пробуем всё равно"
+  return 1
+}
+
+apt_get_cmd() {
+  # apt-get with lock timeout option (APT 2.x / Ubuntu 24.04+)
+  apt-get -o DPkg::Lock::Timeout=600 "$@"
+}
+
+apt_get_retry() {
+  # apt_get_retry [apt-get args...]  — wait locks, up to 3 attempts
+  local attempt=1 max=3 rc=0
+  wait_for_apt_locks 600 || true
+  while (( attempt <= max )); do
+    if apt_get_cmd "$@"; then
+      return 0
+    fi
+    rc=$?
+    warn "apt-get не удался (попытка ${attempt}/${max}, exit ${rc})"
+    if (( attempt < max )); then
+      wait_for_apt_locks 120 || true
+      sleep $(( attempt * 5 ))
+    fi
+    attempt=$((attempt + 1))
+  done
+  return "$rc"
+}
+
 install_packages() {
   step "Пакеты"
   local pkgs=(ufw fail2ban ipset chrony curl ca-certificates iptables)
@@ -1549,10 +1658,16 @@ install_packages() {
     mkdir -p /etc/apt/apt.conf.d
     echo 'Acquire::ForceIPv4 "true";' >/etc/apt/apt.conf.d/99force-ipv4
   fi
-  apt-get update -qq || warn "apt-get update failed (продолжаем)"
-  apt-get install -y -qq "${pkgs[@]}" || apt-get install -y "${pkgs[@]}"
+  wait_for_apt_locks 600 || true
+  apt_get_retry update -qq || warn "apt-get update failed (продолжаем)"
+  if ! apt_get_retry install -y -qq "${pkgs[@]}"; then
+    apt_get_retry install -y "${pkgs[@]}" || {
+      err "Не удалось установить пакеты (apt lock / сеть). Повторите позже: gorecshit …"
+      return 1
+    }
+  fi
   # optional whiptail for future interactive runs on minimal images
-  apt-get install -y -qq whiptail 2>/dev/null || true
+  apt_get_retry install -y -qq whiptail 2>/dev/null || true
   ok "Пакеты установлены: ${pkgs[*]}"
 }
 
@@ -1668,7 +1783,8 @@ WantedBy=multi-user.target
     systemctl enable --now gorecshit-nic-tune.service >/dev/null 2>&1 || true
     # irqbalance best-effort (spreads NIC IRQs; skip quietly if unavailable)
     if ! command -v irqbalance >/dev/null 2>&1; then
-      apt-get install -y -qq irqbalance >/dev/null 2>&1 || true
+      wait_for_apt_locks 120 || true
+      apt_get_retry install -y -qq irqbalance >/dev/null 2>&1 || true
     fi
     if command -v irqbalance >/dev/null 2>&1; then
       systemctl enable --now irqbalance >/dev/null 2>&1 || true
@@ -3115,7 +3231,7 @@ final_verify() {
     ok "daemon.json изменён и Docker был перезапущен для применения"
   fi
   ok "Hardening complete. Backups: ${BACKUP_DIR}"
-  ok "Rollback: bash install.sh --rollback   OR   ${BACKUP_DIR}/rollback.sh"
+  ok "Откат: $(rollback_hint_cmd)   OR   ${BACKUP_DIR}/rollback.sh"
 }
 
 run_hardening() {
