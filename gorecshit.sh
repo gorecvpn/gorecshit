@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# gorecshit v2.4.0 — one-command hardening for Remnawave VPN node servers (Debian 11+/Ubuntu 20.04+)
+# gorecshit v2.5.0 — one-command hardening for Remnawave VPN node servers (Debian 11+/Ubuntu 20.04+)
 # Usage:
 #   bash install.sh --panel-ip X.X.X.X [--node-port 2222] [--yes]
 #   bash install.sh --check --panel-ip X.X.X.X
@@ -8,7 +8,7 @@
 # Does NOT restart Docker while remnanode/xray is live. Does NOT deploy itself.
 set -Eeuo pipefail
 
-VERSION="2.4.0"
+VERSION="2.5.0"
 SCRIPT_NAME="gorecshit"
 BACKUP_ROOT="/root/hardening-backups"
 
@@ -71,6 +71,8 @@ SSH_PORT_NEW=""           # empty = keep 22 only; --ssh-port N adds N
 BLOCKLIST_FROM=""         # ssh host or URL or local path
 MODULES_CSV=""            # --modules ufw,blocklist,...
 TZ_OPT=""                 # empty = leave; "auto" = geo; or IANA name
+NO_UPGRADE=0              # --no-upgrade / GORECSHIT_NO_UPGRADE=1: skip apt full-upgrade
+APT_TIMERS_PAUSED=0       # set when we stop apt-daily* / unattended-upgrades for the run
 ASSUME_YES=0
 CLI_ASSUME_YES=0          # set only by --yes / -y (not by menu)
 FROM_MENU=0               # set when menu item 1/2 starts install
@@ -189,7 +191,12 @@ on_error() {
   err "Откат: $(rollback_hint_cmd)   (или ${BACKUP_DIR:-/root/hardening-backups/<ts>}/rollback.sh)"
   exit "$ec"
 }
+on_exit() {
+  # Always put apt-daily / unattended-upgrades back if we paused them.
+  restore_apt_timers 2>/dev/null || true
+}
 trap on_error ERR
+trap on_exit EXIT
 
 usage() {
   cat <<'EOF'
@@ -239,6 +246,7 @@ Options:
   --no-nofile                Skip nofile 1048576 limits
   --no-resolv-v4             Keep IPv6 nameservers in resolv.conf even when IPv6 off
   --no-certbot-hooks         Skip certbot renew reload hooks for caddy/nginx
+  --no-upgrade               Skip system apt full-upgrade before installing packages
   --dry-run, --check         Print actions / verify plan only; make no changes
   --refresh-lists            Only run scanner-block refresh
   --status                   Show current hardening status
@@ -251,7 +259,7 @@ Options:
   -h, --help                 Show this help
 
 Env: GORECSHIT_PANEL_IP, GORECSHIT_NODE_PORT, GORECSHIT_RELAY_IPS, GORECSHIT_LOG_FILE,
-     GORECSHIT_BLOCKLIST_FROM, GORECSHIT_MODULES
+     GORECSHIT_BLOCKLIST_FROM, GORECSHIT_MODULES, GORECSHIT_NO_UPGRADE=1
 
 One-liner:
   bash <(curl -Ls https://raw.githubusercontent.com/gorecvpn/gorecshit/main/install.sh) --panel-ip X.X.X.X --yes
@@ -405,6 +413,7 @@ parse_args() {
       --no-nofile) DO_NOFILE=0; shift ;;
       --no-resolv-v4) DO_RESOLV_V4=0; shift ;;
       --no-certbot-hooks) DO_CERTBOT_HOOKS=0; shift ;;
+      --no-upgrade) NO_UPGRADE=1; shift ;;
       --yes|-y) ASSUME_YES=1; CLI_ASSUME_YES=1; shift ;;
       --dry-run|--check) DRY_RUN=1; CHECK_ONLY=1; shift ;;
       --refresh-lists) DO_REFRESH_LISTS_ONLY=1; shift ;;
@@ -440,6 +449,9 @@ parse_args() {
   if [[ -n "$MODULES_CSV" ]]; then
     apply_modules_csv "$MODULES_CSV"
   fi
+  case "${GORECSHIT_NO_UPGRADE:-}" in
+    1|true|TRUE|yes|YES|on|ON) NO_UPGRADE=1 ;;
+  esac
   if [[ -n "$SSH_PORT_NEW" ]] && ! is_port "$SSH_PORT_NEW"; then
     err "Invalid --ssh-port: $SSH_PORT_NEW"; exit 2
   fi
@@ -2837,55 +2849,74 @@ EOF
 }
 
 
-wait_for_apt_locks() {
-  # Wait until dpkg/apt locks are free (unattended-upgrades on fresh Ubuntu).
-  local timeout="${1:-600}" elapsed=0 next_msg=0
+# True only for a real unattended-upgrade job.
+# Ubuntu keeps unattended-upgrade-shutdown running forever; both truncate to
+# comm "unattended-upgr" (15 chars), so pgrep -x unattended-upgr is a false positive.
+_apt_real_unattended_running() {
+  local pid cmd
+  for pid in $(pgrep -f 'unattended-upgrade' 2>/dev/null || true); do
+    [[ -r "/proc/${pid}/cmdline" ]] || continue
+    cmd="$(tr '\0' ' ' <"/proc/${pid}/cmdline" 2>/dev/null || true)"
+    case "$cmd" in
+      *unattended-upgrade-shutdown*) continue ;;
+      */usr/bin/unattended-upgrade*) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+_apt_lock_holders_reason() {
+  # Prefer lock-file holders (fuser/lsof) over process-name matching.
   local locks=(
     /var/lib/dpkg/lock-frontend
     /var/lib/dpkg/lock
     /var/lib/apt/lists/lock
     /var/cache/apt/archives/lock
   )
-  local busy reason
+  local lk
+  for lk in "${locks[@]}"; do
+    [[ -e "$lk" ]] || continue
+    if command -v fuser >/dev/null 2>&1; then
+      if fuser "$lk" >/dev/null 2>&1; then
+        printf 'lock %s' "$lk"
+        return 0
+      fi
+    elif command -v lsof >/dev/null 2>&1; then
+      if lsof "$lk" >/dev/null 2>&1; then
+        printf 'lock %s' "$lk"
+        return 0
+      fi
+    fi
+  done
+  if [[ "$(id -u 2>/dev/null || echo 1)" -eq 0 ]] \
+      && [[ -e /var/lib/dpkg/lock-frontend ]] && command -v flock >/dev/null 2>&1; then
+    # Root-only flock probe (non-root gets EACCES → false busy)
+    if ! flock -n /var/lib/dpkg/lock-frontend -c true 2>/dev/null; then
+      printf 'flock /var/lib/dpkg/lock-frontend'
+      return 0
+    fi
+  fi
+  if pgrep -x apt-get >/dev/null 2>&1 \
+    || pgrep -x apt >/dev/null 2>&1 \
+    || pgrep -x dpkg >/dev/null 2>&1; then
+    printf 'процесс apt/dpkg'
+    return 0
+  fi
+  if _apt_real_unattended_running; then
+    printf 'процесс unattended-upgrades'
+    return 0
+  fi
+  return 1
+}
+
+wait_for_apt_locks() {
+  # Wait until dpkg/apt locks are free. Ignores idle unattended-upgrade-shutdown.
+  local timeout="${1:-600}" elapsed=0 next_msg=0
+  local reason=""
   while (( elapsed < timeout )); do
-    busy=0
-    reason=""
-    local lk
-    for lk in "${locks[@]}"; do
-      [[ -e "$lk" ]] || continue
-      if command -v fuser >/dev/null 2>&1; then
-        if fuser "$lk" >/dev/null 2>&1; then
-          busy=1
-          reason="lock $lk"
-          break
-        fi
-      elif command -v lsof >/dev/null 2>&1; then
-        if lsof "$lk" >/dev/null 2>&1; then
-          busy=1
-          reason="lock $lk"
-          break
-        fi
-      fi
-    done
-    if [[ "$busy" -eq 0 ]] && [[ "$(id -u 2>/dev/null || echo 1)" -eq 0 ]] \
-        && [[ -e /var/lib/dpkg/lock-frontend ]] && command -v flock >/dev/null 2>&1; then
-      # Root-only flock probe (non-root gets EACCES → false busy)
-      if ! flock -n /var/lib/dpkg/lock-frontend -c true 2>/dev/null; then
-        busy=1
-        reason="flock /var/lib/dpkg/lock-frontend"
-      fi
-    fi
-    if [[ "$busy" -eq 0 ]]; then
-      if pgrep -x unattended-upgr >/dev/null 2>&1 \
-        || pgrep -x apt-get >/dev/null 2>&1 \
-        || pgrep -x apt >/dev/null 2>&1 \
-        || pgrep -x dpkg >/dev/null 2>&1 \
-        || pgrep -f '/usr/bin/unattended-upgrade' >/dev/null 2>&1; then
-        busy=1
-        reason="процесс apt/dpkg/unattended-upgrades"
-      fi
-    fi
-    if [[ "$busy" -eq 0 ]]; then
+    if reason="$(_apt_lock_holders_reason)"; then
+      :
+    else
       if (( elapsed > 0 )); then
         ok "apt/dpkg свободен (ждали ${elapsed}с)"
       fi
@@ -2900,6 +2931,93 @@ wait_for_apt_locks() {
   done
   warn "Таймаут ${timeout}с ожидания apt/dpkg (${reason:-busy}) — пробуем всё равно"
   return 1
+}
+
+pause_apt_timers() {
+  # Stop apt-daily* so they don't grab locks mid-run; ask unattended-upgrades to finish.
+  # Never kill dpkg mid-install — systemctl stop waits for the current job.
+  [[ "$DRY_RUN" -eq 1 ]] && return 0
+  [[ "$(id -u 2>/dev/null || echo 1)" -eq 0 ]] || return 0
+  command -v systemctl >/dev/null 2>&1 || return 0
+  local u
+  for u in apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service; do
+    systemctl stop "$u" 2>/dev/null || true
+  done
+  if systemctl is-active --quiet unattended-upgrades.service 2>/dev/null \
+      || systemctl is-active --quiet unattended-upgrades 2>/dev/null; then
+    log "Останавливаем unattended-upgrades (дождётся завершения текущей установки)…"
+    # ExecStop of this unit waits for an in-progress unattended-upgrade to finish.
+    systemctl stop unattended-upgrades.service 2>/dev/null \
+      || systemctl stop unattended-upgrades 2>/dev/null \
+      || true
+  fi
+  APT_TIMERS_PAUSED=1
+}
+
+restore_apt_timers() {
+  # Re-enable automatic security updates after our apt work.
+  [[ "${APT_TIMERS_PAUSED:-0}" -eq 1 ]] || return 0
+  APT_TIMERS_PAUSED=0
+  [[ "$(id -u 2>/dev/null || echo 1)" -eq 0 ]] || return 0
+  command -v systemctl >/dev/null 2>&1 || return 0
+  systemctl start apt-daily.timer 2>/dev/null || true
+  systemctl start apt-daily-upgrade.timer 2>/dev/null || true
+  # Restart the shutdown helper so reboot still waits for upgrades.
+  systemctl start unattended-upgrades.service 2>/dev/null \
+    || systemctl start unattended-upgrades 2>/dev/null \
+    || true
+}
+
+system_upgrade() {
+  # Update the OS before installing packages. Skippable via --no-upgrade.
+  if [[ "$NO_UPGRADE" -eq 1 ]]; then
+    log "Обновление системы пропущено (--no-upgrade / GORECSHIT_NO_UPGRADE)"
+    pause_apt_timers
+    wait_for_apt_locks 600 || true
+    return 0
+  fi
+  step "Обновление системы"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    printf '%b[DRY]%b stop apt-daily*; dpkg --configure -a; apt-get update; apt-get full-upgrade -y (force-confold)\n' \
+      "${C_YEL}" "${C_RESET}"
+    return 0
+  fi
+  export DEBIAN_FRONTEND=noninteractive
+  pause_apt_timers
+  wait_for_apt_locks 600 || true
+
+  log "dpkg --configure -a…"
+  if ! dpkg --configure -a; then
+    warn "dpkg --configure -a вернул ошибку (продолжаем)"
+  fi
+  wait_for_apt_locks 120 || true
+
+  if [[ "$IPV6_OFF" -eq 1 ]]; then
+    mkdir -p /etc/apt/apt.conf.d
+    echo 'Acquire::ForceIPv4 "true";' >/etc/apt/apt.conf.d/99force-ipv4
+  fi
+
+  apt_get_retry update -qq || warn "apt-get update не удался (продолжаем)"
+
+  log "apt-get full-upgrade (сохраняем локальные конфиги)…"
+  local upgrade_opts=(-y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
+  if ! apt_get_retry "${upgrade_opts[@]}" full-upgrade; then
+    warn "full-upgrade не удался — пробуем upgrade…"
+    apt_get_retry "${upgrade_opts[@]}" upgrade \
+      || warn "upgrade тоже не удался (продолжаем установку пакетов)"
+  fi
+
+  apt_get_retry -y autoremove --purge -qq 2>/dev/null || true
+
+  if [[ -f /var/run/reboot-required ]]; then
+    warn "Требуется перезагрузка (/var/run/reboot-required) — НЕ перезагружаем автоматически"
+    if [[ -f /var/run/reboot-required.pkgs ]]; then
+      log "Пакеты, требующие reboot: $(tr '\\n' ' ' </var/run/reboot-required.pkgs | head -c 300)"
+    fi
+  else
+    ok "Перезагрузка не требуется"
+  fi
+  ok "Система обновлена"
 }
 
 apt_get_cmd() {
@@ -4950,6 +5068,7 @@ final_verify() {
 }
 
 run_hardening() {
+  system_upgrade
   install_packages
   configure_sysctl
   configure_nofile
@@ -4967,6 +5086,7 @@ run_hardening() {
   configure_certbot_hooks
   final_verify
   install_cli_command  # ensure CLI after hardening
+  restore_apt_timers
 }
 
 main() {

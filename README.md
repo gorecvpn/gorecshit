@@ -2,7 +2,7 @@
 
 Однокомандное hardening-окружение для **нод Remnawave** (Debian 11+ / Ubuntu 20.04+).
 
-**Версия: 2.4.0**
+**Версия: 2.5.0**
 
 Скрипт идемпотентен: его можно запускать повторно. IP панели **не зашит** в репозиторий — его нужно передать параметром `--panel-ip` (или выбрать в интерактивном меню).
 
@@ -13,16 +13,17 @@
 1. **Preflight** — root, определение ОС, бэкап всех затрагиваемых файлов в `/root/hardening-backups/<timestamp>/` + `rollback.sh`.
 2. **Автодетект remnanode** — `/opt/remnanode/.env` (`NODE_PORT` / `APP_PORT`), docker compose; клиентские **TCP и UDP** порты из xray **inbounds** (fallback: `ss` LISTEN вне ephemeral; UDP без эфемерного диапазона). Явно: `--client-ports`, `--client-udp-ports`.
 3. **Интерактивное меню (RU)** — при запуске в TTY без `--yes`: статус-строка + простые пункты с emoji (plain `read` + ANSI, whiptail не обязателен).
-4. **Пакеты** — `ufw`, `fail2ban`, `ipset`, `chrony`, `curl`; при отключении IPv6 — `Acquire::ForceIPv4`.
-5. **UFW** — deny incoming (**DROP**), logging low; `limit 22/tcp`; клиентские TCP/UDP порты; `NODE_PORT` **только с IP панели**; deny публичного `4443/tcp`; whitelist HAProxy-релеев; анти-lockout (`$SSH_CLIENT`, `--allow-ssh-from`, `--relay-ips`).
-6. **Скрытие портов и ping** — ICMP echo-request → DROP; закрытые порты без RST/REJECT (DROP); не светить unreachable.
-7. **Anti-probing** — на клиентских портах только для **NEW**; `ESTABLISHED,RELATED` всегда в обход (без hashlimit/connlimit на датаплейне). Потолки NAT-friendly; **без** xt_recent soft-ban. Не ломает REALITY.
-8. **DOCKER-USER** — ограничение `NODE_PORT` на bridge-publish; Docker **не перезапускается**, пока живы remnanode/xray.
-9. **sysctl / скорость** — BBR + `fq`, буферы **64MB**, `tcp_fastopen=3`, `tcp_slow_start_after_idle=0`, `tcp_mtu_probing=1`, `tcp_notsent_lowat=16384`, `somaxconn`/`netdev_max_backlog`, `conntrack_max`, `txqueuelen=10000`, `irqbalance`; `nf_conntrack_tcp_be_liberal=1`; IPv6 **включён по умолчанию** (`--ipv6-off` опционально); `nofile` 1048576; `--tcp-timestamps-off` опционально.
-10. **SSH** — Banner none, MaxAuthTries 3, опция `--ssh-port N` (сначала UFW, `sshd -t`, **22 сохраняется**). Парольный и root-логин **не** отключаются. fail2ban sshd + **recidive**; сканеры из ipset режутся до SSH.
-11. **Блоклист сканеров** — ipset + weekly timer; **зеркала** raw.githubusercontent.com → cdn.jsdelivr.net / fastly.jsdelivr.net; `--blocklist-from`; never-block для панели/релеев/`$SSH_CLIENT`/private/bogons.
-12. **Стелс** — нейтральный hostname `web-<hex>`, без баннеров, предупреждение о лишних слушателях, отключение nginx default site; NODE_PORT только с панели.
-13. **`--check` / `--rollback` / `--status` / `--version` / `--refresh-lists` / `--dpi-check` / `--audit` / `--stealth` / `--update`**.
+4. **Обновление системы** — перед пакетами: пауза `apt-daily*` / `unattended-upgrades` (без kill dpkg), `dpkg --configure -a`, `apt-get update` + `full-upgrade` (сохранение локальных конфигов); сообщение если нужен reboot (**без** авто-reboot); в конце таймеры возвращаются. Пропуск: `--no-upgrade` / `GORECSHIT_NO_UPGRADE=1`.
+5. **Пакеты** — `ufw`, `fail2ban`, `ipset`, `chrony`, `curl`; при отключении IPv6 — `Acquire::ForceIPv4`.
+6. **UFW** — deny incoming (**DROP**), logging low; `limit 22/tcp`; клиентские TCP/UDP порты; `NODE_PORT` **только с IP панели**; deny публичного `4443/tcp`; whitelist HAProxy-релеев; анти-lockout (`$SSH_CLIENT`, `--allow-ssh-from`, `--relay-ips`).
+7. **Скрытие портов и ping** — ICMP echo-request → DROP; закрытые порты без RST/REJECT (DROP); не светить unreachable.
+8. **Anti-probing** — на клиентских портах только для **NEW**; `ESTABLISHED,RELATED` всегда в обход (без hashlimit/connlimit на датаплейне). Потолки NAT-friendly; **без** xt_recent soft-ban. Не ломает REALITY.
+9. **DOCKER-USER** — ограничение `NODE_PORT` на bridge-publish; Docker **не перезапускается**, пока живы remnanode/xray.
+10. **sysctl / скорость** — BBR + `fq`, буферы **64MB**, `tcp_fastopen=3`, `tcp_slow_start_after_idle=0`, `tcp_mtu_probing=1`, `tcp_notsent_lowat=16384`, `somaxconn`/`netdev_max_backlog`, `conntrack_max`, `txqueuelen=10000`, `irqbalance`; `nf_conntrack_tcp_be_liberal=1`; IPv6 **включён по умолчанию** (`--ipv6-off` опционально); `nofile` 1048576; `--tcp-timestamps-off` опционально.
+11. **SSH** — Banner none, MaxAuthTries 3, опция `--ssh-port N` (сначала UFW, `sshd -t`, **22 сохраняется**). Парольный и root-логин **не** отключаются. fail2ban sshd + **recidive**; сканеры из ipset режутся до SSH.
+12. **Блоклист сканеров** — ipset + weekly timer; **зеркала** raw.githubusercontent.com → cdn.jsdelivr.net / fastly.jsdelivr.net; `--blocklist-from`; never-block для панели/релеев/`$SSH_CLIENT`/private/bogons.
+13. **Стелс** — нейтральный hostname `web-<hex>`, без баннеров, предупреждение о лишних слушателях, отключение nginx default site; NODE_PORT только с панели.
+14. **`--check` / `--rollback` / `--status` / `--version` / `--refresh-lists` / `--dpi-check` / `--audit` / `--stealth` / `--update` / `--no-upgrade`**.
 
 ## Меню (TTY)
 
@@ -95,7 +96,15 @@ sudo gorecshit --stealth
 
 ## Changelog
 
+### v2.5.0
+
+- Перед установкой пакетов: фаза **«Обновление системы»** — пауза `apt-daily.timer` / `apt-daily-upgrade.timer` (+ сервисы), `systemctl stop unattended-upgrades` (ждёт окончания текущей установки, без kill `dpkg`), затем `dpkg --configure -a`, `apt-get update`, `full-upgrade` с `--force-confdef/--force-confold`; опционально `autoremove`; если есть `/var/run/reboot-required` — предупреждение, **без** авто-reboot
+- Таймеры apt и `unattended-upgrades` возвращаются в конце прогона и через `trap EXIT`
+- Исправлен ложный busy-wait до 600с: `pgrep -x unattended-upgr` совпадал с постоянно висящим `unattended-upgrade-shutdown` (оба truncates до 15 символов); ожидание смотрит на держателей lock-файлов (`fuser`/`lsof`/`flock`) и реальный job `/usr/bin/unattended-upgrade`
+- Флаг `--no-upgrade` и env `GORECSHIT_NO_UPGRADE=1` — пропустить full-upgrade (таймеры всё равно ставятся на паузу на время установки пакетов)
+
 ### v2.4.0
+
 
 - Меню «9» / `--stealth`: скрытие отпечатков сервера (SSH/MOTD, TTL/ICMP FP, UFW DROP для закрытых портов, опциональный hostname и mask сервисов с подтверждением, отчёт Docker, server_tokens); бэкап+rollback; без потери скорости и без правок панели/IPv6/клиентских портов
 - `--audit` дополнен проверками fingerprint-маркеров
