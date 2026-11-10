@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# gorecshit v2.5.0 — one-command hardening for Remnawave VPN node servers (Debian 11+/Ubuntu 20.04+)
+# gorecshit v2.6.0 — one-command hardening for Remnawave VPN node servers (Debian 11+/Ubuntu 20.04+)
 # Usage:
 #   bash install.sh --panel-ip X.X.X.X [--node-port 2222] [--yes]
 #   bash install.sh --check --panel-ip X.X.X.X
@@ -8,7 +8,7 @@
 # Does NOT restart Docker while remnanode/xray is live. Does NOT deploy itself.
 set -Eeuo pipefail
 
-VERSION="2.5.0"
+VERSION="2.6.0"
 SCRIPT_NAME="gorecshit"
 BACKUP_ROOT="/root/hardening-backups"
 
@@ -64,6 +64,14 @@ DO_HIDE_PORTS=1
 DO_ANTI_PROBE=1
 DO_STEALTH=1
 DO_DOCKER_JOURNAL=1
+DO_EGRESS_GUARD=1        # --no-egress-guard: skip outbound SMTP block
+EGRESS_BLOCK_PORTS="25"   # --egress-block-ports LIST (e.g. 25,465,587)
+DO_DECOY_WEB=0           # --decoy-web: :80 → 301 https via existing nginx (else asks via /dev/tty, default no)
+AUDIT_PUB_IP=""
+AUDIT_RU_NODES=()
+AUDIT_FOREIGN_NODES=()
+AUDIT_UFW_PUB4=" "
+AUDIT_UFW_PUB6=" "
 FORCE_DOCKER_RESTART=0   # --docker-restart: restart even with --yes / non-interactive
 NO_DOCKER_RESTART=0      # --no-docker-restart: never restart
 DO_TCP_TIMESTAMPS_OFF=0
@@ -228,7 +236,8 @@ Options:
   --ssh-port N               Add SSH listen port N (ufw first, sshd -t, keep 22 until confirmed)
   --blocklist-from SRC       Copy/fetch blocklist from ssh-host, URL, or local path (fallback)
   --modules LIST             Comma modules: ufw,blocklist,hide_ports,anti_probe,ssh,stealth,
-                             fail2ban,sysctl,hostname,docker (default: all enabled)
+                             fail2ban,sysctl,hostname,docker,egress_guard,decoy_web
+                             (default: all enabled except decoy_web)
   --ipv6-off                 Opt-in: disable IPv6 via sysctl (default: keep IPv6 on; safer under dual-stack xray)
   --no-ipv6-off              Keep IPv6 enabled (default; retained for compatibility)
   --no-blocklist             Skip scanner ipset blocklist
@@ -236,6 +245,9 @@ Options:
   --no-hide-ports            Skip ICMP/closed-port hiding
   --no-anti-probe            Skip client-port rate limits
   --no-stealth               Skip stealth / not-look-like-VPN tweaks
+  --no-egress-guard          Skip outbound SMTP block (abuse guard) for host + docker
+  --egress-block-ports LIST  Outbound TCP ports to block (default: 25; e.g. 25,465,587)
+  --decoy-web                Port 80 → 301 https via existing nginx (only if safe; else skip)
   --tcp-timestamps-off       Set net.ipv4.tcp_timestamps=0
   --tz ZONE|auto             Set timezone (default: leave as-is). auto = IP geolocation
   --yes                      Non-interactive (still requires --panel-ip or GORECSHIT_PANEL_IP)
@@ -253,7 +265,8 @@ Options:
   --update                   Self-update from GitHub by commit SHA (jsDelivr / cache-buster fallback)
   --version                  Print script version and exit
   --dpi-check                Check DPI/DNS/TLS from this node (egress diagnostics)
-  --audit                    RU block check (check-host) + xray/server detectability audit
+  --audit                    RU block check + Shodan InternetDB + port/IPv6 exposure + active
+                             REALITY probe + giveaways (PTR/banners/MTU/egress) — read-only
   --stealth                  Hide server fingerprints (SSH banner/MOTD/TTL/ICMP FP; ask before risky)
   --rollback / --uninstall   Restore latest backup under /root/hardening-backups/
   -h, --help                 Show this help
@@ -357,7 +370,7 @@ apply_modules_csv() {
   DO_UFW=0; DO_BLOCKLIST=0; DO_HIDE_PORTS=0; DO_ANTI_PROBE=0
   DO_SSH=0; DO_STEALTH=0; DO_FAIL2BAN=0; DO_SYSCTL=0
   DO_HOSTNAME=0; DO_DOCKER_JOURNAL=0; DO_DOCKER_USER=0; DO_NOFILE=0
-  DO_RESOLV_V4=0; DO_CERTBOT_HOOKS=0
+  DO_RESOLV_V4=0; DO_CERTBOT_HOOKS=0; DO_EGRESS_GUARD=0
   local m
   while IFS= read -r m; do
     case "$m" in
@@ -370,16 +383,18 @@ apply_modules_csv() {
       fail2ban|f2b) DO_FAIL2BAN=1 ;;
       sysctl|bbr) DO_SYSCTL=1; DO_NOFILE=1 ;;
       hostname|tz) DO_HOSTNAME=1 ;;
+      egress_guard|egress|smtp) DO_EGRESS_GUARD=1 ;;
+      decoy_web|decoy) DO_DECOY_WEB=1 ;;
       docker|journald|journal)
         DO_DOCKER_JOURNAL=1; DO_DOCKER_USER=1; DO_RESOLV_V4=1; DO_CERTBOT_HOOKS=1; DO_NOFILE=1 ;;
       all)
         DO_UFW=1; DO_BLOCKLIST=1; DO_HIDE_PORTS=1; DO_ANTI_PROBE=1
         DO_SSH=1; DO_STEALTH=1; DO_FAIL2BAN=1; DO_SYSCTL=1
         DO_HOSTNAME=1; DO_DOCKER_JOURNAL=1; DO_DOCKER_USER=1; DO_NOFILE=1
-        DO_RESOLV_V4=1; DO_CERTBOT_HOOKS=1 ;;
+        DO_RESOLV_V4=1; DO_CERTBOT_HOOKS=1; DO_EGRESS_GUARD=1 ;;
       minimum|min)
         DO_UFW=1; DO_SSH=1; DO_FAIL2BAN=1; DO_SYSCTL=1; DO_BLOCKLIST=1
-        DO_HIDE_PORTS=1; DO_DOCKER_USER=1 ;;
+        DO_HIDE_PORTS=1; DO_DOCKER_USER=1; DO_EGRESS_GUARD=1 ;;
       *) warn "Unknown module: $m" ;;
     esac
   done < <(foreach_csv "$csv")
@@ -404,6 +419,9 @@ parse_args() {
       --no-hide-ports) DO_HIDE_PORTS=0; shift ;;
       --no-anti-probe) DO_ANTI_PROBE=0; shift ;;
       --no-stealth) DO_STEALTH=0; shift ;;
+      --no-egress-guard) DO_EGRESS_GUARD=0; shift ;;
+      --egress-block-ports) EGRESS_BLOCK_PORTS="${2:-}"; shift 2 ;;
+      --decoy-web) DO_DECOY_WEB=1; shift ;;
       --tcp-timestamps-off) DO_TCP_TIMESTAMPS_OFF=1; shift ;;
       --tz) TZ_OPT="${2:-}"; shift 2 ;;
       --relay-ips) RELAY_IPS="${2:-}"; shift 2 ;;
@@ -1440,6 +1458,7 @@ _audit_passive_reality_probe() {
         no_openssl) : ;;
         *) _audit_warn "Маскировочный домен ${masked}:443 не открылся по TLS1.3/h2 с ноды" ;;
       esac
+      _audit_active_probe_reality "$port" "$masked" "$masked" 443
     else
       _audit_warn "Не удалось извлечь CN/SAN из сертификата на порту ${port}"
     fi
@@ -1595,6 +1614,7 @@ for ib in inbounds:
         dest_port="${dest##*:}"
         [[ "$dest_port" =~ ^[0-9]+$ ]] || dest_port=443
       fi
+      _audit_active_probe_reality "$port" "$sni" "$dest_host" "$dest_port"
       if [[ -n "$dest_host" && "$dest_host" != "-" ]]; then
         tls_res="$(_audit_openssl_dest "$dest_host" "$dest_port")"
         case "$tls_res" in
@@ -1733,55 +1753,7 @@ _audit_server_level() {
     _audit_warn "UFW неактивен — защита gorecshit не установлена/выключена; публичная поверхность шире (пункт меню 1)"
   fi
 
-  # Extra listening public ports besides SSH / clients / panel-port
-  load_ephemeral_port_range
-  local node_ex="${DETECTED_NODE_PORT:-3000}"
-  if [[ -f /opt/remnanode/.env ]]; then
-    local np
-    np="$(grep -E '^(NODE_PORT|APP_PORT)=' /opt/remnanode/.env 2>/dev/null | head -1 | cut -d= -f2- | tr -d '\"\r' || true)"
-    [[ "$np" =~ ^[0-9]+$ ]] && node_ex="$np"
-  fi
-  local -a allowed=() extras=()
-  local p
-  for p in "${DETECTED_CLIENT_PORTS[@]:-}"; do
-    [[ "$p" =~ ^[0-9]+$ ]] && allowed+=("$p")
-  done
-  allowed+=("22" "80" "443" "$node_ex")
-  [[ -n "${SSH_PORT_NEW:-}" ]] && allowed+=("$SSH_PORT_NEW")
-  # also common ssh alt from ss
-  local line addr port proc
-  if command -v ss >/dev/null 2>&1; then
-    while IFS= read -r line; do
-      addr="$(ss_local_addr "$line")"
-      port="${addr##*:}"; port="${port%%]*}"
-      [[ "$port" =~ ^[0-9]+$ ]] || continue
-      ss_is_loopback_addr "$addr" && continue
-      is_ephemeral_port "$port" && continue
-      # skip allowed
-      local skip=0 a
-      for a in "${allowed[@]}"; do
-        [[ "$port" == "$a" ]] && skip=1 && break
-      done
-      (( skip == 1 )) && continue
-      # skip excluded service ports that are "expected" infra? We WANT to flag extras.
-      # ignore dns/dhcp-ish
-      case "$port" in
-        53|68|323) continue ;;
-      esac
-      proc=""
-      if [[ "$line" == *'users:(('* ]]; then
-        proc="$(sed -n 's/.*users:(("\([^"]*\).*/\1/p' <<<"$line" | head -1 || true)"
-      fi
-      extras+=("${port}:${proc:-?}")
-    done < <(ss -lntp 2>/dev/null | awk 'NR>1' || true)
-  fi
-  if [[ ${#extras[@]} -eq 0 ]]; then
-    _audit_ok "Лишних публичных TCP-слушателей кроме SSH/клиентов/панели не видно"
-  else
-    local show
-    show="$(printf '%s\n' "${extras[@]}" | head -12 | paste -sd ', ' -)"
-    _audit_warn "Лишние публичные порты: ${show} — закройте или уберите сервисы (не трогаем сами)"
-  fi
+  # Extra public listeners (v4+v6, UFW/Docker aware): see _audit_exposure_listeners (v2.6.0)
 
   # ---- Fingerprint / stealth markers (read-only) ----
   step "Отпечатки сервера (аудит)"
@@ -1849,6 +1821,632 @@ _audit_server_level() {
 
 }
 
+# ---------- v2.6.0: exposure / active-probe / giveaway audit helpers (read-only) ----------
+
+# Known "palevnye" ports: label shown when such a port is visible from outside.
+_audit_port_label() {
+  case "$1" in
+    2222) echo "дефолтный NODE_PORT Remnawave" ;;
+    3000|3001|6767) echo "порты панели/подписки Remnawave" ;;
+    62050|62051) echo "дефолтный порт Marzban-node" ;;
+    10085|62789|8080) echo "часто xray API / stats / прокси" ;;
+    2053|2083|2087|2096|8880) echo "типичный порт xray (CF-порты) / 3x-ui" ;;
+    54321|2095) echo "дефолт 3x-ui / x-ui" ;;
+    1080|3128|8118|9050) echo "SOCKS/HTTP-прокси / Tor" ;;
+    8388|8389) echo "Shadowsocks по умолчанию" ;;
+    51820|51821) echo "WireGuard / wg-easy" ;;
+    1194|1723|500|4500|1701) echo "OpenVPN / PPTP / IPsec / L2TP" ;;
+    2375|2376) echo "Docker API" ;;
+    9100|9090|9091|19999) echo "мониторинг (node_exporter/Prometheus/netdata)" ;;
+    *) echo "" ;;
+  esac
+}
+
+_audit_in_list() {
+  # _audit_in_list needle item...
+  local n="$1" x
+  shift
+  for x in "$@"; do [[ "$x" == "$n" ]] && return 0; done
+  return 1
+}
+
+_audit_node_port() {
+  local np="${DETECTED_NODE_PORT:-}"
+  if [[ -z "$np" && -n "${NODE_PORT:-}" && "${NODE_PORT}" =~ ^[0-9]+$ ]]; then np="$NODE_PORT"; fi
+  if [[ -f /opt/remnanode/.env ]]; then
+    local e
+    e="$(grep -E '^(NODE_PORT|APP_PORT)=' /opt/remnanode/.env 2>/dev/null | head -1 | cut -d= -f2- | tr -d '\"\r' || true)"
+    [[ "$e" =~ ^[0-9]+$ ]] && np="$e"
+  fi
+  printf '%s' "${np:-3000}"
+}
+
+_audit_ssh_ports() {
+  # SSH ports from ss (sshd process) + 22 + --ssh-port
+  local -a out=(22)
+  [[ -n "${SSH_PORT_NEW:-}" ]] && out+=("$SSH_PORT_NEW")
+  local line addr port
+  while IFS= read -r line; do
+    [[ "$line" == *'"sshd"'* ]] || continue
+    addr="$(ss_local_addr "$line")"
+    port="${addr##*:}"
+    [[ "$port" =~ ^[0-9]+$ ]] && out+=("$port")
+  done < <(ss -Hlntp 2>/dev/null || true)
+  printf '%s\n' "${out[@]}" | sort -nu
+}
+
+_audit_detect_public_ipv6() {
+  local ip6=""
+  ip6="$(curl -6 -fsS --connect-timeout 4 --max-time 8 -A "gorecshit-audit/${VERSION}" https://api64.ipify.org 2>/dev/null | tr -d '[:space:]' || true)"
+  if [[ "$ip6" == *:* ]]; then printf '%s\n' "$ip6"; return 0; fi
+  ip6="$(ip -6 addr show scope global 2>/dev/null | awk '/inet6/ && !/deprecated/ {sub(/\/.*/,"",$2); print $2; exit}' || true)"
+  if [[ "$ip6" == *:* && "$ip6" != fd* && "$ip6" != fc* ]]; then printf '%s\n' "$ip6"; return 0; fi
+  return 1
+}
+
+_audit_internetdb() {
+  # Shodan InternetDB (free, no key): what the internet already sees on this IP.
+  local ip="$1"
+  [[ -n "$ip" ]] || return 0
+  local raw code body _try
+  for _try in 1 2; do
+    raw="$(curl -sS --connect-timeout 6 --max-time 12 -A "gorecshit-audit/${VERSION}" \
+      -w '\n%{http_code}' "https://internetdb.shodan.io/${ip}" 2>/dev/null || true)"
+    code="${raw##*$'\n'}"
+    body="${raw%$'\n'*}"
+    [[ "$code" == 200 || "$code" == 404 ]] && break
+    sleep 2
+  done
+  echo
+  printf '%bShodan InternetDB — %s:%b\n' "${C_BOLD}" "$ip" "${C_RESET}"
+  case "$code" in
+    200) ;;
+    404)
+      _audit_ok "Shodan про этот IP ничего не знает — сканеры его пока не каталогизировали"
+      return 0 ;;
+    *)
+      _audit_warn "InternetDB недоступен (HTTP ${code:-нет ответа}) — пропуск, это не ошибка ноды"
+      return 0 ;;
+  esac
+  local idb_ports="" tags="" cpes="" vulns="" hosts=""
+  if command -v python3 >/dev/null 2>&1; then
+    local parsed
+    parsed="$(printf '%s' "$body" | python3 -c '
+import json,sys
+try:
+  d=json.load(sys.stdin)
+except Exception:
+  sys.exit(0)
+def j(k): return ",".join(str(x) for x in (d.get(k) or []))
+print("P "+j("ports")); print("T "+j("tags")); print("C "+j("cpes")); print("V "+j("vulns")); print("H "+j("hostnames"))
+' 2>/dev/null || true)"
+    idb_ports="$(sed -n 's/^P //p' <<<"$parsed")"
+    tags="$(sed -n 's/^T //p' <<<"$parsed")"
+    cpes="$(sed -n 's/^C //p' <<<"$parsed")"
+    vulns="$(sed -n 's/^V //p' <<<"$parsed")"
+    hosts="$(sed -n 's/^H //p' <<<"$parsed")"
+  else
+    idb_ports="$(grep -oE '"ports":\[[^]]*\]' <<<"$body" | sed -E 's/.*\[//;s/\]//' || true)"
+    tags="$(grep -oE '"tags":\[[^]]*\]' <<<"$body" | sed -E 's/.*\[//;s/\]//;s/"//g' || true)"
+    cpes="$(grep -oE '"cpes":\[[^]]*\]' <<<"$body" | sed -E 's/.*\[//;s/\]//;s/"//g' || true)"
+    vulns="$(grep -oE '"vulns":\[[^]]*\]' <<<"$body" | sed -E 's/.*\[//;s/\]//;s/"//g' || true)"
+    hosts="$(grep -oE '"hostnames":\[[^]]*\]' <<<"$body" | sed -E 's/.*\[//;s/\]//;s/"//g' || true)"
+  fi
+  _audit_info "Порты, которые видит интернет: ${idb_ports:-нет}"
+  [[ -n "$tags" ]] && _audit_info "Теги: ${tags}"
+  [[ -n "$cpes" ]] && _audit_info "CPE (софт/версии): ${cpes}"
+  [[ -n "$hosts" ]] && _audit_info "Hostnames: ${hosts}"
+
+  local np t p lbl bad=0
+  np="$(_audit_node_port)"
+  local -a ssh_ports=()
+  mapfile -t ssh_ports < <(_audit_ssh_ports)
+  local IFS_OLD="$IFS"
+  IFS=','
+  for p in $idb_ports; do
+    IFS="$IFS_OLD"
+    [[ "$p" =~ ^[0-9]+$ ]] || continue
+    if [[ "$p" == "$np" ]]; then
+      _audit_err "Shodan видел NODE_PORT ${p} открытым — порт управления нодой светился в интернет (сейчас проверим ниже)"
+      bad=1
+    elif _audit_in_list "$p" "${DETECTED_CLIENT_PORTS[@]:-}" "${DETECTED_CLIENT_UDP_PORTS[@]:-}"; then
+      if [[ "$p" != "443" ]]; then
+        _audit_info "Клиентский порт ${p} виден сканерам (нормально; на 443 он менее заметен)"
+      fi
+    elif _audit_in_list "$p" "${ssh_ports[@]}"; then
+      :
+    else
+      lbl="$(_audit_port_label "$p")"
+      if [[ -n "$lbl" ]]; then
+        _audit_warn "Порт ${p} виден снаружи — ${lbl}"
+      else
+        _audit_warn "Порт ${p} виден снаружи и не является клиентским/SSH — лишний сервис?"
+      fi
+      bad=1
+    fi
+    IFS=','
+  done
+  IFS="$IFS_OLD"
+  for t in ${tags//,/ }; do
+    case "$t" in
+      vpn|proxy|tor|self-signed|compromised|malware|c2|honeypot|scanner|spam)
+        _audit_warn "Тег Shodan «${t}» — IP уже помечен; это видят все, кто ищет VPN-ноды"
+        bad=1 ;;
+    esac
+  done
+  if [[ -n "$vulns" ]]; then
+    local vn
+    vn="$(tr ',' '\n' <<<"$vulns" | grep -c . || true)"
+    _audit_warn "Shodan сопоставил ${vn} CVE (по версиям софта): $(tr ',' ' ' <<<"$vulns" | cut -d' ' -f1-5) — обновите систему (пункт 1 делает full-upgrade)"
+  fi
+  if [[ -n "$hosts" ]] && grep -qiE 'vpn|proxy|xray|vless|reality|remna|v2ray|tunnel|node' <<<"$hosts"; then
+    _audit_warn "Hostname/PTR в Shodan содержит VPN-слова: ${hosts}"
+    bad=1
+  fi
+  [[ "$bad" -eq 0 ]] && _audit_ok "В Shodan нет признаков VPN-ноды"
+  _audit_info "Shodan обновляет данные раз в несколько дней — после закрытия портов они исчезнут не сразу"
+  return 0
+}
+
+_audit_ufw_public_sets() {
+  # Fills AUDIT_UFW_PUB4 / AUDIT_UFW_PUB6 with " port/proto " tokens open to Anywhere.
+  AUDIT_UFW_PUB4=" "
+  AUDIT_UFW_PUB6=" "
+  command -v ufw >/dev/null 2>&1 || return 0
+  local line to action from v6 port proto
+  while IFS= read -r line; do
+    [[ "$line" == *ALLOW* || "$line" == *LIMIT* ]] || continue
+    v6=0
+    [[ "$line" == *"(v6)"* ]] && v6=1
+    line="${line//(v6)/}"
+    # columns: To  Action  From
+    to="$(awk '{print $1}' <<<"$line")"
+    action="$(awk '{print $2}' <<<"$line")"
+    from="$(awk '{for(i=3;i<=NF;i++){ if($i!="IN") {print $i; exit} }}' <<<"$line")"
+    [[ "$action" == ALLOW || "$action" == LIMIT ]] || continue
+    [[ "$from" == Anywhere ]] || continue
+    port="${to%%/*}"
+    proto="${to#*/}"
+    [[ "$to" == */* ]] || proto="any"
+    [[ "$port" =~ ^[0-9]+$ ]] || continue
+    if [[ "$proto" == any ]]; then
+      if [[ "$v6" -eq 1 ]]; then AUDIT_UFW_PUB6+="${port}/tcp ${port}/udp "; else AUDIT_UFW_PUB4+="${port}/tcp ${port}/udp "; fi
+    else
+      if [[ "$v6" -eq 1 ]]; then AUDIT_UFW_PUB6+="${port}/${proto} "; else AUDIT_UFW_PUB4+="${port}/${proto} "; fi
+    fi
+  done < <(ufw status 2>/dev/null | awk 'NR>4' || true)
+  return 0
+}
+
+_audit_exposure_listeners() {
+  step "Внешняя поверхность: кто слушает порты (IPv4 + IPv6)"
+  load_ephemeral_port_range
+  local np ufw_on=0 ufw_v6="no" has_v6=0 v6_enabled=0
+  np="$(_audit_node_port)"
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qiE 'Status:\s*active'; then ufw_on=1; fi
+  if [[ -f /etc/default/ufw ]]; then
+    ufw_v6="$(sed -n 's/^IPV6=//p' /etc/default/ufw 2>/dev/null | tr -d '"' | head -1 || true)"
+  fi
+  if [[ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 1)" == "0" ]]; then v6_enabled=1; fi
+  if [[ "$v6_enabled" -eq 1 ]] && ip -6 addr show scope global 2>/dev/null | grep -q inet6; then has_v6=1; fi
+  _audit_ufw_public_sets
+
+  local -a ssh_ports=() docker_pub=()
+  mapfile -t ssh_ports < <(_audit_ssh_ports)
+  if command -v docker >/dev/null 2>&1; then
+    mapfile -t docker_pub < <(docker ps --format '{{.Ports}}' 2>/dev/null | tr ',' '\n' | grep -oE '(0\.0\.0\.0|\[?::\]?):[0-9]+' | grep -oE '[0-9]+$' | sort -nu || true)
+  fi
+
+  local line proto addr port fam proc lbl shown=0 issues=0
+  local -A seen=()
+  while IFS= read -r line; do
+    proto="$(awk '{print $1}' <<<"$line")"
+    addr="$(ss_local_addr "$line")"
+    [[ -n "$addr" ]] || continue
+    port="${addr##*:}"
+    [[ "$port" =~ ^[0-9]+$ ]] || continue
+    ss_is_loopback_addr "$addr" && continue
+    case "$addr" in \[fe80*|fe80*) continue ;; esac
+    if [[ "$addr" == \[* ]]; then fam=6; elif [[ "$addr" == \*:* ]]; then fam=46; else fam=4; fi
+    if [[ "$proto" == udp ]]; then
+      case "$port" in 68|546|5353|323) continue ;; esac
+      # ephemeral UDP "listeners" are mostly outbound sockets (xray UDP relay, DNS); show only known service ports
+      if is_ephemeral_port "$port" && ! _audit_in_list "$port" "${DETECTED_CLIENT_UDP_PORTS[@]:-}" \
+         && [[ -z "$(_audit_port_label "$port")" ]]; then continue; fi
+    fi
+    [[ -n "${seen[$proto/$port/$fam]:-}" ]] && continue
+    seen[$proto/$port/$fam]=1
+    proc="$(sed -n 's/.*users:(("\([^"]*\).*/\1/p' <<<"$line" | head -1 || true)"
+    shown=$((shown+1))
+    local famtxt="IPv4"
+    [[ "$fam" == 6 ]] && famtxt="IPv6"
+    [[ "$fam" == 46 ]] && famtxt="IPv4+IPv6"
+    local tag="${port}/${proto} (${proc:-?}, ${famtxt})"
+    # classify
+    if [[ "$proto" == tcp ]] && _audit_in_list "$port" "${DETECTED_CLIENT_PORTS[@]:-}"; then
+      _audit_ok "${tag} — клиентский порт"
+      continue
+    fi
+    if [[ "$proto" == udp ]] && _audit_in_list "$port" "${DETECTED_CLIENT_UDP_PORTS[@]:-}"; then
+      _audit_ok "${tag} — клиентский UDP-порт"
+      continue
+    fi
+    if [[ "$proto" == tcp ]] && _audit_in_list "$port" "${ssh_ports[@]}"; then
+      _audit_ok "${tag} — SSH"
+      continue
+    fi
+    local pub4=0 pub6=0 via_docker=0
+    if [[ "$ufw_on" -eq 0 ]]; then
+      pub4=1; pub6=1
+    else
+      [[ "$AUDIT_UFW_PUB4" == *" ${port}/${proto} "* ]] && pub4=1
+      [[ "$AUDIT_UFW_PUB6" == *" ${port}/${proto} "* ]] && pub6=1
+      [[ "$ufw_v6" != "yes" ]] && pub6=1
+    fi
+    [[ "$fam" == 4 ]] && pub6=0
+    [[ "$fam" == 6 ]] && pub4=0
+    [[ "$has_v6" -eq 0 ]] && pub6=0
+    _audit_in_list "$port" "${docker_pub[@]:-}" && via_docker=1
+    lbl="$(_audit_port_label "$port")"
+    if [[ "$port" == "$np" && "$proto" == tcp ]]; then
+      if (( pub4 == 1 || pub6 == 1 )); then
+        _audit_err "${tag} — NODE_PORT открыт всем ($( ((pub4)) && echo IPv4)$( ((pub6)) && echo ' IPv6')) — главный признак ноды! Пункт 1 закроет его (только IP панели)"
+        issues=$((issues+1))
+      elif (( via_docker == 1 )); then
+        _audit_warn "${tag} — NODE_PORT опубликован Docker (обходит UFW); проверьте цепочку DOCKER-USER"
+      else
+        _audit_ok "${tag} — NODE_PORT, снаружи закрыт UFW (только панель)"
+      fi
+      continue
+    fi
+    if (( via_docker == 1 )); then
+      _audit_warn "${tag} — Docker publish 0.0.0.0 обходит UFW, порт виден снаружи${lbl:+ (${lbl})}; привяжите к 127.0.0.1 в compose"
+      issues=$((issues+1))
+    elif (( pub4 == 1 || pub6 == 1 )); then
+      _audit_warn "${tag} — открыт наружу ($( ((pub4)) && echo IPv4)$( ((pub6)) && echo ' IPv6'))${lbl:+ — ${lbl}}: лишний признак, закройте или привяжите к 127.0.0.1"
+      issues=$((issues+1))
+    else
+      _audit_info "${tag} — слушает, но UFW его закрывает (снаружи не виден)${lbl:+ — ${lbl}}"
+    fi
+  done < <(ss -Hlntup 2>/dev/null || true)
+  [[ "$shown" -eq 0 ]] && _audit_info "ss не вернул слушателей (нет прав root?)"
+  [[ "$issues" -eq 0 ]] && _audit_ok "Лишних открытых наружу портов не найдено"
+
+  # ---- IPv6 parity ----
+  echo
+  printf '%bIPv6 (сканеры всё чаще проверяют и v6):%b\n' "${C_BOLD}" "${C_RESET}"
+  if [[ "$has_v6" -eq 0 ]]; then
+    _audit_info "Глобального IPv6 нет (или IPv6 выключен) — v6-поверхности нет"
+  elif [[ "$ufw_on" -eq 1 && "$ufw_v6" != "yes" ]]; then
+    _audit_err "У сервера есть IPv6, но UFW IPV6=${ufw_v6:-?} — по IPv6 открыты ВСЕ порты (включая NODE_PORT). Пункт 1 включит IPV6=yes"
+  elif [[ "$ufw_on" -eq 1 ]]; then
+    _audit_ok "UFW управляет и IPv6 (IPV6=yes)"
+    if [[ "$AUDIT_UFW_PUB6" == *" ${np}/tcp "* ]]; then
+      _audit_err "NODE_PORT ${np} разрешён всем по IPv6 — пункт 1 уберёт это правило (если панель не ходит по IPv6)"
+    fi
+    if [[ -f /etc/ufw/before6.rules ]] && grep -qE '^-A ufw6-before-input -p icmpv6 --icmpv6-type echo-request -j ACCEPT' /etc/ufw/before6.rules 2>/dev/null; then
+      _audit_warn "ping по IPv6 отвечает (before6.rules echo-request ACCEPT) — пункт 1 (hide_ports) закроет"
+    else
+      _audit_ok "ping по IPv6 скрыт"
+    fi
+  else
+    if command -v ip6tables >/dev/null 2>&1 && ip6tables -S INPUT 2>/dev/null | head -1 | grep -qE -- '-P INPUT (DROP|REJECT)'; then
+      _audit_ok "ip6tables INPUT policy DROP"
+    else
+      _audit_warn "IPv6 есть, а фаервол v6 не настроен — все слушатели доступны по IPv6"
+    fi
+  fi
+  return 0
+}
+
+_audit_nodeport_external() {
+  # Ground truth from the internet: NODE_PORT must NOT answer anyone except the panel.
+  local pub_ip="$1" np
+  np="$(_audit_node_port)"
+  [[ -n "$pub_ip" && "$np" =~ ^[0-9]+$ ]] || return 0
+  echo
+  printf '%bNODE_PORT %s снаружи (check-host, не с IP панели):%b\n' "${C_BOLD}" "$np" "${C_RESET}"
+  if [[ ${#AUDIT_RU_NODES[@]} -eq 0 && ${#AUDIT_FOREIGN_NODES[@]} -eq 0 ]]; then
+    _audit_pick_checkhost_nodes || { _audit_warn "check-host недоступен — пропуск"; return 0; }
+  fi
+  local -a nodes=("${AUDIT_FOREIGN_NODES[@]}" "${AUDIT_RU_NODES[@]:0:2}")
+  local rid body ro rt fo ft
+  rid="$(_audit_checkhost_start tcp "${pub_ip}:${np}" "${nodes[@]}" 2>/dev/null || true)"
+  if [[ -z "$rid" ]]; then
+    _audit_warn "Не удалось запустить check-tcp (лимит API?) — пропуск"
+    return 0
+  fi
+  body="$(_audit_checkhost_poll "$rid" "$(( $(date +%s) + 20 ))")"
+  [[ -n "$body" ]] || { _audit_warn "Нет результата check-tcp"; return 0; }
+  read -r ro rt fo ft < <(printf '%s' "$body" | _audit_summarize_tcp_result "${AUDIT_RU_NODES[@]:0:2}" -- "${AUDIT_FOREIGN_NODES[@]}")
+  if (( ${ro:-0} + ${fo:-0} > 0 )); then
+    _audit_err "NODE_PORT ${np} отвечает из интернета ($(( ro + fo ))/$(( rt + ft )) узлов) — любой сканер найдёт API ноды. Закройте: пункт 1"
+  elif (( ${rt:-0} + ${ft:-0} > 0 )); then
+    _audit_ok "NODE_PORT ${np} снаружи не отвечает (0/$(( rt + ft )) узлов) — API ноды скрыт"
+  else
+    _audit_warn "Недостаточно данных check-host по NODE_PORT"
+  fi
+  return 0
+}
+
+# ---- Active probing (like ТСПУ/GFW probers): node without REALITY auth vs real dest ----
+_audit_tls_fp() {
+  # _audit_tls_fp HOST PORT SNI [extra openssl args...] -> "OK|fp|subject|issuer|alpn|proto" or "ERR|reason"
+  local host="$1" port="$2" sni="$3"
+  shift 3
+  local -a sn=()
+  if [[ -n "$sni" ]]; then sn=(-servername "$sni"); else sn=(-noservername); fi
+  local out ec=0 cert fp subj iss alpn proto
+  out="$(timeout 7 openssl s_client -connect "${host}:${port}" "${sn[@]}" "$@" </dev/null 2>&1 | tr -d '\0')" || ec=$?
+  if printf '%s' "$out" | grep -q 'BEGIN CERTIFICATE'; then
+    cert="$(printf '%s\n' "$out" | openssl x509 -noout -fingerprint -sha256 -subject -issuer 2>/dev/null || true)"
+    fp="$(grep -i 'fingerprint' <<<"$cert" | sed 's/.*=//' | tr -d ':' | cut -c1-16 || true)"
+    subj="$(grep -i '^subject' <<<"$cert" | sed -E 's/^subject= ?//' | tr -d '\r' || true)"
+    iss="$(grep -i '^issuer' <<<"$cert" | sed -E 's/^issuer= ?//' | tr -d '\r' || true)"
+    alpn="$(printf '%s' "$out" | grep -iE '^ALPN protocol:|No ALPN negotiated' | head -1 | sed -E 's/ALPN protocol: *//;s/No ALPN negotiated/none/' | tr -d '\r' || true)"
+    proto="$(printf '%s' "$out" | grep -oE 'TLSv1(\.[0-3])?' | head -1 || true)"
+    printf 'OK|%s|%s|%s|%s|%s' "${fp:-?}" "${subj:-?}" "${iss:-?}" "${alpn:-none}" "${proto:-?}"
+    return 0
+  fi
+  if [[ "$ec" -eq 124 ]]; then printf 'ERR|timeout'; return 0; fi
+  if printf '%s' "$out" | grep -qiE 'reset by peer|errno=104'; then printf 'ERR|reset'; return 0; fi
+  if printf '%s' "$out" | grep -qiE 'refused'; then printf 'ERR|refused'; return 0; fi
+  local al
+  al="$(printf '%s' "$out" | grep -oiE 'alert [a-z ]+' | head -1 || true)"
+  if [[ -n "$al" ]]; then printf 'ERR|%s' "$al"; return 0; fi
+  if printf '%s' "$out" | grep -qiE 'unexpected eof|write:errno|no peer certificate'; then printf 'ERR|eof'; return 0; fi
+  printf 'ERR|fail'
+  return 0
+}
+
+_audit_http_status() {
+  # _audit_http_status URL [curl args...] -> "CODE server" or "ERR curlN"
+  local url="$1"
+  shift
+  local hdr ec=0 code srv
+  hdr="$(curl -sk -o /dev/null -D - --connect-timeout 5 -m 10 -A 'Mozilla/5.0' "$@" "$url" 2>/dev/null)" || ec=$?
+  code="$(printf '%s' "$hdr" | grep -m1 -oE '^HTTP/[0-9.]+ [0-9]{3}' | awk '{print $2}' || true)"
+  if [[ -z "$code" ]]; then
+    case "$ec" in
+      52) printf 'ERR empty' ;;
+      56|35) printf 'ERR reset' ;;
+      28) printf 'ERR timeout' ;;
+      7) printf 'ERR refused' ;;
+      *) printf 'ERR curl%s' "$ec" ;;
+    esac
+    return 0
+  fi
+  srv="$(printf '%s' "$hdr" | grep -i -m1 '^server:' | sed 's/^[Ss]erver: *//' | tr -d '\r' || true)"
+  printf '%s %s' "$code" "${srv:--}"
+  return 0
+}
+
+_audit_cmp_line() {
+  # _audit_cmp_line LABEL NODE_RESULT DEST_RESULT SAME(0/1/2=inconclusive)
+  if [[ "$4" -eq 2 ]]; then
+    _audit_info "$1: одна из сторон не ответила вовремя — сравнение пропущено (нода «${2:0:40}», сайт «${3:0:40}»)"
+  elif [[ "$4" -eq 1 ]]; then
+    _audit_ok "$1: совпадает с настоящим сайтом (${2:0:70})"
+  else
+    _audit_warn "$1: нода «${2:0:60}» ≠ сайт «${3:0:60}»"
+  fi
+}
+
+_audit_active_probe_reality() {
+  # _audit_active_probe_reality PORT SNI DEST_HOST DEST_PORT
+  local port="$1" sni="$2" dhost="$3" dport="${4:-443}"
+  command -v openssl >/dev/null 2>&1 || { _audit_warn "openssl нет — активный зонд пропущен"; return 0; }
+  [[ "$port" =~ ^[0-9]+$ ]] || return 0
+  sni="${sni%%,*}"
+  [[ "$sni" == "-" ]] && sni=""
+  [[ "$dhost" == "-" ]] && dhost=""
+  [[ -z "$dhost" ]] && dhost="$sni"
+  [[ -z "$sni" ]] && sni="$dhost"
+  if [[ -z "$sni" ]]; then
+    _audit_warn "Нет SNI/dest для активного зонда порта ${port}"
+    return 0
+  fi
+  case "$dhost" in
+    /*|@*) _audit_info "dest — unix-сокет (${dhost}), selfsteal: сравнение с внешним сайтом не применимо"; return 0 ;;
+  esac
+  local tgt=""
+  if timeout 3 bash -c "</dev/tcp/127.0.0.1/${port}" 2>/dev/null; then
+    tgt="127.0.0.1"
+  elif [[ -n "${AUDIT_PUB_IP:-}" ]] && timeout 3 bash -c "</dev/tcp/${AUDIT_PUB_IP}/${port}" 2>/dev/null; then
+    tgt="$AUDIT_PUB_IP"
+  else
+    _audit_warn "Порт ${port} не принимает TCP локально — активный зонд пропущен"
+    return 0
+  fi
+  echo
+  printf '%bАктивный зонд порта %s без ключа REALITY (как это делает ТСПУ/сканер) vs %s:%s:%b\n' \
+    "${C_BOLD}" "$port" "$dhost" "$dport" "${C_RESET}"
+  case "$dhost" in
+    127.*|localhost|::1) _audit_info "dest локальный (${dhost}) — selfsteal; домен ${sni} виден в Certificate Transparency (crt.sh), это нормально для selfsteal" ;;
+  esac
+  local mism=0 n d same rnd
+  # 1) TLS with configured SNI
+  n="$(_audit_tls_fp "$tgt" "$port" "$sni" -alpn h2,http/1.1)"
+  d="$(_audit_tls_fp "$dhost" "$dport" "$sni" -alpn h2,http/1.1)"
+  same=0
+  if [[ "$n" == OK* && "$d" == OK* ]]; then
+    local nf nsub nalpn df dsub dalpn _r niss
+    IFS='|' read -r _r nf nsub niss nalpn _r <<<"$n"
+    IFS='|' read -r _r df dsub _r dalpn _r <<<"$d"
+    if [[ "$nf" == "$df" ]] || [[ "$nsub" == "$dsub" && "$nalpn" == "$dalpn" ]]; then same=1; fi
+    _audit_cmp_line "TLS (SNI=${sni}) сертификат/ALPN" "${nsub} alpn=${nalpn}" "${dsub} alpn=${dalpn}" "$same"
+    if [[ "$nsub" == "$niss" ]]; then
+      _audit_warn "Сертификат на ноде самоподписанный (subject=issuer) — это видят все сканеры"
+      mism=$((mism+1))
+    fi
+  else
+    [[ "${n%%|*}" == "${d%%|*}" && "$n" == "$d" ]] && same=1
+    _audit_cmp_line "TLS (SNI=${sni})" "$n" "$d" "$same"
+  fi
+  (( same == 0 )) && mism=$((mism+1))
+
+  # 2) HTTPS request through node (unauthenticated -> must be proxied to dest)
+  n="$(_audit_http_status "https://${sni}/" --connect-to "${sni}:443:${tgt}:${port}")"
+  d="$(_audit_http_status "https://${sni}/" --connect-to "${sni}:443:${dhost}:${dport}")"
+  same=0
+  [[ "${n%% *}" == "${d%% *}" ]] && same=1
+  [[ "$same" -eq 0 && ( "$n" == "ERR timeout" || "$d" == "ERR timeout" ) ]] && same=2
+  _audit_cmp_line "HTTPS GET / (код + Server)" "$n" "$d" "$same"
+  (( same == 0 )) && mism=$((mism+1))
+
+  # 3) plain HTTP to the TLS port
+  n="$(_audit_http_status "http://${tgt}:${port}/" -H "Host: ${sni}")"
+  d="$(_audit_http_status "http://${dhost}:${dport}/" -H "Host: ${sni}")"
+  same=0
+  [[ "${n%% *}" == "${d%% *}" ]] && same=1
+  [[ "$same" -eq 0 && ( "$n" == "ERR timeout" || "$d" == "ERR timeout" ) ]] && same=2
+  _audit_cmp_line "Обычный HTTP на TLS-порт" "$n" "$d" "$same"
+  (( same == 0 )) && mism=$((mism+1))
+
+  # 4) random SNI
+  rnd="$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n' | head -c 10).com"
+  n="$(_audit_tls_fp "$tgt" "$port" "$rnd")"
+  d="$(_audit_tls_fp "$dhost" "$dport" "$rnd")"
+  same=0
+  if [[ "$n" == OK* && "$d" == OK* ]]; then
+    [[ "$(cut -d'|' -f3 <<<"$n")" == "$(cut -d'|' -f3 <<<"$d")" ]] && same=1
+  elif [[ "$n" != OK* && "$d" != OK* ]]; then
+    same=1
+  fi
+  _audit_cmp_line "Случайный SNI (${rnd})" "$(cut -d'|' -f1-3 <<<"$n")" "$(cut -d'|' -f1-3 <<<"$d")" "$same"
+  (( same == 0 )) && mism=$((mism+1))
+
+  # 5) TLS 1.2 only (Iran-style probes used TLS1.0–1.2)
+  n="$(_audit_tls_fp "$tgt" "$port" "$sni" -tls1_2)"
+  d="$(_audit_tls_fp "$dhost" "$dport" "$sni" -tls1_2)"
+  same=0
+  if [[ "$n" != OK* && "$d" != OK* ]]; then
+    same=1
+  elif [[ "$n" == OK* && "$d" == OK* && "$(cut -d'|' -f3 <<<"$n")" == "$(cut -d'|' -f3 <<<"$d")" ]]; then
+    same=1
+  fi
+  _audit_cmp_line "Только TLS 1.2" "$(cut -d'|' -f1,3 <<<"$n")" "$(cut -d'|' -f1,3 <<<"$d")" "$same"
+  (( same == 0 )) && mism=$((mism+1))
+
+  if (( mism == 0 )); then
+    _audit_ok "Активное зондирование: порт ${port} отвечает как настоящий ${dhost} — маскировка хорошая"
+  else
+    _audit_warn "Найдено расхождений: ${mism}. Небольшие отличия (разные edge-серверы CDN) бывают; стабильное расхождение = нода палится зондом"
+    _audit_info "Что сделать в панели: REALITY на порту 443, dest = крупный зарубежный сайт с TLS1.3+h2 на том же ASN/рядом (проверьте RealiTLScanner), serverNames = домены этого dest, обновить xray ≥ 25.6.8"
+  fi
+  if [[ "$port" != "443" ]]; then
+    _audit_warn "REALITY на порту ${port} — сайт ${sni} на нестандартном порту выглядит странно; лучше 443"
+  fi
+  return 0
+}
+
+_audit_xray_version() {
+  local cname ver
+  cname="$(_find_remnanode_container 2>/dev/null || true)"
+  [[ -n "$cname" ]] || return 0
+  ver="$(timeout 6 docker exec "$cname" xray version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
+  if [[ -z "$ver" ]]; then
+    ver="$(timeout 6 docker exec "$cname" /usr/local/bin/xray version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
+  fi
+  [[ -n "$ver" ]] || { _audit_info "Версию xray в контейнере ${cname} определить не удалось"; return 0; }
+  if [[ "$(printf '%s\n%s\n' "25.6.8" "$ver" | sort -V | head -1)" == "25.6.8" ]]; then
+    _audit_ok "xray ${ver} (≥ 25.6.8: есть защита от детекта REALITY по post-handshake/NewSessionTicket)"
+  else
+    _audit_warn "xray ${ver} < 25.6.8 — старый REALITY детектится по NewSessionTicket (Aparecium). Обновите образ remnanode в окне обслуживания"
+  fi
+  return 0
+}
+
+_audit_giveaways() {
+  step "Мелкие признаки (баннеры, PTR, MTU, исходящий трафик)"
+  local pub_ip="${AUDIT_PUB_IP:-}"
+  # SSH banner as the internet sees it
+  local p banner
+  for p in $(_audit_ssh_ports); do
+    banner="$(timeout 3 bash -c "exec 3<>/dev/tcp/127.0.0.1/${p}; head -1 <&3" 2>/dev/null | tr -d '\r' || true)"
+    [[ -n "$banner" ]] || continue
+    if grep -qiE 'ubuntu|debian|raspbian' <<<"$banner"; then
+      _audit_warn "SSH-баннер :${p} «${banner}» выдаёт ОС/версию — меню 9 (DebianBanner no)"
+    else
+      _audit_ok "SSH-баннер :${p} «${banner}»"
+    fi
+    break
+  done
+  # PTR
+  if [[ -n "$pub_ip" ]]; then
+    local ptr=""
+    if command -v python3 >/dev/null 2>&1; then
+      ptr="$(timeout 6 python3 -c 'import socket,sys
+try: print(socket.gethostbyaddr(sys.argv[1])[0])
+except Exception: pass' "$pub_ip" 2>/dev/null || true)"
+    else
+      ptr="$(timeout 6 getent hosts "$pub_ip" 2>/dev/null | awk '{print $2; exit}' || true)"
+    fi
+    if [[ -z "$ptr" ]]; then
+      _audit_info "PTR (обратный DNS) для ${pub_ip} не задан — допустимо; нейтральный PTR (как у обычного сайта) выглядит естественнее"
+    elif grep -qiE 'vpn|proxy|xray|vless|reality|remna|v2ray|tunnel|wireguard|node|exit|relay' <<<"$ptr"; then
+      _audit_err "PTR ${pub_ip} → ${ptr} — содержит VPN-слова. Смените PTR в панели хостера на нейтральный (например mail/web/имя сайта)"
+    elif grep -qE '[0-9]+[-.][0-9]+[-.][0-9]+[-.][0-9]+' <<<"$ptr"; then
+      _audit_info "PTR ${ptr} — дефолтный хостерский (норм; нейтральное имя домена выглядит лучше)"
+    else
+      _audit_ok "PTR ${pub_ip} → ${ptr}"
+    fi
+  fi
+  # motd / issue words
+  local f
+  for f in /etc/motd /etc/issue /etc/issue.net; do
+    [[ -s "$f" ]] || continue
+    if grep -qiE 'vpn|xray|remna|vless|reality|v2ray|proxy|marzban' "$f" 2>/dev/null; then
+      _audit_warn "${f} содержит VPN-слова — меню 9 очистит"
+    fi
+  done
+  # HTTP Server headers on non-client web ports
+  local wp res
+  for wp in 80 8080 443 8443; do
+    _audit_in_list "$wp" "${DETECTED_CLIENT_PORTS[@]:-}" && continue
+    ss -Hltn "( sport = :${wp} )" 2>/dev/null | grep -q . || continue
+    if [[ "$wp" == 443 || "$wp" == 8443 ]]; then
+      res="$(_audit_http_status "https://127.0.0.1:${wp}/")"
+    else
+      res="$(_audit_http_status "http://127.0.0.1:${wp}/")"
+    fi
+    if grep -qE '/[0-9]' <<<"${res#* }"; then
+      _audit_warn "HTTP :${wp} Server «${res#* }» — версия видна (server_tokens off / меню 9)"
+    elif grep -qiE 'caddy|xray|v2ray' <<<"${res#* }"; then
+      _audit_info "HTTP :${wp} Server «${res#* }»"
+    else
+      _audit_ok "HTTP :${wp} ответ «${res}»"
+    fi
+  done
+  # MTU / MSS
+  local iface mtu
+  iface="$(ip -o route show default 2>/dev/null | awk '{print $5; exit}' || true)"
+  if [[ -n "$iface" ]]; then
+    mtu="$(cat "/sys/class/net/${iface}/mtu" 2>/dev/null || true)"
+    if [[ "$mtu" == 1500 || -z "$mtu" ]]; then
+      _audit_ok "MTU ${iface}=${mtu:-?} (MSS 1460 — обычный сервер)"
+    else
+      _audit_info "MTU ${iface}=${mtu} → MSS $((mtu-40)) — нестандартный MSS заметен для пассивного TCP-отпечатка (JA4T); у некоторых облаков это норма, менять не нужно"
+    fi
+  fi
+  if command -v iptables >/dev/null 2>&1 && iptables -t mangle -S 2>/dev/null | grep -q 'TCPMSS'; then
+    _audit_info "Есть правила TCPMSS в mangle — MSS клиентам отличается от обычного сервера: $(iptables -t mangle -S 2>/dev/null | grep -m1 TCPMSS)"
+  fi
+  _audit_info "tcp_timestamps=$(sysctl -n net.ipv4.tcp_timestamps 2>/dev/null || echo '?') (оставляем как у обычного Linux; отключение само по себе выделяет сервер)"
+  # Egress guard
+  if command -v iptables >/dev/null 2>&1 && iptables -S GORECSHIT-EGRESS 2>/dev/null | grep -q -- '--dport 25'; then
+    _audit_ok "Исходящий SMTP 25 заблокирован (спам с ноды → abuse хостеру невозможен)"
+  else
+    _audit_warn "Исходящий SMTP 25 не закрыт — через ноду можно слать спам → abuse-жалоба хостеру с вашим IP. Пункт 1 (egress_guard)"
+  fi
+  if command -v iptables >/dev/null 2>&1 && iptables -S GORECSHIT-EGRESS 2>/dev/null | grep -q 'port-unreachable'; then
+    _audit_ok "Исходящие ICMP port-unreachable/time-exceeded режутся (закрытые UDP-порты не отвечают)"
+  else
+    _audit_info "Исходящие ICMP unreachable не режутся (UFW DROP уже скрывает большинство; пункт 1 добавит)"
+  fi
+  return 0
+}
+
 run_node_audit() {
   step "Проверка на блокировку и палевность ноды (read-only)"
   echo "Ничего не меняем: без правок firewall/sysctl/docker, без влияния на скорость клиентов."
@@ -1866,18 +2464,34 @@ run_node_audit() {
     ports=("${DETECTED_CLIENT_PORTS[@]}")
   fi
 
+  AUDIT_PUB_IP="$pub_ip"
   if [[ -n "$pub_ip" ]]; then
     _audit_reachability_from_russia "$pub_ip" "${ports[@]}"
   fi
 
+  # What the internet already knows about this IP (Shodan InternetDB, no key)
+  step "Что о сервере уже знает интернет (Shodan InternetDB)"
+  local pub_ip6=""
+  if [[ -n "$pub_ip" ]]; then _audit_internetdb "$pub_ip"; fi
+  if pub_ip6="$(_audit_detect_public_ipv6)"; then _audit_internetdb "$pub_ip6"; fi
+  [[ -z "$pub_ip" && -z "$pub_ip6" ]] && _audit_warn "Публичный IP не определён — пропуск"
+
+  echo
+  _audit_exposure_listeners
+  if [[ -n "$pub_ip" ]]; then _audit_nodeport_external "$pub_ip"; fi
+
   echo
   _audit_xray_self
+  _audit_xray_version
   echo
   _audit_server_level
+  echo
+  _audit_giveaways
 
   echo
   menu_sep
   ok "Аудит завершён (read-only). Рекомендации выше — применяйте вручную / пунктом установки защиты."
+  echo "Полная карта способов вычислить ноду и что закрывает gorecshit: docs/detection-vectors.md (GitHub)"
   echo "Повтор: gorecshit --audit   |   пункт меню «Проверка на блокировку и палевность ноды»"
 }
 
@@ -2194,6 +2808,7 @@ interactive_select_modules() {
   echo "Модули (введите номера через запятую, Enter = все):"
   echo "  1 ufw  2 blocklist  3 hide_ports  4 anti_probe  5 ssh"
   echo "  6 stealth  7 fail2ban  8 sysctl  9 hostname  10 docker"
+  echo "  11 egress_guard (исходящий SMTP)  12 decoy_web (:80 → https, опц.)"
   echo "  (или: minimum — UFW+SSH+fail2ban+blocklist+BBR)"
   local ans
   prompt_user 'Номера: ' ans
@@ -2202,18 +2817,18 @@ interactive_select_modules() {
   elif [[ "$ans" == "minimum" || "$ans" == "min" ]]; then
     selected="minimum"
   else
-    local map=( "" ufw blocklist hide_ports anti_probe ssh stealth fail2ban sysctl hostname docker )
+    local map=( "" ufw blocklist hide_ports anti_probe ssh stealth fail2ban sysctl hostname docker egress_guard decoy_web )
     local n parts=()
     local IFS=,
     for n in $ans; do
       n="$(echo "$n" | tr -d ' ')"
-      [[ "$n" =~ ^[0-9]+$ ]] && parts+=("${map[$n]}")
+      [[ "$n" =~ ^[0-9]+$ && "$n" -ge 1 && "$n" -le 12 ]] && parts+=("${map[$n]}")
     done
     local IFS=,
     selected="${parts[*]}"
   fi
   apply_modules_csv "${selected:-all}"
-  log "Выбраны модули: ufw=$DO_UFW blocklist=$DO_BLOCKLIST hide=$DO_HIDE_PORTS probe=$DO_ANTI_PROBE ssh=$DO_SSH stealth=$DO_STEALTH f2b=$DO_FAIL2BAN sysctl=$DO_SYSCTL host=$DO_HOSTNAME docker=$DO_DOCKER_JOURNAL"
+  log "Выбраны модули: ufw=$DO_UFW blocklist=$DO_BLOCKLIST hide=$DO_HIDE_PORTS probe=$DO_ANTI_PROBE ssh=$DO_SSH stealth=$DO_STEALTH f2b=$DO_FAIL2BAN sysctl=$DO_SYSCTL host=$DO_HOSTNAME docker=$DO_DOCKER_JOURNAL egress=$DO_EGRESS_GUARD decoy=$DO_DECOY_WEB"
 }
 
 preflight() {
@@ -3387,6 +4002,12 @@ hook_ufw_before_rules() {
   if [[ "$DO_HIDE_PORTS" -eq 1 ]]; then
     sed -i -E 's/^(-A ufw-before-input -p icmp --icmp-type echo-request -j) ACCEPT/\1 DROP/' "$rules" || true
     sed -i -E 's/^(-A ufw-before-forward -p icmp --icmp-type echo-request -j) ACCEPT/\1 DROP/' "$rules" || true
+    # IPv6 ping too (v2.6.0): only echo-request; NDP / packet-too-big untouched
+    if [[ -f /etc/ufw/before6.rules ]]; then
+      backup_file /etc/ufw/before6.rules
+      sed -i -E 's/^(-A ufw6-before-input -p icmpv6 --icmpv6-type echo-request -j) ACCEPT/\1 DROP/' /etc/ufw/before6.rules || true
+      sed -i -E 's/^(-A ufw6-before-forward -p icmpv6 --icmpv6-type echo-request -j) ACCEPT/\1 DROP/' /etc/ufw/before6.rules || true
+    fi
     # Also destination-unreachable / time-exceeded stay ACCEPT for PMTU usually —
     # but for closed-port stealth we drop ICMP unreachable replies via sysctl/iptables below.
   fi
@@ -3549,6 +4170,13 @@ configure_ufw() {
   hook_ufw_before_rules
   configure_hide_ports
 
+  # IPv6 parity (v2.6.0): with IPv6 on, UFW must manage ip6tables too — else every port is open over v6
+  if [[ "$IPV6_OFF" -eq 0 && -f /etc/default/ufw ]] && grep -qE '^IPV6=' /etc/default/ufw \
+     && ! grep -qE '^IPV6=yes' /etc/default/ufw; then
+    sed -i 's/^IPV6=.*/IPV6=yes/' /etc/default/ufw || true
+    ok "UFW IPV6=yes — правила зеркалируются на IPv6"
+  fi
+
   ufw default deny incoming
   ufw default allow outgoing
 
@@ -3585,6 +4213,8 @@ configure_ufw() {
 
   # NODE_PORT only from panel
   ufw allow from "$PANEL_IP" to any port "$NODE_PORT" proto tcp comment 'remnanode from panel' || true
+  # Public "NODE_PORT ALLOW Anywhere" (v4/v6) = main node giveaway; panel-only allow above covers the link
+  ufw_remove_public_node_port || true
   # Deny public NODE_PORT if somehow open (idempotent deny after allow-from)
   # ufw processes first match — allow from panel already added
 
@@ -4190,7 +4820,7 @@ Banner none
   fi
   if [[ -f /etc/motd ]] && [[ -s /etc/motd ]]; then
     # only blank if looks like vendor ad
-    if grep -qiE 'ubuntu|debian|welcome|authorized|legal|cloud' /etc/motd 2>/dev/null; then
+    if grep -qiE 'ubuntu|debian|welcome|authorized|legal|cloud|vpn|xray|remna|vless|reality|v2ray|proxy|marzban' /etc/motd 2>/dev/null; then
       : >/etc/motd
       ok "Очищен /etc/motd"
       done_msgs+=("очищен /etc/motd")
@@ -4960,6 +5590,14 @@ iptables -C DOCKER-USER -m conntrack --ctdir REPLY -j RETURN 2>/dev/null \\
   || iptables -I DOCKER-USER 1 -m conntrack --ctdir REPLY -j RETURN
 iptables -C DOCKER-USER ! -s "\${PANEL_IP}/32" -p tcp -m conntrack --ctorigdstport "\$NODE_PORT" -j DROP 2>/dev/null \\
   || iptables -A DOCKER-USER ! -s "\${PANEL_IP}/32" -p tcp -m conntrack --ctorigdstport "\$NODE_PORT" -j DROP
+# IPv6 (v2.6.0): panel is IPv4 → no IPv6 source may reach a docker-published NODE_PORT
+if command -v ip6tables >/dev/null 2>&1 && ip6tables -S DOCKER-USER >/dev/null 2>&1; then
+  ip6tables -C DOCKER-USER -m conntrack --ctdir REPLY -j RETURN 2>/dev/null \\
+    || ip6tables -I DOCKER-USER 1 -m conntrack --ctdir REPLY -j RETURN
+  ip6tables -C DOCKER-USER -p tcp -m conntrack --ctorigdstport "\$NODE_PORT" -j DROP 2>/dev/null \\
+    || ip6tables -A DOCKER-USER -p tcp -m conntrack --ctorigdstport "\$NODE_PORT" -j DROP
+fi
+exit 0
 EOF
   chmod 755 "$script"
 
@@ -5036,7 +5674,7 @@ final_verify() {
   echo "==== gorecshit ${VERSION} summary ===="
   echo "panel=${PANEL_IP} node_port=${NODE_PORT}"
   echo "clients_tcp=${CLIENT_PORTS:-none} clients_udp=${CLIENT_UDP_PORTS:-none} mode=${MODE}"
-  echo "modules: ufw=$DO_UFW blocklist=$DO_BLOCKLIST hide=$DO_HIDE_PORTS probe=$DO_ANTI_PROBE ssh=$DO_SSH stealth=$DO_STEALTH f2b=$DO_FAIL2BAN sysctl=$DO_SYSCTL host=$DO_HOSTNAME docker=$DO_DOCKER_JOURNAL"
+  echo "modules: ufw=$DO_UFW blocklist=$DO_BLOCKLIST hide=$DO_HIDE_PORTS probe=$DO_ANTI_PROBE ssh=$DO_SSH stealth=$DO_STEALTH f2b=$DO_FAIL2BAN sysctl=$DO_SYSCTL host=$DO_HOSTNAME docker=$DO_DOCKER_JOURNAL egress=$DO_EGRESS_GUARD decoy=$DO_DECOY_WEB"
   if [[ "$DRY_RUN" -eq 1 ]]; then
     echo "(dry-run / --check: live checks skipped)"
     return 0
@@ -5067,6 +5705,266 @@ final_verify() {
   ok "Откат: $(rollback_hint_cmd)   OR   ${BACKUP_DIR}/rollback.sh"
 }
 
+# ---------- v2.6.0: helpers for rollback extras + tty y/N ----------
+_tty_usable() {
+  [[ -r /dev/tty && -w /dev/tty ]] || return 1
+  { : </dev/tty; } 2>/dev/null
+}
+
+_tty_ask_yn() {
+  # Ask y/N via /dev/tty even from menu (menu sets ASSUME_YES=1). Never under CLI --yes.
+  local q="$1" ans=""
+  [[ "${CLI_ASSUME_YES:-0}" -eq 0 ]] || return 1
+  _tty_usable || return 1
+  prompt_user "${q} [y/N] " ans
+  [[ "$ans" =~ ^[YyДд]$ ]]
+}
+
+_rb_append_block() {
+  # _rb_append_block TAG BODY — append once to this run's rollback.sh
+  [[ "$DRY_RUN" -eq 0 ]] || return 0
+  local tag="$1" body="$2" rb="${BACKUP_DIR}/rollback.sh"
+  [[ -f "$rb" ]] || return 0
+  grep -q "# ${tag}" "$rb" 2>/dev/null && return 0
+  printf '\n# %s\n%s\n' "$tag" "$body" >>"$rb"
+  return 0
+}
+
+configure_egress_guard() {
+  # Outbound abuse/leak guard: SMTP 25 REJECT (host + docker FORWARD), ICMP unreachable/ttl leaks DROP.
+  if [[ "$DO_EGRESS_GUARD" -eq 0 && "$DO_HIDE_PORTS" -eq 0 ]]; then
+    log "egress_guard пропущен (--no-egress-guard)"
+    return 0
+  fi
+  step "Egress guard: исходящий SMTP закрыт (egress=${DO_EGRESS_GUARD}), ICMP-утечки скрыты (hide=${DO_HIDE_PORTS})"
+  local script="/usr/local/sbin/gorecshit-egress-guard.sh"
+  local unit="/etc/systemd/system/gorecshit-egress-guard.service"
+  local smtp_ports="" p
+  if [[ "$DO_EGRESS_GUARD" -eq 1 ]]; then
+    while IFS= read -r p; do
+      is_port "$p" && smtp_ports+="${p} "
+    done < <(foreach_csv "$EGRESS_BLOCK_PORTS")
+  fi
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    printf '%b[DRY]%b install %s + %s (REJECT out tcp/%s; ICMP leak drop=%s; v4+v6; lo/docker bridges excluded for ICMP)\n' \
+      "${C_YEL}" "${C_RESET}" "$script" "$unit" "${smtp_ports% }" "$DO_HIDE_PORTS"
+    return 0
+  fi
+  local created=0
+  [[ -e "$script" ]] || created=1
+  backup_file "$script"
+  backup_file "$unit"
+  {
+    echo '#!/bin/bash'
+    echo "# Managed by ${SCRIPT_NAME} ${VERSION} — egress guard (idempotent; never touches client/panel inbound)"
+    echo 'set -u'
+    echo "SMTP_PORTS=\"${smtp_ports% }\""
+    echo "ICMP_LEAK=${DO_HIDE_PORTS}"
+    cat <<'GUARD'
+for IPT in iptables ip6tables; do
+  command -v "$IPT" >/dev/null 2>&1 || continue
+  "$IPT" -S OUTPUT >/dev/null 2>&1 || continue
+  "$IPT" -N GORECSHIT-EGRESS 2>/dev/null || "$IPT" -F GORECSHIT-EGRESS
+  "$IPT" -A GORECSHIT-EGRESS -o lo -j RETURN
+  for p in $SMTP_PORTS; do
+    "$IPT" -A GORECSHIT-EGRESS -p tcp --dport "$p" -j REJECT --reject-with tcp-reset
+  done
+  if [ "$ICMP_LEAK" = "1" ]; then
+    "$IPT" -A GORECSHIT-EGRESS -o docker+ -j RETURN
+    "$IPT" -A GORECSHIT-EGRESS -o br-+ -j RETURN
+    if [ "$IPT" = iptables ]; then
+      # never touch fragmentation-needed (PMTU) — only port/proto unreachable + ttl exceeded
+      "$IPT" -A GORECSHIT-EGRESS -p icmp --icmp-type port-unreachable -j DROP
+      "$IPT" -A GORECSHIT-EGRESS -p icmp --icmp-type protocol-unreachable -j DROP
+      "$IPT" -A GORECSHIT-EGRESS -p icmp --icmp-type time-exceeded -j DROP
+    else
+      # never touch packet-too-big / NDP
+      "$IPT" -A GORECSHIT-EGRESS -p ipv6-icmp --icmpv6-type port-unreachable -j DROP
+      "$IPT" -A GORECSHIT-EGRESS -p ipv6-icmp --icmpv6-type time-exceeded -j DROP
+    fi
+  fi
+  "$IPT" -A GORECSHIT-EGRESS -j RETURN
+  "$IPT" -C OUTPUT -j GORECSHIT-EGRESS 2>/dev/null || "$IPT" -I OUTPUT 1 -j GORECSHIT-EGRESS
+  # docker bridge containers (remnanode itself is usually network_mode: host → OUTPUT)
+  if [ -n "$SMTP_PORTS" ]; then
+    "$IPT" -N GORECSHIT-EGRESS-FWD 2>/dev/null || "$IPT" -F GORECSHIT-EGRESS-FWD
+    for p in $SMTP_PORTS; do
+      "$IPT" -A GORECSHIT-EGRESS-FWD -p tcp --dport "$p" -j REJECT --reject-with tcp-reset
+    done
+    "$IPT" -A GORECSHIT-EGRESS-FWD -j RETURN
+    if "$IPT" -S DOCKER-USER >/dev/null 2>&1; then
+      "$IPT" -C DOCKER-USER -j GORECSHIT-EGRESS-FWD 2>/dev/null || "$IPT" -I DOCKER-USER 1 -j GORECSHIT-EGRESS-FWD
+    else
+      "$IPT" -C FORWARD -j GORECSHIT-EGRESS-FWD 2>/dev/null || "$IPT" -I FORWARD 1 -j GORECSHIT-EGRESS-FWD
+    fi
+  fi
+done
+exit 0
+GUARD
+  } >"$script"
+  chmod 755 "$script"
+  cat >"$unit" <<UNITEOF
+[Unit]
+Description=gorecshit egress guard (outbound SMTP block + ICMP leak hide)
+After=network-pre.target ufw.service docker.service
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+ExecStart=${script}
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+UNITEOF
+  systemctl daemon-reload 2>/dev/null || true
+  systemctl enable gorecshit-egress-guard.service >/dev/null 2>&1 || true
+  "$script" || warn "egress guard apply returned non-zero"
+  if [[ "$created" -eq 1 ]]; then
+    : >"${BACKUP_DIR}/egress-guard.created"
+  fi
+  # shellcheck disable=SC2016  # body is literal rollback.sh code
+  _rb_append_block "gorecshit-egress-restore" '
+if [[ -f "$BACKUP_DIR/egress-guard.created" ]]; then
+  systemctl disable gorecshit-egress-guard.service 2>/dev/null || true
+  rm -f /etc/systemd/system/gorecshit-egress-guard.service /usr/local/sbin/gorecshit-egress-guard.sh
+  systemctl daemon-reload 2>/dev/null || true
+  for IPT in iptables ip6tables; do
+    command -v "$IPT" >/dev/null 2>&1 || continue
+    while "$IPT" -D OUTPUT -j GORECSHIT-EGRESS 2>/dev/null; do :; done
+    while "$IPT" -D DOCKER-USER -j GORECSHIT-EGRESS-FWD 2>/dev/null; do :; done
+    while "$IPT" -D FORWARD -j GORECSHIT-EGRESS-FWD 2>/dev/null; do :; done
+    "$IPT" -F GORECSHIT-EGRESS 2>/dev/null || true
+    "$IPT" -X GORECSHIT-EGRESS 2>/dev/null || true
+    "$IPT" -F GORECSHIT-EGRESS-FWD 2>/dev/null || true
+    "$IPT" -X GORECSHIT-EGRESS-FWD 2>/dev/null || true
+  done
+  echo "egress guard removed"
+elif [[ -x /usr/local/sbin/gorecshit-egress-guard.sh ]]; then
+  /usr/local/sbin/gorecshit-egress-guard.sh || true
+fi'
+  ok "Egress guard: out tcp/${smtp_ports% } → REJECT (хост + docker); ICMP unreachable/ttl-exceeded leak drop=${DO_HIDE_PORTS}; PMTU не тронут"
+  log "Рекомендация (в панели, не трогаем): routing-правило protocol bittorrent → blackhole/block — меньше DMCA-жалоб хостеру"
+}
+
+configure_decoy_web() {
+  # Optional: port 80 → 301 https (как у любого HTTPS-сайта). Only via existing nginx; otherwise recommendation.
+  step "Декой :80 (опционально)"
+  local reason=""
+  if [[ "$MODE" == "cdn" || "$CADDY_PRESENT" -eq 1 ]]; then
+    reason="Caddy/CDN-режим — порт 80 уже ваш"
+  elif ss -Hltn '( sport = :80 )' 2>/dev/null | grep -q .; then
+    reason="порт 80 уже кем-то слушается"
+  elif [[ ",${CLIENT_PORTS}," == *",80,"* ]]; then
+    reason="80 — клиентский порт"
+  elif [[ ",${CLIENT_PORTS}," != *",443,"* ]]; then
+    reason="REALITY не на 443 — редирект на https://IP:443 вёл бы в никуда"
+  elif ! command -v nginx >/dev/null 2>&1 || ! systemctl is-active --quiet nginx 2>/dev/null; then
+    reason="nginx не установлен/не запущен — ставить веб-сервер ради декоя не будем (закрытый 80 — тоже нормально)"
+  elif [[ ! -d /etc/nginx/conf.d ]] || ! grep -RqsE 'include[[:space:]]+/etc/nginx/conf\.d/\*\.conf' /etc/nginx/nginx.conf; then
+    reason="nginx без include conf.d/*.conf — не трогаем конфиг"
+  fi
+  if [[ -n "$reason" ]]; then
+    [[ "$DO_DECOY_WEB" -eq 1 ]] && warn "--decoy-web: пропуск — ${reason}"
+    log "Декой :80 не ставим: ${reason}"
+    return 0
+  fi
+  if [[ "$DO_DECOY_WEB" -eq 0 ]]; then
+    if ! _tty_ask_yn "Включить декой на :80 (nginx: 301 → https, как у обычного сайта)? По умолчанию нет"; then
+      log "Декой :80 не включён (по умолчанию нет; флаг --decoy-web)"
+      return 0
+    fi
+  fi
+  local conf="/etc/nginx/conf.d/gorecshit-decoy.conf"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    printf '%b[DRY]%b write %s (listen 80 → 301 https), nginx -t, reload, ufw allow 80/tcp\n' "${C_YEL}" "${C_RESET}" "$conf"
+    return 0
+  fi
+  local created=0 v6listen=""
+  [[ -e "$conf" ]] || created=1
+  backup_file "$conf"
+  if [[ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 1)" == "0" ]]; then
+    v6listen="    listen [::]:80 default_server;"
+  fi
+  write_content "$conf" "# Managed by ${SCRIPT_NAME} ${VERSION} — decoy: behave like any HTTPS site on :80
+server {
+    listen 80 default_server;
+${v6listen}
+    server_name _;
+    server_tokens off;
+    access_log off;
+    return 301 https://\$host\$request_uri;
+}
+"
+  if ! nginx -t >/dev/null 2>&1; then
+    warn "nginx -t не прошёл с декоем — убираю"
+    rm -f "$conf"
+    [[ -f "${BACKUP_DIR}${conf}" ]] && cp -a "${BACKUP_DIR}${conf}" "$conf"
+    return 0
+  fi
+  systemctl reload nginx 2>/dev/null || true
+  local ufw_added=0
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qiE 'Status:\s*active'; then
+    if ! ufw status 2>/dev/null | grep -qE '^80(/tcp)?[[:space:]]+ALLOW[[:space:]]+Anywhere'; then
+      ufw allow 80/tcp comment 'gorecshit-decoy-80' >/dev/null 2>&1 || true
+      ufw_added=1
+    fi
+  fi
+  [[ "$created" -eq 1 ]] && : >"${BACKUP_DIR}/decoy-web.created"
+  [[ "$ufw_added" -eq 1 ]] && : >"${BACKUP_DIR}/decoy-web.ufw80"
+  # shellcheck disable=SC2016  # body is literal rollback.sh code
+  _rb_append_block "gorecshit-decoy-restore" '
+if [[ -f "$BACKUP_DIR/decoy-web.created" ]]; then
+  rm -f /etc/nginx/conf.d/gorecshit-decoy.conf
+  nginx -t >/dev/null 2>&1 && systemctl reload nginx 2>/dev/null || true
+fi
+if [[ -f "$BACKUP_DIR/decoy-web.ufw80" ]] && command -v ufw >/dev/null; then
+  ufw --force delete allow 80/tcp >/dev/null 2>&1 || true
+fi'
+  ok "Декой :80 включён (301 → https, server_tokens off)"
+}
+
+ufw_remove_public_node_port() {
+  # Delete "NODE_PORT ALLOW Anywhere" (v4/v6) — only for a family where no non-panel
+  # established peer exists on NODE_PORT (never cut the panel↔node link).
+  command -v ufw >/dev/null 2>&1 || return 0
+  local np="$NODE_PORT"
+  is_port "$np" || return 0
+  local peers v4_other=0 v6_other=0 pa
+  peers="$(ss -Htn state established "( sport = :${np} )" 2>/dev/null | awk '{print $4}' || true)"
+  while IFS= read -r pa; do
+    [[ -n "$pa" ]] || continue
+    pa="${pa%:*}"; pa="${pa#[}"; pa="${pa%]}"; pa="${pa#::ffff:}"
+    if [[ "$pa" == *:* ]]; then v6_other=1
+    elif [[ "$pa" != "$PANEL_IP" ]]; then v4_other=1
+    fi
+  done <<<"$peers"
+  local -a del=()
+  local line num is6
+  while IFS= read -r line; do
+    [[ "$line" =~ ^\[\ *([0-9]+)\]\ +${np}(/tcp)?(\ \(v6\))?\ +ALLOW(\ IN)?\ +Anywhere ]] || continue
+    num="${BASH_REMATCH[1]}"
+    is6=0; [[ -n "${BASH_REMATCH[3]}" ]] && is6=1
+    if [[ "$is6" -eq 1 && "$v6_other" -eq 1 ]]; then
+      warn "NODE_PORT ${np} открыт всем по IPv6, но есть живое IPv6-соединение к нему — правило оставлено (панель по IPv6?)"
+      continue
+    fi
+    if [[ "$is6" -eq 0 && "$v4_other" -eq 1 ]]; then
+      warn "NODE_PORT ${np} открыт всем по IPv4 и есть соединение не с IP панели — правило оставлено, проверьте вручную"
+      continue
+    fi
+    del+=("$num")
+  done < <(ufw status numbered 2>/dev/null || true)
+  [[ ${#del[@]} -gt 0 ]] || return 0
+  backup_file /etc/ufw/user.rules
+  backup_file /etc/ufw/user6.rules
+  local n
+  for n in $(printf '%s\n' "${del[@]}" | sort -rn); do
+    ufw --force delete "$n" >/dev/null 2>&1 || true
+  done
+  ok "Удалены публичные ALLOW для NODE_PORT ${np} (${#del[@]} шт.) — остался доступ только с панели ${PANEL_IP}"
+}
+
 run_hardening() {
   system_upgrade
   install_packages
@@ -5079,7 +5977,9 @@ run_hardening() {
   configure_ufw
   configure_anti_probe
   configure_docker_user
+  configure_egress_guard
   configure_stealth
+  configure_decoy_web
   configure_hostname_tz
   configure_docker_journal
   maybe_apply_docker_daemon_restart
@@ -5140,11 +6040,23 @@ main() {
     if [[ "$(id -u)" -ne 0 ]]; then err "Must run as root"; exit 1; fi
     if [[ -x /usr/local/sbin/scanner-block-refresh.sh ]]; then
       /usr/local/sbin/scanner-block-refresh.sh
-    else
-      err "scanner-block-refresh.sh не установлен — сначала выполните полный install"
+      exit 0
+    fi
+    warn "Защита ещё не установлена — списки сканеров обновляет пункт 1 (он их и ставит)"
+    if [[ "$CLI_ASSUME_YES" -eq 1 ]] || ! _tty_usable; then
+      err "scanner-block-refresh.sh не установлен — сначала: gorecshit → пункт 1 (или --panel-ip X --yes)"
       exit 1
     fi
-    exit 0
+    if _tty_ask_yn "Запустить полную установку защиты сейчас (пункт 1)?"; then
+      DO_REFRESH_LISTS_ONLY=0
+      apply_modules_csv "all"
+      prompt_panel_ip
+      FROM_MENU=1
+      ASSUME_YES=1
+    else
+      log "Ок, установку не запускаем. Позже: gorecshit → пункт 1"
+      exit 0
+    fi
   fi
 
   if [[ "$DO_ROLLBACK" -eq 1 ]]; then

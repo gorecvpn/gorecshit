@@ -2,7 +2,9 @@
 
 Однокомандное hardening-окружение для **нод Remnawave** (Debian 11+ / Ubuntu 20.04+).
 
-**Версия: 2.5.0**
+**Версия: 2.6.0**
+
+📍 **[Карта: как вычисляют VPN-ноду и что закрывает gorecshit](docs/detection-vectors.md)** — активное зондирование, DPI, Shodan/Censys, порты, IPv6, PTR, abuse и т.д.
 
 Скрипт идемпотентен: его можно запускать повторно. IP панели **не зашит** в репозиторий — его нужно передать параметром `--panel-ip` (или выбрать в интерактивном меню).
 
@@ -23,7 +25,10 @@
 11. **SSH** — Banner none, MaxAuthTries 3, опция `--ssh-port N` (сначала UFW, `sshd -t`, **22 сохраняется**). Парольный и root-логин **не** отключаются. fail2ban sshd + **recidive**; сканеры из ipset режутся до SSH.
 12. **Блоклист сканеров** — ipset + weekly timer; **зеркала** raw.githubusercontent.com → cdn.jsdelivr.net / fastly.jsdelivr.net; `--blocklist-from`; never-block для панели/релеев/`$SSH_CLIENT`/private/bogons.
 13. **Стелс** — нейтральный hostname `web-<hex>`, без баннеров, предупреждение о лишних слушателях, отключение nginx default site; NODE_PORT только с панели.
-14. **`--check` / `--rollback` / `--status` / `--version` / `--refresh-lists` / `--dpi-check` / `--audit` / `--stealth` / `--update` / `--no-upgrade`**.
+14. **Egress guard** (v2.6.0, по умолчанию вкл., `--no-egress-guard`) — исходящий **TCP 25** (SMTP) → REJECT с хоста и из Docker (IPv4+IPv6), чтобы через ноду нельзя было слать спам и хостер не получал abuse-жалобы. Порты: `--egress-block-ports 25,465,587`. Также режутся исходящие ICMP port/proto-unreachable и time-exceeded (PMTU frag-needed/packet-too-big **не** трогаются). Рекомендация (в панели): routing `bittorrent → blackhole`.
+15. **IPv6 = IPv4** (v2.6.0) — UFW `IPV6=yes`, ping6 DROP, DOCKER-USER для NODE_PORT и по v6; публичные `ALLOW Anywhere` для NODE_PORT удаляются (кроме семейства, где есть живое соединение не с панели).
+16. **Декой :80** (опционально, `--decoy-web` / вопрос y/N) — только если уже есть nginx, 80 свободен и REALITY на 443: `301 → https` как у обычного сайта; иначе только рекомендация.
+17. **`--check` / `--rollback` / `--status` / `--version` / `--refresh-lists` / `--dpi-check` / `--audit` / `--stealth` / `--update` / `--no-upgrade`**.
 
 ## Меню (TTY)
 
@@ -71,6 +76,11 @@ Read-only аудит (меню «8» / `--audit`): **ничего не меня�
 1. **Доступность из России** — публичный IPv4 ноды + клиентские TCP-порты (тот же детект, что из xray inbounds). Через API [check-host.net](https://check-host.net) (`check-tcp` / `check-ping`, узлы `country=RU` + несколько зарубежных для сравнения). По каждому порту: «из России: доступен N/M», «из-за рубежа: …»; если зарубежье OK, а РФ нет → «IP, вероятно, заблокирован в РФ (ТСПУ)». Таймаут/ошибки API обрабатываются мягко (~60с общий лимит). Нужен `curl` (jq необязателен; есть fallback на python3 / grep).
 2. **Палевность** — чтение конфига xray из контейнера `remnawave/node` / remnanode (файлы, `/proc` `-config`, xray API); если конфиг только в runtime/stdin — пассивный TLS/REALITY-зонд локальных портов (CN/SAN маскировки). Для VLESS/REALITY: порт ≠443, flow ≠ vision, «плохой» dest/SNI, dest без TLS1.3+h2, пустые shortIds, нет block bittorrent, plain TLS/WS без CDN. Сервер: отвечает ли ICMP echo, лишние публичные порты, SSH на 22, UFW выключен. Строки ✅/⚠️ с короткой рекомендацией на русском.
 
+3. **Shodan InternetDB** (v2.6.0, без ключа) — какие порты/теги (`vpn`, `proxy`, `self-signed`…)/CPE/CVE/hostnames интернет уже видит по IPv4 и IPv6; NODE_PORT и «палевные» порты (2222, 62050, 2053, 54321, 10085…) подсвечиваются.
+4. **Внешняя поверхность** (v2.6.0) — все слушатели TCP/UDP v4+v6 с учётом UFW и Docker publish; паритет UFW IPv6; NODE_PORT проверяется **снаружи** через check-host (должен быть 0/N).
+5. **Активный зонд REALITY** (v2.6.0) — как ТСПУ/сканер: без ключа REALITY шлём TLS с настоящим SNI, HTTPS GET, plain HTTP на TLS-порт, случайный SNI и TLS 1.2-only, сравниваем сертификат/ALPN/HTTP-код/Server с настоящим `dest`. Совпадает = маскировка хорошая. Плюс версия xray (≥ 25.6.8 — защита от детекта по NewSessionTicket).
+6. **Мелкие признаки** (v2.6.0) — SSH-баннер как видит интернет, PTR (обратный DNS), VPN-слова в motd/issue, `Server`-заголовки, MTU/MSS (JA4T), egress SMTP / ICMP-утечки.
+
 ```bash
 sudo bash install.sh --audit
 # или
@@ -95,6 +105,17 @@ sudo gorecshit --stealth
 ```
 
 ## Changelog
+
+### v2.6.0
+
+- Цель: снаружи не должно быть видно, что на сервере нода. Добавлена карта способов детекта: [docs/detection-vectors.md](docs/detection-vectors.md)
+- `--audit` / меню 8: **Shodan InternetDB** (v4+v6), **внешняя поверхность** (все слушатели TCP/UDP v4+v6 с учётом UFW/Docker, паритет IPv6, NODE_PORT снаружи через check-host), **активный зонд REALITY** без ключа против настоящего `dest` (5 проб), версия xray (≥ 25.6.8), мелкие признаки (SSH-баннер, PTR, motd/issue, Server-заголовки, MTU/TCPMSS, egress)
+- Новый модуль **egress_guard** (по умолчанию вкл.; `--no-egress-guard`, `--egress-block-ports`): исходящий SMTP 25 → REJECT (хост + Docker, v4+v6); при hide_ports — DROP исходящих ICMP port/proto-unreachable и time-exceeded (PMTU не трогаем); systemd-unit + откат
+- UFW: `IPV6=yes` принудительно при включённом IPv6; ping6 (echo-request) DROP в before6.rules; удаление публичных `ALLOW Anywhere` для NODE_PORT (не трогает семейство, где есть живое не-панельное соединение); DOCKER-USER закрывает NODE_PORT и по IPv6
+- Опциональный модуль **decoy_web** (`--decoy-web` или вопрос y/N, по умолчанию нет): `:80 → 301 https` через уже установленный nginx, только если безопасно
+- `--stealth`: /etc/motd очищается и при VPN-словах (xray/remna/vless/…)
+- Меню 3 без установленной защиты: вместо ошибки предлагает запустить полную установку (y/N)
+- `--modules`: `egress_guard`, `decoy_web`; меню 2: пункты 11/12
 
 ### v2.5.0
 
@@ -251,8 +272,11 @@ sudo bash install.sh --panel-ip X.X.X.X --modules ufw,blocklist,hide_ports,anti_
 | `--relay-ips IP,...` | Extra never-block / ACCEPT (по умолчанию HAProxy-релеи). |
 | `--ssh-port N` | Добавить SSH-порт N (22 сохраняется). |
 | `--blocklist-from SRC` | URL / ssh-host / путь — запасной источник blocklist. |
-| `--modules LIST` | `ufw,blocklist,hide_ports,anti_probe,ssh,stealth,fail2ban,sysctl,hostname,docker` или `all`/`minimum`. |
+| `--modules LIST` | `ufw,blocklist,hide_ports,anti_probe,ssh,stealth,fail2ban,sysctl,hostname,docker,egress_guard,decoy_web` или `all`/`minimum` (`decoy_web` не входит в `all`). |
 | `--no-hide-ports` / `--no-anti-probe` / `--no-stealth` | Отключить соответствующие модули. |
+| `--no-egress-guard` | Не блокировать исходящий SMTP (по умолчанию блокируется TCP 25). |
+| `--egress-block-ports LIST` | Какие исходящие TCP-порты блокировать (по умолчанию `25`; например `25,465,587`). |
+| `--decoy-web` | Декой `:80 → 301 https` через существующий nginx (только если безопасно). |
 | `--tcp-timestamps-off` | `net.ipv4.tcp_timestamps=0`. |
 | `--ipv6-off` | Опционально отключить IPv6 (по умолчанию IPv6 **остаётся**). |
 | `--no-ipv6-off` / `--no-blocklist` / `--no-hostname` / … | Как в v2.0 (`--no-ipv6-off` = поведение по умолчанию). |
@@ -261,7 +285,7 @@ sudo bash install.sh --panel-ip X.X.X.X --modules ufw,blocklist,hide_ports,anti_
 | `--refresh-lists` | Только обновить ipset-списки. |
 | `--status` | Показать статус. |
 | `--dpi-check` | DNS/TLS/SNI/TCP16 egress-проверка с ноды. |
-| `--audit` | Доступность из РФ (check-host) + аудит палевности xray/сервера (read-only). |
+| `--audit` | Доступность из РФ (check-host) + Shodan InternetDB + порты v4/v6 + активный зонд REALITY + мелкие признаки (read-only). |
 | `--stealth` | Скрыть отпечатки сервера (баннеры/MOTD/ICMP FP/…); спросит перед рискованным. |
 | `--update` | Самообновление `install.sh` → `/usr/local/sbin/gorecshit` (GitHub, fallback jsDelivr). |
 | `--rollback` / `--uninstall` | Откат из бэкапа. |
