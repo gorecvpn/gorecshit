@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# gorecshit v2.6.0 — one-command hardening for Remnawave VPN node servers (Debian 11+/Ubuntu 20.04+)
+# gorecshit v2.7.0 — one-command hardening for Remnawave VPN node servers (Debian 11+/Ubuntu 20.04+)
 # Usage:
 #   bash install.sh --panel-ip X.X.X.X [--node-port 2222] [--yes]
 #   bash install.sh --check --panel-ip X.X.X.X
@@ -8,7 +8,7 @@
 # Does NOT restart Docker while remnanode/xray is live. Does NOT deploy itself.
 set -Eeuo pipefail
 
-VERSION="2.6.0"
+VERSION="2.7.0"
 SCRIPT_NAME="gorecshit"
 BACKUP_ROOT="/root/hardening-backups"
 
@@ -66,6 +66,16 @@ DO_STEALTH=1
 DO_DOCKER_JOURNAL=1
 DO_EGRESS_GUARD=1        # --no-egress-guard: skip outbound SMTP block
 EGRESS_BLOCK_PORTS="25"   # --egress-block-ports LIST (e.g. 25,465,587)
+# v2.7.0 netguard (outbound abuse / snitch / P2P) — see configure_netguard
+DO_NETGUARD=1            # --no-netguard: skip the whole outbound guard
+DO_P2P_BLOCK=1           # --no-p2p-block: BitTorrent/DHT/tracker drop at netfilter level (backup for xray rule)
+DO_ABUSE_LIMIT=1         # --no-abuse-limit: outbound scan/brute rate-limit + SMB/NetBIOS block
+DO_PRIVATE_EGRESS=1      # --no-private-egress: block client access to RFC1918/CGNAT (hoster LAN)
+DO_SNITCH_GUARD=1        # --no-snitch-guard: block outbound to VK/MAX networks (they report VPN IPs)
+EGRESS_BLOCK_METADATA=0  # --egress-block-metadata: also block 169.254.0.0/16 (cloud metadata; opt-in)
+DO_IP_CHECK=0            # --ip-check: blacklist / VPN-detection self-check (read-only)
+DO_ABUSE_REPORT=0        # --abuse-report: what clients tried (P2P/scan/SMTP/snitch) — read-only
+NET_OFFLINE=0            # set by ensure_network_dns when there is no internet
 DO_DECOY_WEB=0           # --decoy-web: :80 → 301 https via existing nginx (else asks via /dev/tty, default no)
 AUDIT_PUB_IP=""
 AUDIT_RU_NODES=()
@@ -148,7 +158,7 @@ step() { _log_line STEP "$*"; printf '\n%b==>%b %b%s%b\n' "${C_CYN}" "${C_RESET}
 # Interactive I/O: under `curl|bash` / `bash <(curl)` stdin is the script; use /dev/tty.
 can_prompt_user() {
   [[ "$ASSUME_YES" -eq 0 ]] || return 1
-  [[ -r /dev/tty ]] && return 0
+  _tty_usable && return 0
   [[ -t 0 && -t 1 ]] && return 0
   return 1
 }
@@ -156,7 +166,7 @@ can_prompt_user() {
 read_user_input() {
   # read_user_input VAR — reads one line from /dev/tty if available, else stdin
   local __ru_var="$1"
-  if [[ -r /dev/tty ]]; then
+  if _tty_usable; then
     IFS= read -r "$__ru_var" < /dev/tty || true
   else
     IFS= read -r "$__ru_var" || true
@@ -166,7 +176,7 @@ read_user_input() {
 prompt_user() {
   # prompt_user "text" VAR — print prompt (to tty if possible) and read answer
   local __msg="$1" __var="$2"
-  if [[ -w /dev/tty ]]; then
+  if _tty_usable; then
     printf '%s' "$__msg" > /dev/tty
   else
     printf '%s' "$__msg"
@@ -223,6 +233,8 @@ Usage:
   install.sh --dpi-check             # outbound DPI / DNS / TLS checks (node egress)
   install.sh --audit                 # RU reachability + detectability self-audit (read-only)
   install.sh --stealth               # hide server fingerprints (banners/MOTD/ICMP FP/…)
+  install.sh --ip-check              # is this IP in blacklists / VPN-detection DBs (read-only)
+  install.sh --abuse-report          # what clients tried: P2P / scans / SMTP / snitch (read-only)
 
 Required (non-interactive apply):
   --panel-ip IP              Management/panel host allowed to reach NODE_PORT
@@ -236,7 +248,7 @@ Options:
   --ssh-port N               Add SSH listen port N (ufw first, sshd -t, keep 22 until confirmed)
   --blocklist-from SRC       Copy/fetch blocklist from ssh-host, URL, or local path (fallback)
   --modules LIST             Comma modules: ufw,blocklist,hide_ports,anti_probe,ssh,stealth,
-                             fail2ban,sysctl,hostname,docker,egress_guard,decoy_web
+                             fail2ban,sysctl,hostname,docker,egress_guard,netguard,decoy_web
                              (default: all enabled except decoy_web)
   --ipv6-off                 Opt-in: disable IPv6 via sysctl (default: keep IPv6 on; safer under dual-stack xray)
   --no-ipv6-off              Keep IPv6 enabled (default; retained for compatibility)
@@ -247,6 +259,12 @@ Options:
   --no-stealth               Skip stealth / not-look-like-VPN tweaks
   --no-egress-guard          Skip outbound SMTP block (abuse guard) for host + docker
   --egress-block-ports LIST  Outbound TCP ports to block (default: 25; e.g. 25,465,587)
+  --no-netguard              Skip outbound guard (P2P/scan/brute/private-LAN/snitch) entirely
+  --no-p2p-block             Keep BitTorrent/DHT netfilter drop off (xray rule only)
+  --no-abuse-limit           No outbound scan/brute rate-limit and no SMB/NetBIOS block
+  --no-private-egress        Allow clients to reach RFC1918/CGNAT (hoster LAN) through the node
+  --no-snitch-guard          Allow outbound to VK/MAX networks (they report VPN server IPs to RKN)
+  --egress-block-metadata    Also block 169.254.0.0/16 cloud metadata for clients (opt-in)
   --decoy-web                Port 80 → 301 https via existing nginx (only if safe; else skip)
   --tcp-timestamps-off       Set net.ipv4.tcp_timestamps=0
   --tz ZONE|auto             Set timezone (default: leave as-is). auto = IP geolocation
@@ -348,6 +366,7 @@ backup_file() {
     return 0
   fi
   local dest="${BACKUP_DIR}${f}"
+  [[ -e "$dest" ]] && return 0   # v2.7.0: keep the ORIGINAL (file may be backed up twice in one run)
   mkdir -p "$(dirname "$dest")"
   cp -a "$f" "$dest"
 }
@@ -370,7 +389,7 @@ apply_modules_csv() {
   DO_UFW=0; DO_BLOCKLIST=0; DO_HIDE_PORTS=0; DO_ANTI_PROBE=0
   DO_SSH=0; DO_STEALTH=0; DO_FAIL2BAN=0; DO_SYSCTL=0
   DO_HOSTNAME=0; DO_DOCKER_JOURNAL=0; DO_DOCKER_USER=0; DO_NOFILE=0
-  DO_RESOLV_V4=0; DO_CERTBOT_HOOKS=0; DO_EGRESS_GUARD=0
+  DO_RESOLV_V4=0; DO_CERTBOT_HOOKS=0; DO_EGRESS_GUARD=0; DO_NETGUARD=0
   local m
   while IFS= read -r m; do
     case "$m" in
@@ -385,16 +404,17 @@ apply_modules_csv() {
       hostname|tz) DO_HOSTNAME=1 ;;
       egress_guard|egress|smtp) DO_EGRESS_GUARD=1 ;;
       decoy_web|decoy) DO_DECOY_WEB=1 ;;
+      netguard|abuse|p2p|snitch) DO_NETGUARD=1 ;;
       docker|journald|journal)
         DO_DOCKER_JOURNAL=1; DO_DOCKER_USER=1; DO_RESOLV_V4=1; DO_CERTBOT_HOOKS=1; DO_NOFILE=1 ;;
       all)
         DO_UFW=1; DO_BLOCKLIST=1; DO_HIDE_PORTS=1; DO_ANTI_PROBE=1
         DO_SSH=1; DO_STEALTH=1; DO_FAIL2BAN=1; DO_SYSCTL=1
         DO_HOSTNAME=1; DO_DOCKER_JOURNAL=1; DO_DOCKER_USER=1; DO_NOFILE=1
-        DO_RESOLV_V4=1; DO_CERTBOT_HOOKS=1; DO_EGRESS_GUARD=1 ;;
+        DO_RESOLV_V4=1; DO_CERTBOT_HOOKS=1; DO_EGRESS_GUARD=1; DO_NETGUARD=1 ;;
       minimum|min)
         DO_UFW=1; DO_SSH=1; DO_FAIL2BAN=1; DO_SYSCTL=1; DO_BLOCKLIST=1
-        DO_HIDE_PORTS=1; DO_DOCKER_USER=1; DO_EGRESS_GUARD=1 ;;
+        DO_HIDE_PORTS=1; DO_DOCKER_USER=1; DO_EGRESS_GUARD=1; DO_NETGUARD=1 ;;
       *) warn "Unknown module: $m" ;;
     esac
   done < <(foreach_csv "$csv")
@@ -422,6 +442,14 @@ parse_args() {
       --no-egress-guard) DO_EGRESS_GUARD=0; shift ;;
       --egress-block-ports) EGRESS_BLOCK_PORTS="${2:-}"; shift 2 ;;
       --decoy-web) DO_DECOY_WEB=1; shift ;;
+      --no-netguard) DO_NETGUARD=0; shift ;;
+      --no-p2p-block) DO_P2P_BLOCK=0; shift ;;
+      --no-abuse-limit) DO_ABUSE_LIMIT=0; shift ;;
+      --no-private-egress) DO_PRIVATE_EGRESS=0; shift ;;
+      --no-snitch-guard) DO_SNITCH_GUARD=0; shift ;;
+      --egress-block-metadata) EGRESS_BLOCK_METADATA=1; shift ;;
+      --ip-check) DO_IP_CHECK=1; shift ;;
+      --abuse-report) DO_ABUSE_REPORT=1; shift ;;
       --tcp-timestamps-off) DO_TCP_TIMESTAMPS_OFF=1; shift ;;
       --tz) TZ_OPT="${2:-}"; shift 2 ;;
       --relay-ips) RELAY_IPS="${2:-}"; shift 2 ;;
@@ -478,7 +506,7 @@ parse_args() {
 
 prompt_panel_ip() {
   if [[ -n "$PANEL_IP" ]]; then return 0; fi
-  if [[ "$DO_ROLLBACK" -eq 1 || "$DO_STATUS_ONLY" -eq 1 || "$DO_REFRESH_LISTS_ONLY" -eq 1 || "$DO_DPI_CHECK" -eq 1 || "$DO_AUDIT" -eq 1 || "$DO_FINGERPRINT_ONLY" -eq 1 || "$DO_UPDATE_ONLY" -eq 1 ]]; then return 0; fi
+  if [[ "$DO_ROLLBACK" -eq 1 || "$DO_STATUS_ONLY" -eq 1 || "$DO_REFRESH_LISTS_ONLY" -eq 1 || "$DO_DPI_CHECK" -eq 1 || "$DO_AUDIT" -eq 1 || "$DO_FINGERPRINT_ONLY" -eq 1 || "$DO_UPDATE_ONLY" -eq 1 || "$DO_IP_CHECK" -eq 1 || "$DO_ABUSE_REPORT" -eq 1 ]]; then return 0; fi
   if [[ "$ASSUME_YES" -eq 1 ]]; then
     err "--panel-ip is required (or set GORECSHIT_PANEL_IP). Refusing non-interactive without it."
     exit 2
@@ -631,11 +659,21 @@ show_status_summary() {
   fi
   echo "---- listeners ----"
   ss -lntup 2>/dev/null | head -40 || true
-  if command -v ipset >/dev/null 2>&1 && ipset list scanner-block >/dev/null 2>&1; then
-    echo "---- ipset scanner-block ----"
-    echo "entries: $(ipset list scanner-block 2>/dev/null | grep -cE '^[0-9]' || echo 0)"
+  if command -v ipset >/dev/null 2>&1 && ipset list -n scanner-block >/dev/null 2>&1; then
+    echo "---- ipsets ----"
+    local _set _n
+    for _set in scanner-block scanner-block6 gorecshit-rep gorecshit-snitch gorecshit-snitch6 gorecshit-cdn; do
+      _n="$(ipset list "$_set" -t 2>/dev/null | awk -F': ' '/Number of entries/{print $2}')"
+      [[ -n "$_n" ]] && printf '  %-18s %s\n' "$_set" "$_n"
+    done
   else
     echo "ipset scanner-block: нет"
+  fi
+  if iptables -nL GS-NETGUARD >/dev/null 2>&1; then
+    echo "---- netguard ----"
+    echo "  активен · подробности: gorecshit --abuse-report"
+  else
+    echo "netguard: не установлен"
   fi
   if command -v fail2ban-client >/dev/null 2>&1; then
     echo "---- fail2ban ----"
@@ -2447,6 +2485,204 @@ except Exception: pass' "$pub_ip" 2>/dev/null || true)"
   return 0
 }
 
+# ---------- v2.7.0: IP reputation / VPN-detection self-check (read-only, no API keys) ----------
+_json_field() {
+  # _json_field JSON dotted.path → prints value (python3; empty if absent)
+  command -v python3 >/dev/null 2>&1 || return 0
+  python3 -c '
+import json,sys
+try:
+    d=json.loads(sys.argv[1])
+    for k in sys.argv[2].split("."):
+        d=d[k]
+    print(d if not isinstance(d,bool) else ("true" if d else "false"))
+except Exception:
+    pass' "$1" "$2" 2>/dev/null || true
+}
+
+_ip_rev() { awk -F. '{print $4"."$3"."$2"."$1}' <<<"$1"; }
+
+_audit_ip_reputation() {
+  local ip="$1" rev z res listed=0
+  [[ -n "$ip" ]] || return 0
+  step "Репутация IP ${ip}: DNSBL, списки атакующих, базы «VPN/прокси» (read-only)"
+  rev="$(_ip_rev "$ip")"
+  # sanity: 1.0.0.127.<zone> must NOT resolve; if it does, the resolver rewrites answers (fake-DNS / NXDOMAIN hijack)
+  local wild
+  wild="$(timeout 6 getent ahostsv4 "1.0.0.127.zen.spamhaus.org" 2>/dev/null | awk '{print $1}' | head -1 || true)"
+  if [[ -n "$wild" && ! "$wild" =~ ^127\. ]]; then
+    _audit_warn "DNSBL пропущены: резолвер подменяет ответы (${wild}) — результат был бы ложным"
+  else
+  for z in zen.spamhaus.org bl.spamcop.net b.barracudacentral.org dnsbl-1.uceprotect.net psbl.surriel.com bl.blocklist.de all.s5h.net dnsbl.dronebl.org; do
+    res="$(timeout 6 getent ahostsv4 "${rev}.${z}" 2>/dev/null | awk '{print $1}' | sort -u | paste -sd, - || true)"
+    if [[ -z "$res" ]]; then
+      _audit_ok "${z}: чисто"
+    elif [[ "$res" =~ 127\.255\.255\. ]]; then
+      _audit_info "${z}: ответ ${res} — список не отвечает публичным резолверам (1.1.1.1/8.8.8.8); проверьте вручную: https://check.spamhaus.org/ / https://mxtoolbox.com/blacklists.aspx"
+    elif [[ ! "$res" =~ ^127\. ]]; then
+      _audit_info "${z}: нестандартный ответ ${res} — пропущено"
+    else
+      listed=$((listed+1))
+      _audit_err "${z}: В СПИСКЕ (${res}) — хостеры и почтовики видят IP как «грязный»"
+    fi
+  done
+  fi
+  # attackers feeds
+  local bd
+  bd="$(curl -fsS --connect-timeout 5 --max-time 10 "https://api.blocklist.de/api.php?ip=${ip}" 2>/dev/null | tr -d '\r' | tr '\n' ' ' || true)"
+  if [[ "$bd" =~ attacks:[[:space:]]*([0-9]+) ]] && [[ "${BASH_REMATCH[1]}" -gt 0 ]]; then
+    listed=$((listed+1)); _audit_err "blocklist.de: ${BASH_REMATCH[1]} атак с этого IP (абуз-репорты хостеру!)"
+  elif [[ -n "$bd" ]]; then
+    _audit_ok "blocklist.de: атак не зафиксировано"
+  fi
+  local ips
+  ips="$(curl -fsS --connect-timeout 5 --max-time 20 https://raw.githubusercontent.com/stamparm/ipsum/master/ipsum.txt 2>/dev/null \
+        | awk -v ip="$ip" '$1==ip{print $2}' || true)"
+  if [[ -n "$ips" ]]; then
+    listed=$((listed+1)); _audit_err "IPsum: IP в ${ips} чёрных списках атакующих"
+  else
+    _audit_ok "IPsum (агрегатор ~30 списков атакующих): не найден"
+  fi
+  # VPN/proxy detection DBs (used by банки/маркетплейсы/стриминги и «методички» по выявлению VPN)
+  local pc pi
+  pc="$(_audit_http_get "https://proxycheck.io/v2/${ip}?vpn=1&asn=1" 12)"
+  if [[ -n "$pc" ]]; then
+    local pxy typ prov
+    pxy="$(_json_field "$pc" "${ip}.proxy")"; typ="$(_json_field "$pc" "${ip}.type")"; prov="$(_json_field "$pc" "${ip}.provider")"
+    if [[ "$pxy" == "yes" ]]; then
+      _audit_warn "proxycheck.io: помечен как ${typ:-proxy} (провайдер: ${prov:-?}) — сервисы видят VPN"
+    elif [[ -n "$pxy" ]]; then
+      _audit_ok "proxycheck.io: не VPN/proxy (тип: ${typ:-?}, ${prov:-?})"
+    fi
+  fi
+  pi="$(_audit_http_get "https://api.ipapi.is/?q=${ip}" 12)"
+  if [[ -n "$pi" ]]; then
+    local vpn dc ab org
+    vpn="$(_json_field "$pi" is_vpn)"; dc="$(_json_field "$pi" is_datacenter)"; ab="$(_json_field "$pi" is_abuser)"; org="$(_json_field "$pi" asn.org)"
+    [[ "$vpn" == "true" ]] && _audit_warn "ipapi.is: is_vpn=true (${org:-?}) — IP уже в VPN-базах"
+    [[ "$vpn" == "false" ]] && _audit_ok "ipapi.is: is_vpn=false"
+    [[ "$ab" == "true" ]] && { listed=$((listed+1)); _audit_err "ipapi.is: is_abuser=true — с IP шёл абуз"; }
+    [[ "$dc" == "true" ]] && _audit_info "ipapi.is: датацентр (${org:-?}) — для ТСПУ «подозрительная подсеть» определяется по ASN, это не исправить скриптом"
+  fi
+  _audit_info "AbuseIPDB (без ключа не проверить автоматически): https://www.abuseipdb.com/check/${ip}"
+  if [[ "$listed" -gt 0 ]]; then
+    _audit_err "Итог: IP в ${listed} списках. Смотрите gorecshit --abuse-report (что делали клиенты), чистите причину, пишите делист."
+  else
+    _audit_ok "Итог: в проверенных чёрных списках IP не найден"
+  fi
+  return 0
+}
+
+run_ip_check() {
+  local ip=""
+  if ! ip="$(_audit_detect_public_ipv4)"; then
+    err "Не удалось определить публичный IPv4 (нет интернета/DNS?)"
+    return 0
+  fi
+  _audit_ip_reputation "$ip"
+  echo
+  _audit_info "Блокировку из РФ (ТСПУ/белые списки) проверяет пункт 8 (--audit, check-host из РФ)."
+  return 0
+}
+
+# ---------- v2.7.0: abuse report — what clients tried through this node (read-only) ----------
+_ipt_hits() {
+  # _ipt_hits IPT CHAIN → packets hitting verdict rules (excludes LOG lines)
+  "$1" -nvxL "$2" 2>/dev/null | awk 'NR>2 && $3!="LOG"{s+=$1} END{print s+0}'
+}
+
+run_abuse_report() {
+  step "Что клиенты пытались делать через ноду (с момента загрузки правил; read-only)"
+  if ! iptables -nL GS-NETGUARD >/dev/null 2>&1; then
+    warn "Netguard не установлен — пункт 1 (или --modules netguard) включит учёт и защиту"
+  fi
+  local smtp=0
+  smtp="$(iptables -nvxL GORECSHIT-EGRESS 2>/dev/null | awk '$3=="REJECT" && /dpt:(25|465|587)/{s+=$1} END{print s+0}')"
+  local p2p abuse smb priv snitch
+  p2p=$(( $(_ipt_hits iptables GS-HIT-P2P) + $(_ipt_hits ip6tables GS-HIT-P2P) ))
+  abuse=$(( $(_ipt_hits iptables GS-HIT-ABUSE) + $(_ipt_hits ip6tables GS-HIT-ABUSE) ))
+  smb=$(( $(_ipt_hits iptables GS-HIT-SMB) + $(_ipt_hits ip6tables GS-HIT-SMB) ))
+  priv="$(_ipt_hits iptables GS-HIT-PRIV)"
+  snitch=$(( $(_ipt_hits iptables GS-HIT-SNITCH) + $(_ipt_hits ip6tables GS-HIT-SNITCH) ))
+  printf '  %-44s %s\n' "Торренты (DHT/handshake/трекеры) — DROP:" "$p2p" \
+    "Сканы/брутфорс SSH/RDP/БД — REJECT:" "$abuse" "SMB/NetBIOS наружу — REJECT:" "$smb" \
+    "Доступ в LAN хостера (10/172/192/100.64):" "$priv" "VK/MAX/mail.ru («стукачи») — REJECT:" "$snitch" \
+    "Исходящий SMTP (спам) — REJECT:" "$smtp"
+  echo
+  if command -v journalctl >/dev/null 2>&1; then
+    local pref
+    for pref in GS-P2P GS-ABUSE GS-SMB GS-PRIV GS-SNITCH; do
+      local lines
+      lines="$(journalctl -k --since '-24h' --no-pager 2>/dev/null | grep -F "[${pref}]" || true)"
+      [[ -n "$lines" ]] || continue
+      echo "  ${pref}: $(grep -c . <<<"$lines") записей за 24ч (лог ограничен 6/мин). Топ направлений:"
+      grep -oE 'DST=[^ ]+ .*DPT=[0-9]+' <<<"$lines" | awk '{d=$1; for(i=1;i<=NF;i++) if($i ~ /^DPT=/) p=$i; print d" "p}' \
+        | sed 's/DST=//; s/DPT=/:/; s/ //' | sort | uniq -c | sort -rn | head -5 | sed 's/^/      /'
+    done
+  fi
+  # Map to Remnawave users when xray access log is available (best effort, nothing is changed)
+  local c logsrc=""
+  c="$(_find_remnanode_container 2>/dev/null || true)"
+  if [[ -n "$c" ]]; then
+    logsrc="$(docker logs --since 24h "$c" 2>&1 | grep -E 'accepted (tcp|udp):' | tail -n 200000 || true)"
+  fi
+  local f
+  for f in /var/log/remnanode/access.log /var/log/xray/access.log; do
+    [[ -r "$f" ]] && logsrc+=$'\n'"$(tail -n 200000 "$f" 2>/dev/null)"
+  done
+  if [[ -n "${logsrc//[[:space:]]/}" ]] && command -v journalctl >/dev/null 2>&1; then
+    local dsts
+    dsts="$(journalctl -k --since '-24h' --no-pager 2>/dev/null | grep -E '\[GS-(P2P|ABUSE|SMB|PRIV)\]' \
+           | grep -oE 'DST=[0-9.]+' | cut -d= -f2 | sort | uniq -c | sort -rn | head -5 | awk '{print $2}' || true)"
+    if [[ -n "$dsts" ]]; then
+      echo
+      echo "  Кто из пользователей ходил на эти адреса (access-лог xray):"
+      local d
+      while IFS= read -r d; do
+        [[ -n "$d" ]] || continue
+        local who
+        who="$(grep -F ":${d}:" <<<"$logsrc" | grep -oE 'email: *[^ ]+' | sort | uniq -c | sort -rn | head -3 | tr -s ' ' | paste -sd';' - || true)"
+        printf '      %-16s %s\n' "$d" "${who:-нет в логе}"
+      done <<<"$dsts"
+    fi
+  else
+    _audit_info "Access-лог xray недоступен — сопоставить с пользователями нельзя (включите access log в профиле панели при расследовании)."
+  fi
+  echo
+  _audit_info "Торренты гасятся и тут, и правилом xray (рекомендуется в профиле: protocol bittorrent → block + Torrent Blocker в панели)."
+  return 0
+}
+
+_audit_antiban_advice() {
+  step "Анти-бан: что сдаёт IP ноды и что уже закрыто"
+  if iptables -nL GS-NETGUARD >/dev/null 2>&1; then
+    _audit_ok "Netguard активен (торренты/сканы/SMB/LAN/VK-MAX — см. gorecshit --abuse-report)"
+  else
+    _audit_warn "Netguard не активен — торренты/сканы клиентов = абузы хостеру, MAX/VK видят IP ноды"
+  fi
+  if iptables -nL GS-HIT-SNITCH >/dev/null 2>&1; then
+    _audit_ok "VK/MAX/mail.ru через ноду закрыты (MAX HOST_REACHABILITY не отправит IP ноды)"
+  else
+    _audit_warn "VK/MAX через ноду открыты: MAX/VK-приложения у клиентов с полным туннелем сообщают IP ноды"
+  fi
+  if ipset list -n gorecshit-rep >/dev/null 2>&1; then
+    _audit_ok "Репутационные списки — только на SSH (мобильные CGNAT-адреса клиентов не режутся)"
+  fi
+  local json
+  json="$(collect_xray_config_json 2>/dev/null || true)"
+  if [[ -n "$json" ]] && grep -q '"routing"' <<<"$json"; then
+    grep -q '"bittorrent"' <<<"$json" && _audit_ok "xray routing: bittorrent → блок есть" \
+      || _audit_warn "xray routing: нет правила protocol bittorrent → block (профиль в панели)"
+    grep -q 'geoip:private' <<<"$json" && _audit_ok "xray routing: geoip:private есть" \
+      || _audit_warn "xray routing: нет geoip:private → block (клиенты видят LAN хостера/метаданные)"
+    grep -qE 'oneme\.ru|max\.ru' <<<"$json" && _audit_ok "xray routing: домены MAX блокируются" \
+      || _audit_info "xray routing: добавьте domain:oneme.ru, domain:max.ru, full:ip.mail.ru → block (дублирует netguard по доменам)"
+  fi
+  _audit_info "Клиенты (Happ/подписка): РФ-сайты и приложения — НАПРЯМУЮ (geoip:ru, geosite:category-ru → direct), иначе банки/маркетплейсы/MAX видят IP ноды"
+  _audit_info "Отпечаток клиента: firefox (chrome/safari/ios в июне 2026 считались подозрительными); меньше параллельных TLS (mux/xmux), >3 за ~100 мс → заморозка"
+  _audit_info "Не публикуйте ссылки-подписки и IP нод; одна утечка конфига = IP в списке"
+}
+
 run_node_audit() {
   step "Проверка на блокировку и палевность ноды (read-only)"
   echo "Ничего не меняем: без правок firewall/sysctl/docker, без влияния на скорость клиентов."
@@ -2487,6 +2723,10 @@ run_node_audit() {
   _audit_server_level
   echo
   _audit_giveaways
+  echo
+  if [[ -n "$pub_ip" ]]; then _audit_ip_reputation "$pub_ip"; fi
+  echo
+  _audit_antiban_advice
 
   echo
   menu_sep
@@ -2738,13 +2978,15 @@ interactive_menu() {
     printf '  %b7)%b ⬆️  Обновить gorecshit (GitHub)\n' "${C_BOLD}" "${C_RESET}"
     printf '  %b8)%b 🛡️  Проверка на блокировку и палевность ноды\n' "${C_BOLD}" "${C_RESET}"
     printf '  %b9)%b 🕵️  Скрыть отпечатки сервера\n' "${C_BOLD}" "${C_RESET}"
+    printf '  %b10)%b 🧾 IP в чёрных списках / VPN-базах?\n' "${C_BOLD}" "${C_RESET}"
+    printf '  %b11)%b 🚨 Что делали клиенты (торренты/сканы/спам/«стукачи»)\n' "${C_BOLD}" "${C_RESET}"
     menu_sep
     printf '  %b0)%b 🚪 Выход\n' "${C_BOLD}" "${C_RESET}"
-    printf '%bCLI: gorecshit [--status|--update|--audit|--stealth|--yes|--modules …]%b\n' "${C_GREY}" "${C_RESET}"
+    printf '%bCLI: gorecshit [--status|--update|--audit|--stealth|--ip-check|--abuse-report|--yes|--modules …]%b\n' "${C_GREY}" "${C_RESET}"
     if [[ -w /dev/tty ]]; then
-      printf '%bВыберите пункт [0-9]:%b ' "${C_BOLD}" "${C_RESET}" > /dev/tty
+      printf '%bВыберите пункт [0-11]:%b ' "${C_BOLD}" "${C_RESET}" > /dev/tty
     else
-      printf '%bВыберите пункт [0-9]:%b ' "${C_BOLD}" "${C_RESET}"
+      printf '%bВыберите пункт [0-11]:%b ' "${C_BOLD}" "${C_RESET}"
     fi
     read_user_input choice
     case "$choice" in
@@ -2793,6 +3035,12 @@ interactive_menu() {
         DO_FINGERPRINT_ONLY=1
         return 0
         ;;
+      10)
+        run_ip_check
+        ;;
+      11)
+        run_abuse_report
+        ;;
       0|q|Q)
         exit 0
         ;;
@@ -2809,6 +3057,7 @@ interactive_select_modules() {
   echo "  1 ufw  2 blocklist  3 hide_ports  4 anti_probe  5 ssh"
   echo "  6 stealth  7 fail2ban  8 sysctl  9 hostname  10 docker"
   echo "  11 egress_guard (исходящий SMTP)  12 decoy_web (:80 → https, опц.)"
+  echo "  13 netguard (торренты/сканы/брутфорс/LAN хостера/VK-MAX «стукачи»)"
   echo "  (или: minimum — UFW+SSH+fail2ban+blocklist+BBR)"
   local ans
   prompt_user 'Номера: ' ans
@@ -2817,18 +3066,18 @@ interactive_select_modules() {
   elif [[ "$ans" == "minimum" || "$ans" == "min" ]]; then
     selected="minimum"
   else
-    local map=( "" ufw blocklist hide_ports anti_probe ssh stealth fail2ban sysctl hostname docker egress_guard decoy_web )
+    local map=( "" ufw blocklist hide_ports anti_probe ssh stealth fail2ban sysctl hostname docker egress_guard decoy_web netguard )
     local n parts=()
     local IFS=,
     for n in $ans; do
       n="$(echo "$n" | tr -d ' ')"
-      [[ "$n" =~ ^[0-9]+$ && "$n" -ge 1 && "$n" -le 12 ]] && parts+=("${map[$n]}")
+      [[ "$n" =~ ^[0-9]+$ && "$n" -ge 1 && "$n" -le 13 ]] && parts+=("${map[$n]}")
     done
     local IFS=,
     selected="${parts[*]}"
   fi
   apply_modules_csv "${selected:-all}"
-  log "Выбраны модули: ufw=$DO_UFW blocklist=$DO_BLOCKLIST hide=$DO_HIDE_PORTS probe=$DO_ANTI_PROBE ssh=$DO_SSH stealth=$DO_STEALTH f2b=$DO_FAIL2BAN sysctl=$DO_SYSCTL host=$DO_HOSTNAME docker=$DO_DOCKER_JOURNAL egress=$DO_EGRESS_GUARD decoy=$DO_DECOY_WEB"
+  log "Выбраны модули: ufw=$DO_UFW blocklist=$DO_BLOCKLIST hide=$DO_HIDE_PORTS probe=$DO_ANTI_PROBE ssh=$DO_SSH stealth=$DO_STEALTH f2b=$DO_FAIL2BAN sysctl=$DO_SYSCTL host=$DO_HOSTNAME docker=$DO_DOCKER_JOURNAL egress=$DO_EGRESS_GUARD netguard=$DO_NETGUARD decoy=$DO_DECOY_WEB"
 }
 
 preflight() {
@@ -3592,6 +3841,11 @@ system_upgrade() {
     return 0
   fi
   step "Обновление системы"
+  if [[ "$NET_OFFLINE" -eq 1 ]]; then
+    warn "Офлайн (нет интернета/DNS) — обновление системы пропущено"
+    pause_apt_timers
+    return 0
+  fi
   if [[ "$DRY_RUN" -eq 1 ]]; then
     printf '%b[DRY]%b stop apt-daily*; dpkg --configure -a; apt-get update; apt-get full-upgrade -y (force-confold)\n' \
       "${C_YEL}" "${C_RESET}"
@@ -3661,13 +3915,24 @@ apt_get_retry() {
 
 install_packages() {
   step "Пакеты"
-  local pkgs=(ufw fail2ban ipset chrony curl ca-certificates iptables)
+  local pkgs=(ufw fail2ban ipset chrony curl ca-certificates iptables python3)
   # hashlimit / connlimit need xtables modules usually already in iptables
   if [[ "$DRY_RUN" -eq 1 ]]; then
     printf '%b[DRY]%b apt-get install -y %s\n' "${C_YEL}" "${C_RESET}" "${pkgs[*]}"
     return 0
   fi
   export DEBIAN_FRONTEND=noninteractive
+  local missing=()
+  mapfile -t missing < <(_pkgs_missing "${pkgs[@]}")
+  if [[ ${#missing[@]} -eq 0 ]]; then
+    ok "Пакеты уже стоят: ${pkgs[*]}"
+    return 0
+  fi
+  if [[ "$NET_OFFLINE" -eq 1 ]]; then
+    err "Не хватает пакетов: ${missing[*]} — а интернета/DNS нет, apt не сработает."
+    err "Почините сеть (ip r, панель хостера) или DNS (nameserver 1.1.1.1 в /etc/resolv.conf) и запустите снова."
+    return 1
+  fi
   if [[ "$IPV6_OFF" -eq 1 ]]; then
     mkdir -p /etc/apt/apt.conf.d
     echo 'Acquire::ForceIPv4 "true";' >/etc/apt/apt.conf.d/99force-ipv4
@@ -3683,6 +3948,103 @@ install_packages() {
   # optional whiptail for future interactive runs on minimal images
   apt_get_retry install -y -qq whiptail 2>/dev/null || true
   ok "Пакеты установлены: ${pkgs[*]}"
+}
+
+# ---------- v2.7.0: network / DNS self-heal (servers without DNS are a real-world case) ----------
+_net_ip_ok() {
+  # Raw IP connectivity (no DNS needed): TCP to well-known anycast resolvers, then ICMP.
+  local ip port
+  for ip in 1.1.1.1 8.8.8.8 77.88.8.8; do
+    for port in 443 53; do
+      if timeout 4 bash -c "exec 3<>/dev/tcp/${ip}/${port}" 2>/dev/null; then
+        return 0
+      fi
+    done
+  done
+  ping -c1 -W2 1.1.1.1 >/dev/null 2>&1 && return 0
+  ping -c1 -W2 77.88.8.8 >/dev/null 2>&1 && return 0
+  return 1
+}
+
+_dns_ok() {
+  local h
+  for h in github.com deb.debian.org archive.ubuntu.com ya.ru; do
+    if timeout 6 getent ahostsv4 "$h" >/dev/null 2>&1; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+ensure_network_dns() {
+  # Make apt/curl work on servers with broken resolv.conf; clear message when there is no internet at all.
+  [[ "$DRY_RUN" -eq 1 ]] && { printf '%b[DRY]%b check DNS; if broken but IP works → nameserver 1.1.1.1/8.8.8.8/77.88.8.8\n' "${C_YEL}" "${C_RESET}"; return 0; }
+  step "Сеть и DNS"
+  if _dns_ok; then
+    if _net_ip_ok; then
+      ok "DNS работает"
+    else
+      NET_OFFLINE=1
+      warn "DNS отвечает (кэш?), но 1.1.1.1 / 8.8.8.8 / 77.88.8.8 недоступны по IP — работаю офлайн (без apt, встроенные/сохранённые списки)"
+    fi
+    return 0
+  fi
+  if ! _net_ip_ok; then
+    NET_OFFLINE=1
+    err "Нет выхода в интернет: не отвечают 1.1.1.1 / 8.8.8.8 / 77.88.8.8 даже по IP — это не DNS, а сеть/шлюз."
+    warn "Проверьте: ip a; ip r (должна быть строка 'default via …'), сеть/IP в панели хостера."
+    warn "Продолжаю офлайн: apt пропускаю, списки сканеров — встроенные в скрипт."
+    return 0
+  fi
+  warn "DNS не работает (интернет по IP есть) — прописываю резолверы 1.1.1.1 / 8.8.8.8 / 77.88.8.8"
+  local dropin="/etc/systemd/resolved.conf.d/99-gorecshit-dns.conf" created_dropin=0
+  backup_file /etc/resolv.conf
+  [[ -e "$dropin" ]] || created_dropin=1
+  backup_file "$dropin"
+  if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+    mkdir -p /etc/systemd/resolved.conf.d
+    printf '# Managed by %s %s (DNS self-heal)\n[Resolve]\nDNS=1.1.1.1 8.8.8.8\nFallbackDNS=1.0.0.1 8.8.4.4 77.88.8.8\n' \
+      "$SCRIPT_NAME" "$VERSION" >"$dropin"
+    systemctl restart systemd-resolved 2>/dev/null || true
+    sleep 2
+  fi
+  if ! _dns_ok; then
+    # Replace resolv.conf (a symlink to the resolved stub is common) with static resolvers
+    local keep=""
+    keep="$(grep -E '^\s*(search|domain|options)\b' /etc/resolv.conf 2>/dev/null || true)"
+    rm -f /etc/resolv.conf
+    {
+      echo "# Managed by ${SCRIPT_NAME} ${VERSION} (DNS self-heal; original in ${BACKUP_DIR}/etc/resolv.conf)"
+      [[ -n "$keep" ]] && printf '%s\n' "$keep"
+      echo "nameserver 1.1.1.1"
+      echo "nameserver 8.8.8.8"
+      echo "nameserver 77.88.8.8"
+      echo "options timeout:2 attempts:2"
+    } >/etc/resolv.conf
+  fi
+  if [[ "$created_dropin" -eq 1 && -e "$dropin" ]]; then
+    : >"${BACKUP_DIR}/dns-dropin.created"
+    # shellcheck disable=SC2016  # literal rollback code
+    _rb_append_block "gorecshit-dns-restore" '
+if [[ -f "$BACKUP_DIR/dns-dropin.created" ]]; then
+  rm -f /etc/systemd/resolved.conf.d/99-gorecshit-dns.conf
+  systemctl restart systemd-resolved 2>/dev/null || true
+fi'
+  fi
+  if _dns_ok; then
+    ok "DNS починен (1.1.1.1 / 8.8.8.8 / 77.88.8.8). Откат вернёт прежний resolv.conf"
+  else
+    NET_OFFLINE=1
+    err "DNS всё ещё не работает (возможно, хостер режет UDP/TCP 53). Продолжаю офлайн: без apt, встроенные списки."
+  fi
+}
+
+_pkgs_missing() {
+  # prints missing packages from args
+  local p
+  for p in "$@"; do
+    dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q 'install ok installed' || printf '%s\n' "$p"
+  done
 }
 
 configure_sysctl() {
@@ -3971,9 +4333,18 @@ hook_ufw_before_rules() {
   while IFS= read -r a; do
     insert+="-A ufw-before-input -s ${a} -j ACCEPT"$'\n'
   done < <(foreach_csv_ip "$RELAY_IPS")
-  if [[ "$DO_BLOCKLIST" -eq 1 ]]; then
+  local sshp
+  sshp="$(_ssh_ports_csv)"
+  if [[ "$DO_BLOCKLIST" -eq 1 ]] && ipset list -n scanner-block >/dev/null 2>&1; then
     insert+="-A ufw-before-input -m conntrack --ctstate NEW -m set --match-set scanner-block src -j DROP"$'\n'
   fi
+  # v2.7.0: reputation lists (brute-forcers; contain mobile CGNAT IPs) — SSH only, never client ports
+  if [[ "$DO_BLOCKLIST" -eq 1 ]] && ipset list -n gorecshit-rep >/dev/null 2>&1; then
+    insert+="-A ufw-before-input -p tcp -m multiport --dports ${sshp} -m conntrack --ctstate NEW -m set --match-set gorecshit-rep src -j DROP"$'\n'
+  fi
+  # v2.7.0: SSH rate-limit with silent DROP (ufw limit answers REJECT/icmp-port-unreachable = fingerprint)
+  insert+="-A ufw-before-input -p tcp -m multiport --dports ${sshp} -m conntrack --ctstate NEW -m recent --name gs_ssh --set"$'\n'
+  insert+="-A ufw-before-input -p tcp -m multiport --dports ${sshp} -m conntrack --ctstate NEW -m recent --name gs_ssh --update --seconds 60 --hitcount 10 -j DROP"$'\n'
   insert+="# gorecshit-managed-end"$'\n'
 
   if grep -q 'ufw-before-input -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT' "$rules"; then
@@ -4011,7 +4382,43 @@ hook_ufw_before_rules() {
     # Also destination-unreachable / time-exceeded stay ACCEPT for PMTU usually —
     # but for closed-port stealth we drop ICMP unreachable replies via sysctl/iptables below.
   fi
-  ok "UFW before.rules hooked (panel+relays ACCEPT; scanner DROP; ping hide=${DO_HIDE_PORTS})"
+  _hook_ufw_before6_rules "$sshp"
+  ok "UFW before.rules hooked (panel+relays ACCEPT; scanner DROP; reputation→SSH only; SSH limit DROP; ping hide=${DO_HIDE_PORTS})"
+}
+
+_ssh_ports_csv() {
+  # 22 + --ssh-port + whatever sshd really listens on (max 15 for multiport)
+  local ports=(22) p
+  [[ -n "$SSH_PORT_NEW" ]] && ports+=("$SSH_PORT_NEW")
+  if command -v sshd >/dev/null 2>&1; then
+    while IFS= read -r p; do is_port "$p" && ports+=("$p"); done < <(sshd -T 2>/dev/null | awk '$1=="port"{print $2}')
+  fi
+  printf '%s\n' "${ports[@]}" | sort -n -u | head -15 | paste -sd, -
+}
+
+_hook_ufw_before6_rules() {
+  # IPv6 parity: scanner DROP + SSH silent rate-limit in before6.rules (managed block, idempotent)
+  local rules6="/etc/ufw/before6.rules" sshp="$1"
+  [[ -f "$rules6" ]] || return 0
+  backup_file "$rules6"
+  if grep -q '# gorecshit-managed-begin' "$rules6"; then
+    sed -i '/# gorecshit-managed-begin/,/# gorecshit-managed-end/d' "$rules6"
+  fi
+  local ins="# gorecshit-managed-begin ${VERSION}"$'\n'
+  if [[ "$DO_BLOCKLIST" -eq 1 ]] && ipset list -n scanner-block6 >/dev/null 2>&1; then
+    ins+="-A ufw6-before-input -m conntrack --ctstate NEW -m set --match-set scanner-block6 src -j DROP"$'\n'
+  fi
+  ins+="-A ufw6-before-input -p tcp -m multiport --dports ${sshp} -m conntrack --ctstate NEW -m recent --name gs_ssh6 --set"$'\n'
+  ins+="-A ufw6-before-input -p tcp -m multiport --dports ${sshp} -m conntrack --ctstate NEW -m recent --name gs_ssh6 --update --seconds 60 --hitcount 10 -j DROP"$'\n'
+  ins+="# gorecshit-managed-end"$'\n'
+  if grep -q 'ufw6-before-input -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT' "$rules6"; then
+    local tmp; tmp="$(mktemp)"
+    awk -v ins="$ins" '
+      /ufw6-before-input -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT/ && !done { print; print ins; done=1; next }
+      { print }
+    ' "$rules6" >"$tmp"
+    cat "$tmp" >"$rules6"; rm -f "$tmp"
+  fi
 }
 
 configure_hide_ports() {
@@ -4110,6 +4517,8 @@ configure_anti_probe() {
     while IFS= read -r a; do
       echo "iptables -A \"\$CHAIN\" -s ${a} -j RETURN"
     done < <(foreach_csv_ip "$RELAY_IPS")
+    echo '# v2.7.0: CDN edges (Yandex Cloud CDN / Cloudflare) aggregate thousands of users — never per-IP limit them'
+    echo 'ipset list -n gorecshit-cdn >/dev/null 2>&1 && iptables -A "$CHAIN" -m set --match-set gorecshit-cdn src -j RETURN'
     for p in "${ports_tcp[@]}"; do
       echo "iptables -A \"\$CHAIN\" -p tcp --dport ${p} -m conntrack --ctstate NEW -m connlimit --connlimit-above 2000 --connlimit-mask 32 -j DROP"
       echo "iptables -A \"\$CHAIN\" -p tcp --dport ${p} -m conntrack --ctstate NEW -m hashlimit --hashlimit-name gs_ap_${p} --hashlimit-mode srcip --hashlimit-above 600/min --hashlimit-burst 1200 --hashlimit-htable-expire 120000 -j DROP"
@@ -4160,7 +4569,10 @@ configure_ufw() {
   fi
   step "UFW"
   backup_file /etc/ufw/before.rules
+  backup_file /etc/ufw/before6.rules
   backup_file /etc/default/ufw
+  backup_file /etc/ufw/user.rules     # v2.7.0: rollback restores ufw allow/limit rules too
+  backup_file /etc/ufw/user6.rules
 
   if [[ "$DRY_RUN" -eq 1 ]]; then
     printf '%b[DRY]%b ufw default deny incoming / allow outgoing; limit 22; clients; NODE_PORT from panel\n' "${C_YEL}" "${C_RESET}"
@@ -4181,7 +4593,9 @@ configure_ufw() {
   ufw default allow outgoing
 
   # SSH
-  ufw limit 22/tcp comment 'SSH rate-limit' || true
+  # v2.7.0: plain allow + silent DROP rate-limit in before.rules (ufw limit = REJECT → visible fingerprint)
+  ufw allow 22/tcp comment 'SSH (rate-limit DROP in before.rules)' || true
+  ufw delete limit 22/tcp >/dev/null 2>&1 || true
   if [[ -n "$SSH_CLIENT_IP" ]]; then
     ufw allow from "$SSH_CLIENT_IP" to any port 22 proto tcp comment 'SSH current client' || true
   fi
@@ -4227,410 +4641,605 @@ configure_ufw() {
   ufw deny 4443/tcp comment 'deny-public-xray-4443' || true
 
   ufw --force enable
-  ok "UFW enabled (SSH limited; NODE_PORT=${NODE_PORT}←panel; clients tcp=${CLIENT_PORTS} udp=${CLIENT_UDP_PORTS})"
+  ok "UFW enabled (SSH: silent DROP rate-limit; NODE_PORT=${NODE_PORT}←panel; clients tcp=${CLIENT_PORTS} udp=${CLIENT_UDP_PORTS})"
 }
 
+
+# ---------- v2.7.0 built-in lists (offline fallback; snapshot 2026-11-14) ----------
+# Sources: OpenFilters/internet-scanners (small/medium feeds), CyberOK Skipa, traffic-guard antiscanner,
+# RIPEstat announced prefixes of scanner ASNs (Modat 209334, Censys 398324/398705, Driftnet 211298,
+# ONYPHE 213412, IP Volume 202425, Pfcloud 51396). Pre-filtered: no Yandex/Cloudflare, no RU mobile.
+_write_builtin_lists() {
+  local d="/etc/scanner-block"
+  mkdir -p "$d"
+  tr ' ' '\n' >"$d/builtin-scanners.txt" <<'GS_BUILTIN_SCANNERS'
+2.31.155.11/32 2.57.17.0/24 2.59.21.51/32 2.59.22.234/32 2.59.255.74/32 3.7.157.159/32 3.7.173.162/32 3.9.159.128/25 3.14.73.254/32 3.14.82.245/32
+3.14.84.197/32 3.14.86.234/32 3.15.169.123/32 3.15.179.241/32 3.15.180.31/32 3.16.148.58/32 3.16.213.130/32 3.17.72.122/32 3.17.73.23/32
+3.17.206.73/32 3.17.207.148/32 3.18.101.236/32 3.18.108.78/32 3.19.14.190/32 3.19.14.223/32 3.19.223.104/32 3.19.240.76/32 3.21.171.90/32
+3.22.234.7/32 3.23.59.18/32 3.23.104.96/32 3.26.100.0/24 3.31.100.0/24 3.32.43.0/27 3.42.1.0/26 3.42.1.64/30 3.42.1.68/31 3.64.4.229/32 3.67.7.128/25
+3.97.253.250/32 3.98.92.0/25 3.98.168.45/32 3.101.216.65/32 3.101.216.66/31 3.101.216.68/30 3.101.216.72/29 3.101.216.80/31 3.101.216.82/32
+3.101.216.88/29 3.101.216.96/29 3.101.216.104/30 3.101.216.108/31 3.101.216.111/32 3.101.216.114/32 3.101.216.119/32 3.101.216.120/30
+3.101.216.124/31 3.101.216.126/32 3.101.226.128/26 3.101.230.128/25 3.101.239.64/26 3.101.240.0/25 3.101.240.128/26 3.106.118.128/25 3.108.37.0/24
+3.115.120.212/32 3.124.123.128/25 3.129.92.250/32 3.130.96.91/32 3.131.215.38/32 3.132.23.201/32 3.132.217.0/25 3.133.84.157/32 3.134.93.22/32
+3.134.100.58/32 3.134.101.147/32 3.134.148.59/32 3.136.67.107/32 3.136.208.236/32 3.137.73.221/32 3.137.132.216/32 3.137.136.201/32 3.137.141.123/32
+3.137.146.232/32 3.137.148.99/32 3.137.151.234/32 3.138.185.30/32 3.138.190.72/32 3.139.58.65/32 3.139.191.225/32 3.141.153.201/32 3.141.168.125/32
+3.142.97.232/32 3.142.219.55/32 3.143.33.63/32 3.143.152.247/32 3.144.44.57/32 3.144.77.222/32 3.144.120.14/32 3.144.120.21/32 3.144.192.36/32
+3.144.236.65/32 3.144.239.16/32 3.144.245.141/32 3.146.111.124/32 3.148.147.222/32 3.149.59.26/32 3.151.181.143/32 3.208.140.122/32 3.211.92.239/32
+3.232.81.89/32 3.233.59.216/32 3.234.180.95/32 3.251.224.0/24 5.63.151.96/27 5.101.64.6/32 5.143.224.100/30 5.143.224.104/30 5.159.97.203/32
+5.178.87.167/32 5.181.20.206/32 5.182.36.155/32 5.188.159.228/32 5.189.167.246/32 5.226.140.0/25 5.252.83.0/24 8.34.210.32/27 8.208.10.94/32
+8.209.96.179/32 8.210.123.17/32 8.211.162.45/32 13.37.76.130/32 13.49.36.97/32 13.51.103.193/32 13.56.21.128/25 13.58.84.198/32 13.58.114.74/32
+13.58.203.73/32 13.59.16.128/32 13.59.59.233/32 13.59.120.77/32 13.59.132.170/32 13.59.242.100/32 13.59.252.0/25 13.62.142.172/32 13.62.143.68/32
+13.113.254.122/32 13.115.104.128/25 13.125.155.228/32 13.126.5.12/32 13.204.242.170/32 13.209.164.77/32 13.210.1.64/26 13.213.79.0/24 13.215.44.86/32
+13.219.121.241/32 13.234.214.153/32 13.237.51.211/32 15.175.17.253/32 15.175.179.151/32 15.200.117.191/32 15.204.109.96/31 15.204.109.103/32
+15.204.109.224/32 15.224.61.208/32 15.228.125.0/24 15.236.61.7/32 16.60.94.233/32 16.192.194.110/32 18.97.5.0/25 18.97.19.128/25 18.97.26.0/24
+18.98.162.96/29 18.116.198.0/24 18.116.202.164/32 18.116.239.38/32 18.117.57.162/32 18.117.109.14/32 18.117.218.107/32 18.118.100.31/32
+18.118.107.228/32 18.119.11.223/32 18.119.13.69/32 18.135.209.62/32 18.135.221.73/32 18.139.37.197/32 18.139.204.0/25 18.168.180.128/25
+18.168.224.128/25 18.188.53.152/32 18.188.134.51/32 18.188.229.2/32 18.189.28.87/32 18.190.152.179/32 18.190.163.148/32 18.191.16.102/32
+18.191.69.170/32 18.191.84.177/32 18.191.173.38/32 18.191.255.164/32 18.194.95.64/26 18.199.138.76/32 18.200.155.2/32 18.217.102.23/32
+18.217.128.63/32 18.217.194.148/32 18.218.94.172/32 18.218.168.5/32 18.218.230.153/32 18.219.11.104/32 18.219.37.54/32 18.219.47.173/32
+18.219.56.153/32 18.219.157.186/32 18.219.193.156/32 18.220.248.172/32 18.221.18.194/32 18.221.100.43/32 18.221.137.47/32 18.221.180.165/32
+18.221.214.151/32 18.222.192.238/32 18.222.201.82/32 18.222.255.237/32 18.223.2.197/32 18.223.104.85/32 18.224.39.133/32 18.224.93.149/32
+18.224.184.103/32 18.225.7.162/32 18.225.206.49/32 18.229.34.49/32 18.235.110.182/32 23.92.31.220/32 23.111.14.183/32 23.111.14.184/29
+23.111.14.192/32 23.176.184.0/24 23.239.4.252/32 23.239.12.138/32 23.239.14.238/32 23.239.15.172/32 23.239.21.238/32 24.144.104.6/32 31.14.32.4/30
+31.14.32.8/32 31.14.254.0/25 31.40.201.0/24 31.57.185.0/24 31.131.251.106/32 31.131.251.235/32 31.131.255.205/32 31.131.255.206/31 31.131.255.208/30
+31.131.255.212/32 31.131.255.240/32 32.189.238.195/32 32.193.229.248/32 32.196.38.110/32 32.236.69.187/32 34.19.116.48/28 34.19.127.160/27
+34.19.127.192/27 34.68.34.64/27 34.201.223.128/25 34.223.64.0/25 34.234.144.84/32 34.234.177.119/32 35.73.219.128/25 35.75.73.253/32 35.82.51.128/25
+35.86.126.0/24 35.93.174.0/24 35.177.219.0/26 35.182.14.64/26 35.203.210.0/23 35.216.140.3/32 35.216.140.175/32 35.216.144.195/32 35.216.149.150/32
+35.216.150.3/32 35.216.156.249/32 35.216.172.131/32 35.216.183.140/32 35.216.185.210/32 35.216.188.37/32 35.216.189.16/32 35.216.195.77/32
+35.216.196.110/32 35.216.197.176/32 35.216.200.253/32 35.216.201.9/32 35.216.216.242/32 35.216.217.192/32 35.216.231.117/32 35.216.236.0/32
+35.216.247.217/32 35.216.254.237/32 36.156.22.4/32 37.9.13.54/32 37.9.13.84/32 37.9.13.105/32 37.9.13.217/32 37.10.113.208/28 44.192.244.0/24
+44.193.87.188/32 44.206.3.0/24 44.220.185.0/24 44.220.188.0/24 44.237.114.33/32 44.242.181.128/25 45.12.129.166/32 45.12.129.173/32 45.12.136.73/32
+45.12.136.79/32 45.12.146.245/32 45.33.28.47/32 45.33.50.24/32 45.33.65.249/32 45.33.69.253/32 45.33.73.58/32 45.33.78.24/32 45.33.78.70/32
+45.33.80.243/32 45.33.83.115/32 45.33.84.124/32 45.33.89.53/32 45.33.94.76/32 45.33.95.64/32 45.55.151.3/32 45.55.153.86/32 45.55.158.168/32
+45.55.185.224/32 45.55.186.92/32 45.56.101.170/32 45.56.103.133/32 45.56.103.154/32 45.56.111.60/32 45.58.168.128/32 45.58.168.141/32
+45.58.168.180/32 45.58.168.195/32 45.58.168.253/32 45.79.38.219/32 45.79.102.191/32 45.79.128.205/32 45.79.132.41/32 45.79.133.252/32 45.79.153.51/32
+45.79.153.72/32 45.79.156.130/32 45.79.162.88/32 45.79.172.21/32 45.79.177.245/32 45.79.181.94/32 45.79.181.104/32 45.79.181.179/32 45.79.181.223/32
+45.79.181.251/32 45.79.186.176/32 45.79.190.10/32 45.79.190.208/32 45.79.190.216/32 45.79.191.178/32 45.83.64.0/22 45.90.57.150/32 45.91.64.6/31
+45.91.64.8/32 45.92.176.94/32 45.92.176.129/32 45.92.176.143/32 45.92.176.144/31 45.92.176.205/32 45.92.177.113/32 45.92.177.127/32 45.92.177.237/32
+45.93.20.45/32 45.93.20.79/32 45.93.20.103/32 45.93.20.104/32 45.93.20.109/32 45.93.20.126/32 45.93.20.148/32 45.93.20.229/32 45.133.173.0/24
+45.135.193.0/24 45.135.194.0/24 45.140.222.0/24 45.141.86.171/32 45.144.212.0/24 45.146.167.56/32 45.146.167.68/32 45.146.167.105/32
+45.146.167.237/32 45.148.144.0/24 45.156.128.0/22 46.101.1.225/32 46.101.111.185/32 46.101.126.116/32 46.101.232.106/32 46.105.132.32/27
+46.161.50.108/31 47.89.154.16/32 47.91.125.252/32 47.253.116.19/32 50.116.30.197/32 50.116.47.129/32 51.15.34.47/32 51.15.44.6/32 51.15.56.200/32
+51.15.98.45/32 51.15.115.141/32 51.15.164.26/32 51.15.164.149/32 51.24.112.219/32 51.24.186.244/32 51.38.12.12/30 51.38.12.20/30 51.45.55.60/32
+51.102.108.215/32 51.112.93.0/24 51.158.173.123/32 51.158.173.124/32 51.159.110.167/32 51.159.125.104/32 51.159.125.199/32 51.159.125.200/32
+51.159.125.208/32 51.159.149.103/32 51.254.49.96/28 51.254.59.112/28 52.14.58.0/32 52.14.122.207/32 52.14.197.136/32 52.14.202.153/32 52.15.76.227/32
+52.15.78.25/32 52.15.85.154/32 52.16.213.65/32 52.17.9.21/32 52.17.98.131/32 52.20.29.198/32 52.29.203.240/32 52.33.46.232/32 52.60.84.222/32
+52.61.37.84/32 52.73.169.169/32 52.192.76.61/32 52.208.235.127/32 52.209.13.240/32 54.37.81.238/32 54.73.182.190/32 54.77.111.234/32 54.86.115.253/32
+54.93.254.128/26 54.149.204.90/32 54.175.125.192/26 54.207.105.3/32 54.212.169.44/32 54.233.128.86/32 54.253.208.103/32 54.255.254.0/26
+56.125.84.114/32 56.126.23.58/32 57.129.64.10/32 57.129.64.219/32 57.129.64.237/32 57.182.57.78/32 62.76.98.0/24 62.113.99.65/32 62.210.142.21/32
+62.210.142.39/32 62.210.142.61/32 62.210.142.62/32 62.210.142.65/32 62.210.142.148/32 62.210.142.159/32 62.210.142.160/28 62.210.142.176/30
+62.210.145.219/32 62.210.245.60/32 62.210.245.66/32 62.233.57.30/32 63.32.130.39/32 63.179.48.119/32 64.23.159.209/32 64.23.218.208/32 64.52.19.0/24
+64.62.156.0/24 64.62.195.152/29 64.62.197.0/24 64.94.153.0/24 64.94.156.0/24 64.94.159.0/24 64.95.9.0/24 64.95.14.0/24 64.205.72.0/24
+64.225.74.178/32 64.225.75.131/32 64.225.75.246/32 64.225.78.34/32 64.226.64.124/32 64.226.65.160/32 64.226.78.121/32 64.226.86.7/32
+64.226.108.113/32 64.227.10.52/32 64.227.11.241/32 64.227.18.98/32 64.227.32.66/32 64.227.70.2/32 64.227.90.185/32 64.227.97.195/32 64.227.99.138/32
+64.227.99.233/32 64.227.106.112/32 64.227.108.146/32 64.227.109.89/32 64.227.110.161/32 65.49.1.0/24 65.49.20.64/26 66.94.119.243/32 66.132.148.0/24
+66.132.153.0/24 66.132.159.0/24 66.132.172.0/24 66.132.175.0/24 66.132.180.0/24 66.132.186.0/24 66.132.195.0/24 66.132.198.0/24 66.132.209.0/24
+66.132.224.0/24 66.132.228.0/24 66.175.208.166/32 66.175.212.77/32 66.175.213.4/32 66.228.40.98/32 66.228.41.127/32 66.234.1.0/24 66.240.192.138/32
+66.240.205.34/32 66.240.219.133/32 66.240.219.146/32 66.240.223.214/32 66.240.223.240/32 66.240.236.109/32 66.240.236.116/32 66.240.236.119/32
+67.21.68.60/32 67.21.68.237/32 67.207.95.230/32 67.215.228.63/32 68.69.177.0/24 68.183.3.153/32 68.183.9.16/32 68.183.11.224/32 68.183.16.131/32
+68.183.96.213/32 68.183.105.175/32 68.183.180.73/32 69.5.169.0/24 69.164.207.173/32 69.164.213.157/32 69.164.214.243/32 70.39.95.20/32 70.39.95.36/32
+70.39.95.67/32 70.39.95.72/32 70.39.95.129/32 71.6.135.131/32 71.6.142.213/32 71.6.146.130/32 71.6.146.185/32 71.6.146.186/32 71.6.147.198/32
+71.6.147.254/32 71.6.154.144/32 71.6.158.166/32 71.6.165.200/32 71.6.167.142/32 71.6.199.23/32 71.6.199.65/32 71.6.199.87/32 71.6.202.219/32
+71.6.233.0/24 74.82.47.0/26 77.67.26.0/24 77.83.207.0/24 77.223.102.84/32 77.223.102.101/32 77.223.102.191/32 77.223.103.45/32 77.223.103.53/32
+77.223.120.227/32 78.232.50.178/32 79.124.58.134/32 79.124.62.10/32 80.82.64.0/22 80.82.68.0/23 80.82.70.0/24 80.82.76.0/22 80.85.152.96/32
+80.93.187.17/32 80.249.131.92/32 81.19.216.64/26 81.19.219.192/26 82.117.255.125/32 82.148.21.205/32 84.75.255.71/32 85.25.43.94/32 85.25.103.50/32
+85.142.100.0/24 85.175.69.50/32 85.175.147.234/32 85.208.84.0/24 85.217.140.0/24 85.217.149.0/24 86.38.187.0/24 86.54.31.32/28 87.236.176.0/24
+88.80.189.24/32 88.202.190.128/27 88.214.50.0/24 89.21.67.128/26 89.37.172.128/27 89.45.35.0/24 89.169.28.191/32 89.169.28.210/32 89.169.28.214/32
+89.248.160.0/21 89.248.168.0/22 89.248.172.0/23 89.248.174.0/24 91.122.177.241/32 91.196.152.0/24 91.230.168.0/24 91.231.89.0/24 92.38.135.119/32
+92.38.153.0/24 92.63.196.0/24 92.124.109.218/32 92.223.103.144/32 93.120.27.62/32 93.123.109.17/32 93.123.109.18/31 93.123.109.20/30 93.123.109.24/29
+93.123.109.32/30 93.123.109.36/31 93.123.109.39/32 93.123.109.40/31 93.123.109.120/30 93.123.109.124/31 93.123.109.219/32 93.174.88.0/21
+94.25.46.114/32 94.26.228.18/32 94.26.228.205/32 94.102.48.0/20 94.183.174.0/24 94.231.206.0/24 95.143.190.169/32 95.143.190.179/32 95.143.191.147/32
+95.143.191.223/32 95.143.191.245/32 95.167.62.66/32 95.167.62.82/32 95.167.82.26/32 95.167.87.66/32 95.167.133.10/32 95.167.148.18/32 95.167.186.2/32
+95.167.197.242/32 95.167.198.186/32 95.167.199.34/32 95.167.199.90/32 95.167.200.10/32 95.189.36.106/32 95.215.0.144/31 96.126.110.54/32
+96.126.112.111/32 96.126.117.80/32 97.107.133.213/32 97.107.136.165/32 97.107.140.120/32 97.107.141.150/32 98.80.4.0/25 98.84.1.175/32
+98.85.37.217/32 98.85.103.176/32 98.88.137.2/32 100.52.158.15/32 101.132.145.132/32 103.16.130.243/32 103.16.131.136/32 103.29.69.181/32
+103.29.70.204/32 103.66.28.0/22 103.203.56.0/22 103.230.157.150/32 104.128.144.201/32 104.128.144.202/31 104.128.144.204/30 104.128.144.208/29
+104.128.144.216/30 104.128.144.220/32 104.152.52.0/24 104.156.155.0/24 104.237.130.38/32 104.237.150.176/32 104.237.151.205/32 104.237.151.244/32
+104.248.206.108/32 107.20.158.220/32 107.21.48.111/32 107.170.65.169/32 107.170.75.78/32 108.132.249.171/32 109.105.208.0/21 109.123.117.224/27
+112.74.38.239/32 128.199.8.140/32 128.199.44.215/32 128.199.182.55/32 128.199.182.77/32 128.199.182.152/32 130.193.25.11/32 134.122.28.88/32
+134.209.25.199/32 134.209.95.237/32 134.209.252.42/32 137.184.13.100/32 137.184.31.185/32 137.184.75.34/32 137.184.78.203/32 137.184.95.216/32
+137.184.112.103/32 137.184.112.192/32 137.184.190.194/32 137.184.190.205/32 137.184.190.246/32 138.68.73.85/32 138.68.82.23/32 138.68.86.32/32
+138.68.144.227/32 138.68.249.116/32 138.197.90.201/32 138.197.101.95/32 138.197.118.33/32 138.197.191.87/32 138.249.120.0/23 138.249.122.0/24
+138.249.124.0/23 139.59.132.8/32 139.59.136.184/32 139.59.143.102/32 139.59.170.85/32 139.59.231.238/32 139.144.235.132/32 139.144.239.72/32
+139.144.239.74/32 139.162.3.141/32 139.162.3.144/32 139.162.8.186/32 139.162.31.7/32 139.162.66.65/32 139.162.70.53/32 139.162.70.102/32
+139.162.71.210/32 139.162.78.6/32 139.162.87.250/32 139.162.96.14/32 139.162.96.81/32 139.162.99.58/32 139.162.109.245/32 139.162.113.212/32
+139.162.116.22/32 139.162.117.40/32 139.162.119.12/32 139.162.119.49/32 139.162.119.51/32 139.162.119.61/32 139.162.119.94/32 139.162.119.146/32
+139.162.119.196/32 139.162.124.188/32 139.162.141.82/32 139.162.155.225/32 139.162.173.209/32 139.162.189.5/32 139.162.251.127/32 142.91.102.186/31
+142.93.0.66/32 142.93.49.93/32 142.93.129.190/32 142.93.135.91/32 142.93.135.160/32 142.93.143.8/32 142.93.146.198/32 143.110.213.72/32
+143.110.217.244/32 143.110.239.2/32 143.198.68.20/32 143.198.115.76/32 143.198.179.104/32 143.198.225.197/32 143.198.238.87/32 143.244.168.161/32
+144.86.173.0/24 144.202.82.88/32 145.220.91.19/32 146.88.240.0/23 146.185.25.160/27 146.190.21.73/32 146.190.63.48/32 146.190.63.248/32
+146.190.69.241/32 146.190.103.103/32 146.190.242.161/32 147.182.149.75/32 147.182.200.94/32 147.182.202.179/32 147.182.225.86/32 147.182.240.244/31
+147.182.240.247/32 147.182.241.81/32 147.182.247.10/32 147.185.132.0/22 148.59.129.0/24 148.153.56.170/32 148.153.56.174/32 148.153.188.246/32
+148.153.188.254/32 148.153.189.62/32 150.107.36.236/32 150.107.38.251/32 151.245.151.0/24 152.32.142.86/32 152.42.136.22/32 154.16.44.0/24
+154.30.3.68/32 154.53.40.98/32 154.70.207.100/32 154.197.56.163/32 157.230.19.140/32 157.230.178.76/32 157.230.220.136/32 157.245.36.108/32
+157.245.72.120/32 157.245.77.56/32 157.245.105.107/32 157.245.113.227/32 157.245.176.143/32 157.245.204.205/32 157.245.222.108/32 157.245.243.118/32
+157.245.245.246/32 157.245.252.5/32 158.94.187.0/24 158.94.218.0/24 159.65.18.197/32 159.65.144.72/32 159.65.193.17/32 159.65.204.129/32
+159.65.206.235/32 159.65.216.50/32 159.65.219.252/32 159.65.224.182/32 159.65.237.176/32 159.89.1.53/32 159.89.12.166/32 159.89.124.112/32
+159.89.127.165/32 159.89.174.87/32 159.195.79.176/32 159.203.96.42/32 159.223.0.20/32 159.223.98.198/32 159.223.132.86/32 159.223.179.74/32
+159.223.203.97/32 159.223.217.240/32 159.223.231.254/32 160.119.70.0/24 160.119.76.40/32 160.119.76.42/32 161.35.51.104/32 161.35.56.30/32
+161.35.70.45/32 161.35.74.94/32 161.35.108.63/32 161.35.145.35/32 161.35.230.3/32 161.35.230.183/32 161.35.236.116/32 161.35.236.158/32
+161.35.238.241/32 162.142.125.0/24 162.216.18.113/32 162.216.148.0/22 162.243.114.171/32 162.243.116.182/32 162.243.208.127/32 163.172.99.21/32
+163.172.99.35/32 163.172.99.60/32 163.172.99.85/32 163.172.99.98/32 163.172.109.18/32 164.68.102.233/32 164.90.176.216/32 164.90.208.56/32
+164.90.228.79/32 164.92.106.15/32 164.92.107.174/32 164.92.114.247/32 164.92.148.118/32 164.92.159.100/32 164.92.182.157/32 164.92.215.178/32
+164.92.219.121/32 164.92.244.132/32 165.22.27.186/32 165.22.34.189/32 165.22.193.223/32 165.22.235.3/32 165.154.23.177/32 165.154.163.10/32
+165.227.39.235/32 165.227.55.4/32 165.227.62.247/32 165.227.84.14/32 165.227.84.134/32 165.227.110.45/32 165.227.172.206/32 165.227.173.41/32
+165.227.188.42/32 165.232.118.73/32 167.71.48.103/32 167.71.81.114/32 167.71.102.95/32 167.71.102.181/32 167.71.110.14/32 167.71.175.236/32
+167.94.138.0/24 167.94.145.0/24 167.94.146.0/24 167.99.1.98/32 167.99.107.57/32 167.99.119.168/32 167.99.181.249/32 167.99.182.39/32
+167.99.210.137/32 167.99.211.88/32 167.99.225.143/32 167.99.234.119/32 167.172.40.9/32 167.172.47.74/32 167.172.148.206/32 167.172.158.128/32
+167.172.183.39/32 167.172.232.142/32 167.248.133.0/24 170.187.163.90/32 170.187.163.117/32 170.187.163.133/32 170.187.165.134/32 170.187.165.139/32
+170.187.165.218/31 170.187.165.242/32 170.231.236.98/32 170.231.237.214/32 172.104.11.4/32 172.104.11.34/32 172.104.11.46/32 172.104.11.51/32
+172.104.19.160/32 172.104.23.19/32 172.104.94.121/32 172.104.94.242/32 172.104.100.117/32 172.104.210.143/32 172.104.211.111/32 172.104.241.92/32
+172.104.241.98/32 172.105.16.34/32 172.105.16.40/32 172.105.16.105/32 172.105.16.117/32 172.105.16.131/32 172.105.102.10/32 172.105.102.42/32
+172.105.128.11/32 172.105.128.12/31 172.105.147.0/24 172.105.158.219/32 172.105.169.180/32 172.105.197.151/32 172.105.208.132/32 172.105.212.74/32
+172.105.218.179/32 172.105.224.72/32 172.105.229.64/32 172.232.20.149/32 172.232.188.177/32 172.232.232.10/32 172.232.232.48/32 172.232.232.169/32
+172.232.232.179/32 172.233.16.50/32 172.233.20.117/32 172.233.28.142/32 172.233.29.203/32 172.233.74.207/32 172.233.135.159/32 172.233.172.43/32
+172.233.190.104/32 172.233.195.143/32 172.234.162.31/32 172.234.162.56/32 172.234.207.202/32 172.234.218.10/32 172.234.246.109/32 172.235.173.150/32
+172.235.181.217/32 172.235.181.226/32 172.236.137.159/32 172.236.233.65/32 172.237.28.61/32 172.237.132.117/32 172.239.4.138/32 172.255.209.23/32
+173.230.145.103/32 173.255.214.145/32 173.255.225.139/32 174.138.40.30/32 175.6.54.250/32 176.9.9.142/32 176.65.134.0/24 176.65.148.0/22
+176.100.243.247/32 176.208.65.146/32 176.208.67.114/32 176.208.69.226/32 176.208.70.162/32 176.208.79.82/32 176.210.118.218/32 176.211.46.130/32
+176.211.47.122/32 176.211.48.242/32 176.211.51.218/32 176.211.56.130/32 176.211.103.178/32 176.211.103.202/32 176.223.188.0/24 178.62.212.177/32
+178.79.148.58/32 178.128.32.203/32 178.128.66.56/32 178.128.66.109/32 178.128.207.138/32 178.128.250.218/32 178.185.133.251/32 178.185.170.42/32
+178.185.202.130/32 178.185.202.162/32 178.185.216.114/32 178.185.228.58/32 178.185.234.162/32 178.185.235.58/32 178.185.235.74/32 178.185.238.154/32
+178.185.238.178/32 178.185.239.50/32 178.185.239.58/32 178.185.241.98/32 178.185.241.114/32 184.105.139.64/26 184.105.247.192/26 184.192.173.246/32
+184.192.188.55/32 184.193.157.254/32 185.2.80.252/31 185.94.111.1/32 185.107.80.93/32 185.114.175.0/24 185.117.225.0/24 185.142.236.34/31
+185.142.236.36/32 185.142.236.38/32 185.142.236.40/31 185.142.236.43/32 185.142.239.16/32 185.154.110.22/32 185.165.190.17/32 185.165.190.34/32
+185.165.191.26/31 185.180.140.0/22 185.191.236.38/32 185.197.182.0/24 185.200.118.32/32 185.200.118.34/31 185.200.118.36/30 185.200.118.40/29
+185.200.118.48/29 185.200.118.56/30 185.200.118.60/32 185.200.118.63/32 185.200.118.64/32 185.200.118.66/31 185.200.118.68/30 185.200.118.72/29
+185.200.118.80/29 185.200.118.88/30 185.200.118.92/32 185.216.145.160/27 185.218.100.133/32 185.223.235.0/26 185.224.228.0/22 185.226.196.0/22
+185.230.223.46/32 185.235.167.0/24 185.238.75.248/32 185.242.226.0/24 185.247.137.0/24 188.68.217.207/32 188.138.9.50/32 188.166.25.133/32
+188.166.75.16/32 188.166.108.93/32 188.240.59.0/26 188.246.224.80/32 190.114.255.238/32 192.46.211.230/32 192.46.221.9/32 192.155.90.118/32
+192.155.90.220/32 192.158.140.0/24 192.165.198.0/24 192.241.179.235/32 193.32.209.224/27 193.47.62.90/31 193.47.62.92/31 193.47.62.110/31
+193.47.62.187/32 193.124.20.224/27 193.163.125.0/24 193.168.46.143/32 193.176.29.0/27 193.176.31.144/28 193.176.31.192/26 193.181.177.0/24
+193.235.193.0/24 194.26.25.137/32 194.50.235.128/27 194.55.238.32/32 194.88.98.80/28 194.88.98.96/27 194.187.176.0/22 195.96.139.0/24
+195.123.244.73/32 195.140.214.16/28 195.144.21.56/32 195.154.107.13/32 195.154.107.191/32 195.154.208.62/32 195.178.110.162/32 195.184.76.0/24
+195.206.182.192/27 195.206.182.224/32 195.209.120.0/22 195.216.154.0/24 198.20.69.74/32 198.20.69.98/32 198.20.70.114/32 198.20.99.130/32
+198.46.182.214/32 198.74.57.47/32 198.74.58.148/32 198.199.123.141/32 198.211.109.100/32 198.235.24.0/24 199.45.154.0/23 199.85.8.144/32
+199.165.159.0/24 199.195.248.205/32 200.138.46.0/24 202.112.47.54/32 202.112.47.150/32 204.44.125.237/32 204.48.24.63/32 204.76.203.0/24
+204.130.133.143/32 204.130.133.193/32 204.188.219.9/32 204.188.254.145/32 204.188.254.146/32 204.188.254.228/32 204.188.254.231/32 205.210.31.0/24
+206.81.12.187/32 206.81.24.74/32 206.81.24.227/32 206.168.32.0/22 206.189.2.13/32 206.189.5.249/32 206.189.19.19/32 206.189.95.232/32
+206.189.225.181/32 206.189.233.36/32 207.90.244.0/24 207.154.197.113/32 207.154.212.47/32 207.244.234.126/32 207.244.235.11/32 207.244.236.30/32
+207.244.249.143/32 207.244.251.12/32 207.244.251.14/32 207.244.251.16/32 208.98.38.114/32 208.98.38.173/32 208.98.38.223/32 208.98.38.229/32
+208.98.38.234/32 209.38.96.38/32 209.38.111.38/32 209.38.208.202/32 209.38.208.214/32 209.38.248.17/32 209.58.160.54/32 209.97.180.8/32
+209.126.86.45/32 209.126.86.46/32 209.126.87.66/32 209.126.87.68/32 209.126.87.70/32 209.126.87.72/31 209.126.87.112/32 209.126.151.114/31
+209.126.151.116/30 209.126.151.120/30 209.126.151.124/31 209.145.53.57/32 209.145.58.124/32 209.145.59.230/32 209.188.108.0/24 209.237.154.0/24
+212.41.10.41/32 212.41.12.45/32 212.41.12.46/31 212.41.12.48/32 212.41.13.23/32 212.41.13.24/31 212.41.26.138/32 212.67.10.218/32 212.67.11.37/32
+212.67.11.128/32 212.67.11.136/32 212.67.11.167/32 212.67.11.227/32 212.67.11.233/32 212.67.11.234/32 212.73.148.0/24 212.83.184.12/30
+212.83.184.16/31 212.83.184.18/32 212.129.7.56/32 212.129.7.154/32 212.129.9.141/32 212.129.10.138/32 212.129.10.245/32 212.129.53.181/32
+212.164.59.250/32 212.192.156.0/22 213.32.122.80/28 213.59.217.242/32 213.166.84.32/27 213.219.38.113/32 216.25.88.0/21 216.25.124.0/24
+216.31.0.17/32 216.31.13.40/30 216.117.2.176/28 216.180.246.0/24 216.218.206.64/26 217.12.206.132/32 217.21.193.74/32 217.60.197.0/24 217.60.241.0/24
+217.60.250.0/24 217.65.82.18/32 217.146.80.96/27 222.186.13.130/32
+GS_BUILTIN_SCANNERS
+  # Never block: Yandex (AS13238), Yandex.Cloud (AS200350), Yandex Cloud CDN edges (AS215013), Cloudflare
+  tr ' ' '\n' >"$d/builtin-never.txt" <<'GS_BUILTIN_NEVER'
+5.45.192.0/18 5.255.192.0/18 31.44.8.0/21 37.9.64.0/18 37.140.128.0/18 37.230.168.0/23 37.230.172.0/22 46.21.244.0/22 46.243.210.0/23 51.250.0.0/17
+62.84.112.0/20 77.88.0.0/18 81.26.176.0/20 84.201.128.0/18 84.252.128.0/20 84.252.160.0/19 87.250.224.0/19 89.104.112.0/23 89.169.128.0/18
+89.223.9.0/24 89.232.188.0/23 92.255.1.0/24 92.255.3.0/24 92.255.13.0/24 92.255.15.0/24 92.255.112.0/20 93.77.160.0/19 93.158.128.0/18
+94.131.190.0/23 95.108.128.0/17 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 103.76.52.0/22 104.16.0.0/13 104.24.0.0/14 108.162.192.0/18
+111.88.144.0/20 111.88.240.0/20 130.193.32.0/19 131.0.72.0/22 141.8.128.0/18 141.101.64.0/18 153.51.32.0/19 153.51.96.0/19 153.51.160.0/19
+158.160.0.0/16 162.158.0.0/15 172.64.0.0/13 173.245.48.0/20 178.154.128.0/17 185.32.187.0/24 185.206.164.0/22 188.72.103.0/24 188.72.104.0/23
+188.72.110.0/23 188.72.112.0/23 188.114.96.0/20 190.93.240.0/20 193.32.216.0/22 194.247.51.0/24 197.234.240.0/22 198.41.128.0/17 213.130.80.0/21
+213.165.192.0/19 213.180.192.0/19 217.28.224.0/20 217.198.168.0/21
+GS_BUILTIN_NEVER
+  # RU mobile operators (MTS 8359, MegaFon 31133/25159/31213/31163, Beeline 16345/3216, T2 15378/12958):
+  # reputation lists often contain their CGNAT addresses → thousands of real clients behind one IP.
+  tr ' ' '\n' >"$d/builtin-mobile-ru.txt" <<'GS_BUILTIN_MOBILE'
+2.95.0.0/16 5.144.96.0/19 5.189.208.0/21 5.227.0.0/17 5.227.160.0/23 5.227.162.0/24 5.227.164.0/22 5.227.170.0/23 31.13.144.0/21 31.15.80.0/20
+31.29.144.0/23 31.29.146.0/24 31.29.150.0/23 31.29.177.0/24 31.40.112.0/20 31.131.92.0/22 31.173.0.0/16 37.9.240.0/22 37.9.244.0/23 37.9.247.0/24
+37.28.160.0/19 37.29.0.0/17 37.139.192.0/18 37.208.96.0/21 37.208.120.0/21 37.230.245.0/24 45.141.92.0/24 46.16.64.0/21 46.16.96.0/21 46.20.176.0/20
+46.23.184.0/21 46.42.128.0/18 46.148.240.0/20 46.229.128.0/20 46.232.164.0/22 46.232.200.0/21 46.237.40.0/22 46.250.52.0/22 46.250.64.0/19
+62.5.128.0/17 62.64.0.0/19 62.89.194.0/24 62.105.44.0/22 62.105.48.0/20 62.105.128.0/19 62.113.88.0/24 62.118.0.0/16 62.141.64.0/18 62.152.64.0/19
+62.168.224.0/19 62.182.136.0/21 62.220.48.0/21 62.231.0.0/19 66.90.90.0/23 66.90.92.0/23 66.90.95.0/24 66.90.96.0/24 66.90.108.0/23 66.90.121.0/24
+66.90.122.0/24 77.41.142.0/23 77.41.144.0/20 77.41.160.0/19 77.41.248.0/21 77.43.128.0/17 77.66.128.0/17 77.105.187.0/24 77.106.196.0/23
+77.220.60.0/22 77.239.192.0/19 78.25.64.0/18 78.107.56.0/24 78.107.67.0/24 78.107.124.0/24 78.109.47.0/24 78.153.0.0/19 78.159.239.0/24 79.104.0.0/17
+79.104.192.0/19 79.111.120.0/24 79.111.122.0/24 79.120.30.0/24 79.120.102.0/24 79.120.104.0/24 79.120.106.0/24 79.120.112.0/24 79.143.238.0/23
+79.171.115.0/24 79.171.208.0/24 80.80.96.0/19 80.83.225.0/24 80.83.228.0/22 80.83.232.0/23 80.83.234.0/24 80.83.236.0/22 80.243.73.0/24
+80.243.78.0/23 80.253.10.0/24 80.253.12.0/22 80.255.129.0/24 80.255.130.0/23 80.255.132.0/23 80.255.134.0/24 80.255.136.0/21 80.255.144.0/23
+80.255.147.0/24 80.255.148.0/22 80.255.153.0/24 80.255.154.0/23 80.255.158.0/24 81.9.0.0/17 81.23.160.0/20 81.91.32.0/19 81.177.72.0/21 81.195.0.0/16
+81.201.16.0/20 81.211.0.0/17 81.222.0.0/17 81.222.129.0/24 81.222.144.0/20 81.222.176.0/22 81.222.180.0/23 81.222.182.0/24 81.222.184.0/21
+81.222.196.0/23 81.222.202.0/24 81.222.204.0/23 81.222.218.0/23 81.222.221.0/24 81.222.228.0/24 81.222.244.0/23 81.222.249.0/24 82.96.192.0/18
+82.142.128.0/18 82.149.128.0/19 82.204.128.0/17 83.102.132.0/24 83.102.160.0/24 83.136.24.0/21 83.149.0.0/18 83.169.192.0/18 83.220.224.0/22
+83.220.232.0/21 83.220.240.0/20 83.222.212.0/22 83.222.216.0/21 83.229.211.0/24 83.237.0.0/16 83.242.128.0/17 84.17.0.0/19 84.204.0.0/16
+85.21.54.0/24 85.21.223.0/24 85.26.128.0/17 85.115.236.0/22 85.115.243.0/24 85.115.246.0/24 85.115.248.0/23 85.115.252.0/22 85.140.0.0/15
+85.235.32.0/19 85.235.160.0/19 85.249.16.0/20 85.249.128.0/19 85.249.160.0/20 85.249.230.0/24 85.249.244.0/23 85.249.252.0/23 87.229.142.0/23
+87.229.144.0/23 87.229.176.0/21 87.229.186.0/23 87.229.192.0/21 87.229.204.0/22 87.229.208.0/20 87.229.224.0/19 87.254.132.0/23 89.22.188.0/22
+89.31.184.0/21 89.106.192.0/21 89.107.194.0/23 89.112.128.0/17 89.113.0.0/20 89.113.24.0/21 89.113.32.0/19 89.113.96.0/21 89.113.120.0/21
+89.113.144.0/20 89.113.192.0/18 89.169.80.0/20 89.175.0.0/16 89.178.203.0/24 89.178.236.0/24 89.249.144.0/20 89.251.111.0/24 91.76.0.0/18
+91.76.215.0/24 91.76.216.0/21 91.77.0.0/16 91.78.0.0/15 91.143.48.0/20 91.185.76.0/22 91.185.87.0/24 91.193.176.0/22 91.195.210.0/23 91.205.168.0/22
+91.216.147.0/24 91.223.226.0/24 92.36.0.0/17 92.38.42.0/24 92.39.64.0/20 92.39.208.0/20 92.43.184.0/21 92.246.200.0/22 92.246.216.0/22
+92.246.222.0/23 93.90.224.0/20 93.189.48.0/21 94.25.128.0/17 94.72.0.0/18 94.77.128.0/18 94.140.128.0/19 94.229.232.0/24 94.232.11.0/24
+94.232.14.0/23 94.243.0.0/19 94.243.32.0/20 94.243.48.0/22 94.243.52.0/23 94.243.56.0/23 95.25.120.0/21 95.25.128.0/18 95.25.204.0/22 95.25.208.0/21
+95.26.0.0/21 95.26.8.0/22 95.26.160.0/21 95.26.168.0/22 95.26.174.0/23 95.26.176.0/21 95.26.184.0/23 95.26.192.0/22 95.26.208.0/21 95.26.228.0/22
+95.26.232.0/22 95.26.236.0/23 95.27.0.0/21 95.27.8.0/22 95.27.68.0/22 95.27.72.0/21 95.27.80.0/22 95.27.84.0/23 95.27.188.0/22 95.30.0.0/16
+95.31.56.0/22 95.31.64.0/22 95.31.119.0/24 95.31.120.0/22 95.64.128.0/17 95.104.128.0/17 95.139.0.0/17 95.141.225.0/24 95.141.227.0/24
+95.141.228.0/22 95.141.232.0/21 95.153.128.0/17 95.169.128.0/19 95.215.248.0/22 95.220.224.0/21 95.221.0.0/20 109.71.200.0/21 109.94.176.0/20
+109.95.160.0/21 109.95.228.0/23 109.105.64.0/19 109.106.192.0/19 109.161.56.0/24 109.170.68.0/24 109.170.92.0/24 109.170.96.0/23 109.170.98.0/24
+109.170.107.0/24 109.188.0.0/16 109.196.16.0/20 109.196.192.0/20 109.197.200.0/21 109.198.224.0/19 109.201.64.0/21 109.236.96.0/20 128.70.0.0/15
+128.74.248.0/22 128.75.224.0/19 128.140.164.0/24 128.140.166.0/24 128.204.64.0/23 128.204.66.0/24 128.204.70.0/23 128.204.72.0/21 130.49.216.0/23
+139.181.32.0/24 141.101.232.0/24 141.105.24.0/21 176.14.0.0/16 176.15.0.0/17 176.15.128.0/21 176.15.136.0/23 176.15.140.0/22 176.15.144.0/24
+176.15.148.0/22 176.15.161.0/24 176.15.162.0/23 176.15.164.0/22 176.15.168.0/21 176.15.176.0/21 176.15.185.0/24 176.15.186.0/23 176.15.188.0/22
+176.15.192.0/20 176.15.208.0/21 176.15.216.0/23 176.15.220.0/22 176.15.240.0/20 176.52.52.0/22 176.52.56.0/22 176.52.80.0/21 176.59.0.0/18
+176.59.160.0/19 176.118.8.0/21 176.118.16.0/20 176.192.22.0/24 176.192.50.0/24 176.192.75.0/24 176.192.116.0/24 176.193.72.0/21 176.222.16.0/23
+176.222.200.0/21 176.241.96.0/21 178.72.64.0/18 178.141.0.0/16 178.155.0.0/17 178.157.128.0/18 178.159.16.0/20 178.176.0.0/14 178.216.216.0/21
+178.217.40.0/21 185.3.32.0/22 185.4.144.0/22 185.12.208.0/23 185.35.192.0/22 185.59.137.0/24 185.59.138.0/23 185.103.26.0/23 185.132.20.0/22
+185.138.206.0/23 185.168.236.0/22 185.190.166.0/24 185.210.140.0/23 185.224.96.0/22 185.242.16.0/22 188.65.241.0/24 188.65.242.0/23 188.65.244.0/22
+188.66.32.0/22 188.66.38.0/23 188.75.192.0/18 188.94.168.0/21 188.162.0.0/16 188.170.0.0/16 188.191.86.0/23 188.191.240.0/21 192.162.0.0/22
+193.8.211.0/24 193.22.148.0/22 193.104.128.0/24 193.169.118.0/23 193.189.68.0/23 193.201.228.0/22 193.228.164.0/22 193.232.55.0/24 194.32.223.0/24
+194.33.81.0/24 194.67.0.0/18 194.85.128.0/19 194.126.203.0/24 194.154.64.0/19 194.186.0.0/16 195.7.160.0/19 195.16.32.0/19 195.16.96.0/19
+195.19.217.0/24 195.34.0.0/18 195.42.64.0/19 195.46.160.0/19 195.58.3.0/24 195.62.54.0/23 195.68.128.0/18 195.96.64.0/19 195.122.224.0/19
+195.131.128.0/18 195.151.22.0/24 195.190.96.0/19 195.191.18.0/23 195.209.160.0/20 195.210.128.0/18 195.218.128.0/17 195.222.160.0/19 195.230.70.0/23
+195.230.91.0/24 195.230.92.0/24 195.239.0.0/16 212.13.26.0/24 212.30.128.0/18 212.44.128.0/19 212.45.247.0/24 212.46.192.0/18 212.48.32.0/19
+212.48.135.0/24 212.48.144.0/23 212.48.150.0/24 212.48.152.0/23 212.48.154.0/24 212.48.158.0/23 212.69.96.0/19 212.77.128.0/19 212.109.208.0/21
+212.119.192.0/18 212.188.0.0/17 212.248.0.0/17 213.27.0.0/17 213.33.128.0/17 213.87.0.0/16 213.108.128.0/23 213.147.32.0/19 213.154.160.0/19
+213.176.228.0/22 213.221.0.0/18 213.242.220.0/24 213.243.109.0/24 213.243.116.0/24 217.8.224.0/20 217.15.137.0/24 217.15.156.0/24 217.19.112.0/20
+217.20.64.0/20 217.66.148.0/22 217.66.152.0/21 217.69.192.0/19 217.74.240.0/20 217.118.64.0/24 217.118.66.0/24 217.118.68.0/22 217.118.72.0/21
+217.118.81.0/24 217.118.82.0/23 217.118.84.0/22 217.118.88.0/22 217.118.92.0/23 217.118.95.0/24 217.169.82.0/23 217.169.84.0/22 217.169.88.0/21
+217.173.24.0/22 217.195.212.0/23 217.195.216.0/23 217.195.219.0/24
+GS_BUILTIN_MOBILE
+  # VK / MAX / OK / mail.ru networks (C24Be blacklist-vk + AS47541/47764/28709/49797/60863):
+  # MAX «HOST_REACHABILITY» reports the exit IP of VPN users → RKN. Outbound NEW only (snitch guard).
+  tr ' ' '\n' >"$d/builtin-snitch.txt" <<'GS_BUILTIN_SNITCH'
+5.61.16.0/21 5.61.232.0/21 5.101.40.0/22 5.181.60.0/22 5.188.140.0/22 31.177.104.0/22 37.139.32.0/22 37.139.40.0/22 45.84.128.0/22 45.136.20.0/22
+62.217.160.0/20 79.137.132.0/24 79.137.139.0/24 79.137.142.0/24 79.137.157.0/24 79.137.164.0/24 79.137.167.0/24 79.137.174.0/23 79.137.180.0/24
+79.137.183.0/24 79.137.240.0/21 81.177.12.0/24 81.177.31.64/26 83.166.232.0/21 83.166.248.0/21 83.217.216.0/22 83.222.28.0/22 84.23.52.0/22
+85.114.31.108/30 85.142.115.0/24 85.192.32.0/22 85.198.106.0/23 87.239.104.0/21 87.240.128.0/18 87.242.112.0/22 89.208.84.0/22 89.208.196.0/22
+89.208.208.0/22 89.208.216.0/21 89.208.228.0/22 89.221.228.0/22 89.221.232.0/21 90.156.148.0/22 90.156.212.0/22 90.156.216.0/22 90.156.232.0/21
+91.219.224.0/22 91.231.132.0/22 91.237.76.0/24 92.38.217.0/24 93.153.255.84/30 93.186.224.0/20 94.100.176.0/20 94.139.244.0/22 95.142.192.0/20
+95.163.32.0/19 95.163.133.0/24 95.163.180.0/22 95.163.208.0/21 95.163.216.0/22 95.163.248.0/21 95.213.0.0/17 109.120.180.0/22 109.120.188.0/22
+128.140.168.0/21 130.49.224.0/19 138.16.192.0/20 138.16.240.0/20 146.185.208.0/22 146.185.240.0/22 155.212.192.0/20 160.5.208.0/20 161.104.104.0/21
+168.113.128.0/20 176.112.168.0/21 178.22.88.0/21 178.237.16.0/20 185.5.136.0/22 185.6.244.0/22 185.16.148.0/22 185.16.244.0/22 185.29.128.0/22
+185.32.248.0/22 185.86.144.0/22 185.100.104.0/22 185.130.112.0/22 185.131.68.0/22 185.180.200.0/22 185.187.63.0/24 185.226.52.0/22 185.241.192.0/22
+188.93.56.0/21 193.203.40.0/22 194.84.16.12/30 194.186.63.0/24 195.211.20.0/22 195.218.190.0/23 195.239.247.0/24 212.111.84.0/22 212.233.72.0/21
+212.233.88.0/21 212.233.96.0/22 212.233.120.0/22 213.219.212.0/22 217.16.16.0/20 217.20.144.0/20 217.69.128.0/20 217.174.188.0/22
+GS_BUILTIN_SNITCH
+  sed -i '/^$/d' "$d"/builtin-*.txt 2>/dev/null || true
+}
 
 install_blocklist() {
   if [[ "$DO_BLOCKLIST" -eq 0 ]]; then
     warn "Skipping scanner blocklist (--no-blocklist)"
     return 0
   fi
-  step "Scanner blocklist (ipset + mirrors + weekly timer)"
+  step "Списки: сканеры (все порты) · репутация (только SSH) · VK/MAX (исходящие) — ipset + ежедневное обновление"
 
   if [[ "$DRY_RUN" -eq 1 ]]; then
-    printf '%b[DRY]%b install /usr/local/sbin/scanner-block-refresh.sh (mirrors + parallel)\n' "${C_YEL}" "${C_RESET}"
-    printf '%b[DRY]%b never-block + --blocklist-from fallback\n' "${C_YEL}" "${C_RESET}"
+    printf '%b[DRY]%b install /usr/local/sbin/scanner-block-refresh.sh (OpenFilters all feeds + Skipa + scanner ASNs; builtin offline fallback)\n' "${C_YEL}" "${C_RESET}"
+    printf '%b[DRY]%b ipsets: scanner-block(+6) all ports · gorecshit-rep SSH only · gorecshit-snitch outbound; never-block Yandex/CF/RU-mobile\n' "${C_YEL}" "${C_RESET}"
     return 0
   fi
 
   mkdir -p /etc/scanner-block
-  backup_file /usr/local/sbin/scanner-block-refresh.sh
-  backup_file /etc/systemd/system/scanner-block.service
-  backup_file /etc/systemd/system/scanner-block-refresh.service
-  backup_file /etc/systemd/system/scanner-block-refresh.timer
-  backup_file /etc/scanner-block/never-block.txt
+  local f
+  for f in /usr/local/sbin/scanner-block-refresh.sh /etc/systemd/system/scanner-block.service \
+           /etc/systemd/system/scanner-block-refresh.service /etc/systemd/system/scanner-block-refresh.timer \
+           /etc/scanner-block/never-block.txt; do
+    backup_file "$f"
+  done
   if [[ -n "$BLOCKLIST_FROM" ]]; then
     printf '%s\n' "$BLOCKLIST_FROM" >/etc/scanner-block/blocklist-from.conf
   fi
+  _write_builtin_lists
 
   {
-    echo "# Managed by ${SCRIPT_NAME} — never include these in scanner-block"
+    echo "# Managed by ${SCRIPT_NAME} ${VERSION} — never include these in any gorecshit ipset"
     echo "$PANEL_IP"
     if [[ -n "$SSH_CLIENT_IP" ]]; then echo "$SSH_CLIENT_IP"; fi
     local a
     while IFS= read -r a; do echo "$a"; done < <(foreach_csv_ip "$ALLOW_SSH_FROM")
     while IFS= read -r a; do echo "$a"; done < <(foreach_csv_ip "$RELAY_IPS")
-    echo "10.0.0.0/8"
-    echo "172.16.0.0/12"
-    echo "192.168.0.0/16"
-    echo "127.0.0.0/8"
-    echo "169.254.0.0/16"
-    # Yandex / common CDN edge (harmless if unused)
-    echo "5.45.192.0/18"
-    echo "5.255.192.0/18"
-    echo "37.9.64.0/18"
-    echo "37.140.128.0/18"
-    echo "77.88.0.0/18"
-    echo "87.250.224.0/19"
-    echo "93.158.128.0/18"
-    echo "95.108.128.0/17"
-    echo "141.8.128.0/18"
-    echo "178.154.128.0/17"
-    echo "213.180.192.0/19"
-    echo "185.32.186.0/23"
-    echo "185.32.184.0/22"
+    printf '%s\n' 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 127.0.0.0/8 169.254.0.0/16 100.64.0.0/10
+    # Yandex Cloud CDN edges (AS215013) — CDN-нода умрёт, если их заблокировать
+    printf '%s\n' 188.72.96.0/19 89.223.9.0/24 94.131.190.0/23
+    # Yandex core (legacy entries kept)
+    printf '%s\n' 5.45.192.0/18 5.255.192.0/18 37.9.64.0/18 37.140.128.0/18 77.88.0.0/18 87.250.224.0/19 \
+      93.158.128.0/18 95.108.128.0/17 141.8.128.0/18 178.154.128.0/17 213.180.192.0/19 185.32.184.0/22
+    # this server's own addresses
+    ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1
   } >/etc/scanner-block/never-block.txt
 
   cat >/usr/local/sbin/scanner-block-refresh.sh <<'REFRESH_EOF'
 #!/bin/bash
-set -euo pipefail
-# Refresh scanner-block ipset. Safe failure: keep old list if download fails.
-# Mirrors: raw.githubusercontent.com → cdn.jsdelivr.net/gh → fastly.jsdelivr.net/gh
-# Timeouts: connect 8s, max 20s. Parallel downloads. --blocklist-from fallback.
-# --local-only: only load /etc/scanner-block/blocklist.txt (boot path)
-
+# gorecshit scanner-block refresh (v2.7.0). Safe: on any failure keeps the previous lists;
+# with no internet/DNS uses built-in lists. --local-only: just (re)load ipsets from disk (boot path).
+set -uo pipefail
 LOCAL_ONLY=0
 [ "${1:-}" = "--local-only" ] && LOCAL_ONLY=1
 
 DIR=/etc/scanner-block
-LIST="$DIR/blocklist.txt"
-TMP="$DIR/blocklist.txt.new"
-NEVER="$DIR/never-block.txt"
+LIST="$DIR/blocklist.txt"            # scanners v4  → DROP NEW on all ports
+LIST6="$DIR/blocklist6.txt"          # scanners v6  → DROP NEW on all ports
+REP="$DIR/reputation.txt"            # attackers v4 → DROP NEW on SSH only (never on client ports)
+SNITCH="$DIR/snitch.txt"             # VK/MAX v4    → REJECT outbound NEW (netguard)
+
+NEVER_DYN="$DIR/never-dynamic.txt"
+MOB_DYN="$DIR/mobile-ru-dynamic.txt"
 FROM_CONF="$DIR/blocklist-from.conf"
-SET=scanner-block
-CONNECT_TIMEOUT=8
-MAX_TIME=20
+CT=8
+MT=25
 mkdir -p "$DIR"
 
+log() { echo "[scanner-block] $*"; }
+
+OF_V4_FALLBACK="a10networks academyforinternetresearch adscore agentcensus alphastrike apcosys binaryedge bitsight bufferoverrun censys criminalip crowdstrikefalconsurface cybcube cybergreen cyberok cyberresilience cypex dataplane deepfield detectify driftnet edgewatch eset flowiq fofa forestengine groupib hackertarget hadrian hunter infrawatch internetmeasurementresearch internetmetrics internetresearchproject internettl intrinsec intruder ipinfo ipip ki3 knoq leakix mandiantasm modat netlas netscout odin onlyscans onyphe other paloaltonetworks pocnroll probethenet quake rapid7 recordedfuture recyber researchscanner rootevidence securityresearch shadowforce shadowserver shodan silentpush strechoid synthient tenableasm tttx universities virustotal visionheight xmco zern zoomeye"
+OF_V6_FALLBACK="alphastrike apcosys binaryedge bitsight censys dataplane deepfield driftnet forestengine hadrian infrawatch internetmeasurementresearch ipinfo leakix onyphe other paloaltonetworks rapid7 shadowserver shodan tenableasm universities"
+SCANNER_ASNS="209334 398324 398705 398722 211298 213412 202425 51396"
+NEVER_ASNS="13238 200350 215013"
+MOBILE_ASNS="8359 31133 25159 31213 31163 16345 3216 15378 12958"
+SNITCH_ASNS="47541 47764 28709 49797 60863"
+
 js_mirrors() {
-  # js_mirrors <github_raw_url> → prints mirror URLs (jsdelivr) then original
   local url="$1"
-  local owner repo ref path
   if [[ "$url" =~ ^https://raw\.githubusercontent\.com/([^/]+)/([^/]+)/([^/]+)/(.*)$ ]]; then
-    owner="${BASH_REMATCH[1]}"; repo="${BASH_REMATCH[2]}"; ref="${BASH_REMATCH[3]}"; path="${BASH_REMATCH[4]}"
-    echo "https://cdn.jsdelivr.net/gh/${owner}/${repo}@${ref}/${path}"
-    echo "https://fastly.jsdelivr.net/gh/${owner}/${repo}@${ref}/${path}"
+    echo "https://cdn.jsdelivr.net/gh/${BASH_REMATCH[1]}/${BASH_REMATCH[2]}@${BASH_REMATCH[3]}/${BASH_REMATCH[4]}"
+    echo "https://fastly.jsdelivr.net/gh/${BASH_REMATCH[1]}/${BASH_REMATCH[2]}@${BASH_REMATCH[3]}/${BASH_REMATCH[4]}"
   fi
   echo "$url"
 }
-
 fetch_one() {
-  # fetch_one <outdir> <name> <url...>  (tries each URL)
-  local outdir="$1" name="$2"; shift 2
-  local u
+  # fetch_one <outfile> <url...>
+  local out="$1" u; shift
   for u in "$@"; do
-    if curl -fsSL --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TIME" -o "${outdir}/${name}" "$u" 2>/dev/null; then
-      return 0
+    if curl -fsSL --connect-timeout "$CT" --max-time "$MT" -o "$out.part" "$u" 2>/dev/null && [ -s "$out.part" ]; then
+      mv -f "$out.part" "$out"; return 0
     fi
   done
-  return 1
+  rm -f "$out.part"; return 1
 }
-
-fetch_gh() {
-  # fetch_gh <outdir> <name> <raw_github_url>
-  local outdir="$1" name="$2" raw="$3"
-  local urls
-  mapfile -t urls < <(js_mirrors "$raw")
-  fetch_one "$outdir" "$name" "${urls[@]}"
+fetch_gh() { local out="$1" raw="$2" urls; mapfile -t urls < <(js_mirrors "$raw"); fetch_one "$out" "${urls[@]}"; }
+ripe_prefixes() {
+  # ripe_prefixes <outfile> <asn...>  → announced v4+v6 prefixes (RIPEstat, no key)
+  local out="$1" as; shift
+  : >"$out.part"
+  for as in "$@"; do
+    curl -fsS --connect-timeout "$CT" --max-time "$MT" \
+      "https://stat.ripe.net/data/announced-prefixes/data.json?resource=AS${as}&sourceapp=gorecshit" 2>/dev/null \
+      | grep -oE '"prefix": *"[^"]+"' | sed -E 's/.*"([^"]+)"$/\1/' >>"$out.part" || true
+  done
+  if [ -s "$out.part" ]; then mv -f "$out.part" "$out"; return 0; fi
+  rm -f "$out.part"; return 1
 }
-
 import_from_source() {
-  # import_from_source <src> → writes LIST if successful
-  local src="$1"
-  local dest="$LIST.from"
-  if [[ -z "$src" ]]; then return 1; fi
+  local src="$1" dest="$2"
+  [ -n "$src" ] || return 1
   if [[ "$src" =~ ^https?:// ]]; then
-    curl -fsSL --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TIME" -o "$dest" "$src" || return 1
-  elif [[ -f "$src" ]]; then
-    cp -a "$src" "$dest" || return 1
+    curl -fsSL --connect-timeout "$CT" --max-time "$MT" -o "$dest" "$src" || return 1
+  elif [ -f "$src" ]; then
+    cp -f "$src" "$dest" || return 1
   else
-    # treat as SSH host: copy remote /etc/scanner-block/blocklist.txt
-    scp -o ConnectTimeout=12 -o StrictHostKeyChecking=accept-new \
-      "root@${src}:/etc/scanner-block/blocklist.txt" "$dest" 2>/dev/null || \
-    scp -o ConnectTimeout=12 -o StrictHostKeyChecking=accept-new \
-      "${src}:/etc/scanner-block/blocklist.txt" "$dest" 2>/dev/null || return 1
+    scp -o ConnectTimeout=12 -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+      "root@${src}:/etc/scanner-block/blocklist.txt" "$dest" 2>/dev/null || return 1
   fi
-  if [[ -s "$dest" ]]; then
-    grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$' "$dest" | sort -u >"$TMP.raw" || true
-    if [[ -s "$TMP.raw" ]]; then
-      echo "IMPORTED from $src ($(wc -l <"$TMP.raw") lines)"
-      return 0
-    fi
-  fi
-  return 1
+  [ -s "$dest" ]
 }
 
-download_lists() {
-  local tmpdir
-  tmpdir=$(mktemp -d)
-  # shellcheck disable=SC2064
-  trap 'rm -rf "$tmpdir"' RETURN
-  local ok=0
-  local pids=()
-
-  download_job() {
-    local name="$1"; shift
-    if fetch_one "$tmpdir" "$name" "$@"; then
-      echo OK >"${tmpdir}/${name}.ok"
-    fi
-  }
-
-  # OpenFilters scanner CIDRs (GitHub + jsDelivr mirrors)
-  local BASE_RAW="https://raw.githubusercontent.com/OpenFilters/internet-scanners/main/cidr"
-  local f
-  for f in censys_v4.txt shodan_v4.txt binaryedge_v4.txt shadowserver_v4.txt driftnet_v4.txt \
-    paloaltonetworks_v4.txt rapid7_v4.txt onyphe_v4.txt bitsight_v4.txt leakix_v4.txt cyberok_v4.txt \
-    netlas_v4.txt zoomeye_v4.txt quake_v4.txt fofa_v4.txt hunter_v4.txt criminalip_v4.txt \
-    internetmeasurementresearch_v4.txt researchscanner_v4.txt alphastrike_v4.txt \
-    cyberresilience_v4.txt cybcube_v4.txt detectify_v4.txt hackertarget_v4.txt other_v4.txt; do
-    (
-      mapfile -t urls < <(js_mirrors "$BASE_RAW/$f")
-      fetch_one "$tmpdir" "$f" "${urls[@]}" && echo OK >"${tmpdir}/${f}.ok"
-    ) &
-    pids+=($!)
+download_all() {
+  local T="$1" n jobs=0
+  mkdir -p "$T/scan" "$T/scan6" "$T/rep" "$T/snitch" "$T/meta"
+  # OpenFilters feed names: discover live (new scanners appear often), else built-in names
+  local v4="$OF_V4_FALLBACK" v6="$OF_V6_FALLBACK" api
+  api="$(curl -fsS --connect-timeout "$CT" --max-time "$MT" https://api.github.com/repos/OpenFilters/internet-scanners/contents/cidr 2>/dev/null \
+        || curl -fsS --connect-timeout "$CT" --max-time "$MT" 'https://data.jsdelivr.com/v1/packages/gh/OpenFilters/internet-scanners@main?structure=flat' 2>/dev/null || true)"
+  if [ -n "$api" ]; then
+    local l4 l6
+    l4="$(printf '%s' "$api" | grep -oE '[a-z0-9_-]+_v4\.txt' | sed 's/_v4\.txt$//' | sort -u | tr '\n' ' ')"
+    l6="$(printf '%s' "$api" | grep -oE '[a-z0-9_-]+_v6\.txt' | sed 's/_v6\.txt$//' | sort -u | tr '\n' ' ')"
+    [ -n "$l4" ] && v4="$l4"
+    [ -n "$l6" ] && v6="$l6"
+  fi
+  local BASE="https://raw.githubusercontent.com/OpenFilters/internet-scanners/main/cidr"
+  for n in $v4; do
+    fetch_gh "$T/scan/of_$n.txt" "$BASE/${n}_v4.txt" &
+    jobs=$((jobs+1)); [ $((jobs % 12)) -eq 0 ] && wait
   done
-
-  # Extra verified sources (2026-11-01 curl-checked; 404s dropped)
-  (
-    mapfile -t urls < <(js_mirrors "https://raw.githubusercontent.com/tread-lightly/CyberOK_Skipa_ips/main/lists/skipa_cidr.txt")
-    fetch_one "$tmpdir" "cyberok-skipa.txt" "${urls[@]}" && echo OK >"${tmpdir}/cyberok-skipa.txt.ok"
-  ) &
-  pids+=($!)
-  (
-    mapfile -t urls < <(js_mirrors "https://raw.githubusercontent.com/shadow-netlab/traffic-guard-lists/main/public/antiscanner.list")
-    fetch_one "$tmpdir" "antiscanner.list" "${urls[@]}" && echo OK >"${tmpdir}/antiscanner.list.ok"
-  ) &
-  pids+=($!)
-  (
-    mapfile -t urls < <(js_mirrors "https://raw.githubusercontent.com/Xorlent/Internet-Scanners/main/censys.txt")
-    fetch_one "$tmpdir" "xorlent-censys.txt" "${urls[@]}" && echo OK >"${tmpdir}/xorlent-censys.txt.ok"
-  ) &
-  pids+=($!)
+  for n in $v6; do
+    fetch_gh "$T/scan6/of_$n.txt" "$BASE/${n}_v6.txt" &
+    jobs=$((jobs+1)); [ $((jobs % 12)) -eq 0 ] && wait
+  done
+  wait
+  # RU scanners (CyberOK Skipa, RU state networks), community anti-scanner list
+  fetch_gh "$T/scan/skipa.txt" https://raw.githubusercontent.com/tread-lightly/CyberOK_Skipa_ips/main/lists/skipa_cidr.txt &
+  fetch_gh "$T/scan/antiscanner.txt" https://raw.githubusercontent.com/shadow-netlab/traffic-guard-lists/main/public/antiscanner.list &
+  fetch_gh "$T/scan/c24be_gov.txt" https://raw.githubusercontent.com/C24Be/AS_Network_List/main/blacklists/blacklist-v4.txt &
+  fetch_gh "$T/snitch/c24be_vk.txt" https://raw.githubusercontent.com/C24Be/AS_Network_List/main/blacklists/blacklist-vk-v4.txt &
   for n in stretchoid binaryedge shadowserver censys internet-measurement.com; do
-    (
-      fetch_one "$tmpdir" "wdes-$n.txt" "https://security.wdes.eu/scanners/$n.txt" && echo OK >"${tmpdir}/wdes-$n.txt.ok"
-    ) &
-    pids+=($!)
+    fetch_one "$T/scan/wdes-$n.txt" "https://security.wdes.eu/scanners/$n.txt" &
   done
-  for n in stretchoid censys binaryedge shadowserver; do
-    (
-      mapfile -t urls < <(js_mirrors "https://raw.githubusercontent.com/Xorlent/Internet-Scanners/main/$n.txt")
-      fetch_one "$tmpdir" "xorlent-$n.txt" "${urls[@]}" && echo OK >"${tmpdir}/xorlent-$n.txt.ok"
-    ) &
-    pids+=($!)
-  done
-
-  # FireHOL level1/level2 (iplists + github mirrors). Filtered by never-block + prefixlen.
-  (
-    fetch_one "$tmpdir" "firehol_level1.netset" \
-      "https://iplists.firehol.org/files/firehol_level1.netset" \
-      "https://cdn.jsdelivr.net/gh/firehol/blocklist-ipsets@master/firehol_level1.netset" \
-      "https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/firehol_level1.netset" \
-      && echo OK >"${tmpdir}/firehol_level1.netset.ok"
-  ) &
-  pids+=($!)
-  (
-    fetch_one "$tmpdir" "firehol_level2.netset" \
-      "https://iplists.firehol.org/files/firehol_level2.netset" \
-      "https://cdn.jsdelivr.net/gh/firehol/blocklist-ipsets@master/firehol_level2.netset" \
-      "https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/firehol_level2.netset" \
-      && echo OK >"${tmpdir}/firehol_level2.netset.ok"
-  ) &
-  pids+=($!)
-
-  # Spamhaus DROP/EDROP (official + github mirror)
-  (
-    fetch_one "$tmpdir" "spamhaus_drop.txt" \
-      "https://www.spamhaus.org/drop/drop.txt" \
-      "https://cdn.jsdelivr.net/gh/firehol/blocklist-ipsets@master/spamhaus_drop.netset" \
-      "https://raw.githubusercontent.com/SecOps-Institute/SpamhausIPLists/master/drop.txt" \
-      && echo OK >"${tmpdir}/spamhaus_drop.txt.ok"
-  ) &
-  pids+=($!)
-  (
-    fetch_one "$tmpdir" "spamhaus_edrop.txt" \
-      "https://www.spamhaus.org/drop/edrop.txt" \
-      "https://cdn.jsdelivr.net/gh/firehol/blocklist-ipsets@master/spamhaus_edrop.netset" \
-      "https://raw.githubusercontent.com/SecOps-Institute/SpamhausIPLists/master/edrop.txt" \
-      && echo OK >"${tmpdir}/spamhaus_edrop.txt.ok"
-  ) &
-  pids+=($!)
-
-  # blocklist.de
-  (
-    fetch_one "$tmpdir" "blocklist_de_ssh.txt" "https://lists.blocklist.de/lists/ssh.txt" \
-      "https://cdn.jsdelivr.net/gh/firehol/blocklist-ipsets@master/blocklist_de_ssh.ipset" \
-      && echo OK >"${tmpdir}/blocklist_de_ssh.txt.ok"
-  ) &
-  pids+=($!)
-  (
-    fetch_one "$tmpdir" "blocklist_de_all.txt" "https://lists.blocklist.de/lists/all.txt" \
-      && echo OK >"${tmpdir}/blocklist_de_all.txt.ok"
-  ) &
-  pids+=($!)
-
-  # CINS army
-  (
-    fetch_one "$tmpdir" "cins_army.txt" "https://cinsscore.com/list/ci-badguys.txt" \
-      && echo OK >"${tmpdir}/cins_army.txt.ok"
-  ) &
-  pids+=($!)
-
-  # ipsum level 3 (reputation)
-  (
-    mapfile -t urls < <(js_mirrors "https://raw.githubusercontent.com/stamparm/ipsum/master/levels/3.txt")
-    fetch_one "$tmpdir" "ipsum3.txt" "${urls[@]}" && echo OK >"${tmpdir}/ipsum3.txt.ok"
-  ) &
-  pids+=($!)
-
-  # Russian state scanner ranges: CyberOK Skipa (already) + C24Be AS_Network_List blacklist-v4
-  (
-    mapfile -t urls < <(js_mirrors "https://raw.githubusercontent.com/C24Be/AS_Network_List/main/blacklists/blacklist-v4.txt")
-    fetch_one "$tmpdir" "c24be_v4.txt" "${urls[@]}" && echo OK >"${tmpdir}/c24be_v4.txt.ok"
-  ) &
-  pids+=($!)
-
-  for pid in "${pids[@]}"; do
-    wait "$pid" || true
-  done
-
-  ok=0
-  for marker in "$tmpdir"/*.ok; do
-    [ -f "$marker" ] || continue
-    ok=1
-    break
-  done
-
-  if [ "$ok" -eq 0 ]; then
-    echo "DOWNLOAD_FAILED all mirrors" >&2
-    # fallback: --blocklist-from / existing list
-    local src=""
-    if [ -f "$FROM_CONF" ]; then
-      src="$(head -1 "$FROM_CONF" | tr -d '\r')"
-    fi
-    if [ -n "${GORECSHIT_BLOCKLIST_FROM:-}" ]; then
-      src="${GORECSHIT_BLOCKLIST_FROM}"
-    fi
-    if import_from_source "$src"; then
-      :
-    elif [ -s "$LIST" ]; then
-      echo "KEEPING existing $LIST" >&2
-      return 1
-    else
-      echo "EMPTY blocklist — no sources reachable" >&2
-      return 1
-    fi
-  else
-    {
-      cat "$tmpdir"/*_v4.txt 2>/dev/null || true
-      cat "$tmpdir/cyberok-skipa.txt" 2>/dev/null || true
-      grep -E '^[0-9]' "$tmpdir/antiscanner.list" 2>/dev/null || true
-      for f in "$tmpdir"/wdes-*.txt "$tmpdir"/xorlent-*.txt; do
-        [ -f "$f" ] || continue
-        grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' "$f" | sed 's/\r//' | awk '{if($1!~/\//) print $1"/32"; else print $1}'
-      done
-      # firehol / spamhaus / blocklist.de / cins / ipsum / c24be — extract CIDRs/IPs
-      for f in "$tmpdir"/firehol_level1.netset "$tmpdir"/firehol_level2.netset \
-               "$tmpdir"/spamhaus_drop.txt "$tmpdir"/spamhaus_edrop.txt \
-               "$tmpdir"/blocklist_de_ssh.txt "$tmpdir"/blocklist_de_all.txt \
-               "$tmpdir"/cins_army.txt "$tmpdir"/ipsum3.txt "$tmpdir"/c24be_v4.txt; do
-        [ -f "$f" ] || continue
-        # Spamhaus DROP format: CIDR ; SBL...
-        sed 's/\r//' "$f" | sed 's/[;#].*//' | awk '
-          /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+/ {print $1; next}
-          /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ {print $1"/32"; next}
-        '
-      done
-    } | sed 's/\r//' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$' | sort -u >"$TMP.raw"
+  wait
+  # Hijacked / bulletproof netblocks — nobody legit connects from there (all ports)
+  fetch_one "$T/scan/spamhaus_drop.txt" https://www.spamhaus.org/drop/drop.txt \
+    https://cdn.jsdelivr.net/gh/firehol/blocklist-ipsets@master/spamhaus_drop.netset &
+  fetch_one "$T/scan/spamhaus_edrop.txt" https://www.spamhaus.org/drop/edrop.txt \
+    https://cdn.jsdelivr.net/gh/firehol/blocklist-ipsets@master/spamhaus_edrop.netset &
+  # Reputation (brute-force/attackers). Contains CGNAT addresses of mobile operators → SSH only!
+  fetch_one "$T/rep/firehol_level1.netset" https://iplists.firehol.org/files/firehol_level1.netset \
+    https://cdn.jsdelivr.net/gh/firehol/blocklist-ipsets@master/firehol_level1.netset &
+  fetch_one "$T/rep/firehol_level2.netset" https://iplists.firehol.org/files/firehol_level2.netset \
+    https://cdn.jsdelivr.net/gh/firehol/blocklist-ipsets@master/firehol_level2.netset &
+  fetch_one "$T/rep/blocklist_de_all.txt" https://lists.blocklist.de/lists/all.txt &
+  fetch_one "$T/rep/cins_army.txt" https://cinsscore.com/list/ci-badguys.txt &
+  fetch_gh "$T/rep/ipsum3.txt" https://raw.githubusercontent.com/stamparm/ipsum/master/levels/3.txt &
+  # ASN-based (RIPEstat): scanners without public lists, never-block, RU mobile, VK
+  ripe_prefixes "$T/scan/asn_scanners.txt" $SCANNER_ASNS &
+  ripe_prefixes "$T/meta/never_asn.txt" $NEVER_ASNS &
+  ripe_prefixes "$T/meta/mobile_asn.txt" $MOBILE_ASNS &
+  ripe_prefixes "$T/snitch/asn_vk.txt" $SNITCH_ASNS &
+  fetch_one "$T/meta/cf4.txt" https://www.cloudflare.com/ips-v4 &
+  fetch_one "$T/meta/cf6.txt" https://www.cloudflare.com/ips-v6 &
+  wait
+  # cache dynamic never/mobile lists only when they look sane
+  if [ "$(cat "$T"/meta/never_asn.txt "$T"/meta/cf4.txt 2>/dev/null | grep -c .)" -ge 20 ]; then
+    cat "$T"/meta/never_asn.txt "$T"/meta/cf4.txt "$T"/meta/cf6.txt 2>/dev/null >"$NEVER_DYN.new" && mv -f "$NEVER_DYN.new" "$NEVER_DYN"
   fi
-
-  if [ ! -s "$TMP.raw" ]; then
-    echo "RAW empty after parse" >&2
-    if [ -s "$LIST" ]; then return 1; fi
-    # last chance: blocklist-from
-    local src=""
-    [ -f "$FROM_CONF" ] && src="$(head -1 "$FROM_CONF" | tr -d '\r')"
-    import_from_source "$src" || return 1
+  if [ "$(grep -c . "$T/meta/mobile_asn.txt" 2>/dev/null || echo 0)" -ge 200 ]; then
+    cp -f "$T/meta/mobile_asn.txt" "$MOB_DYN"
   fi
-
-  python3 - "$TMP.raw" "$TMP" "$NEVER" <<'PY'
-import sys, ipaddress
-raw, out, never_path = sys.argv[1:4]
-never_nets = [
-  "10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","127.0.0.0/8","169.254.0.0/16",
-  "0.0.0.0/8","100.64.0.0/10","192.0.0.0/24","192.0.2.0/24","198.18.0.0/15",
-  "198.51.100.0/24","203.0.113.0/24","224.0.0.0/4","240.0.0.0/4","255.255.255.255/32",
-]
-try:
-  for line in open(never_path):
-    line=line.strip()
-    if line and not line.startswith("#"):
-      never_nets.append(line if "/" in line else line+"/32")
-except FileNotFoundError:
-  pass
-never=[ipaddress.ip_network(n, strict=False) for n in never_nets]
-kept=[]
-for line in open(raw):
-  line=line.strip()
-  if not line: continue
-  try: net=ipaddress.ip_network(line, strict=False)
-  except ValueError: continue
-  if net.version!=4: continue
-  # Skip huge aggregates (bogons / whole continents) that could hit infra
-  if net.prefixlen < 12: continue
-  if any(net.overlaps(n) for n in never): continue
-  kept.append(str(net))
-kept=sorted(set(kept), key=lambda x: (ipaddress.ip_network(x).network_address.packed, ipaddress.ip_network(x).prefixlen))
-open(out,"w").write("\n".join(kept)+"\n")
-print(len(kept))
-PY
-  mv -f "$TMP" "$LIST"
-  echo "UPDATED $(wc -l < "$LIST") entries"
+  # copy scanners v6 from the ASN file too
+  grep ':' "$T/scan/asn_scanners.txt" 2>/dev/null >"$T/scan6/asn_scanners6.txt" || true
+  local got
+  got="$(find "$T/scan" "$T/rep" -type f -size +0 2>/dev/null | wc -l)"
+  log "downloaded feeds: $got"
+  [ "$got" -gt 0 ]
 }
 
-load_ipset() {
-  if [ ! -s "$LIST" ]; then
-    echo "No blocklist at $LIST" >&2
-    return 1
-  fi
-  ipset create "${SET}-new" hash:net family inet maxelem 500000 -exist
-  ipset flush "${SET}-new"
-  local n=0
-  while read -r cidr; do
-    [ -z "$cidr" ] && continue
-    ipset add "${SET}-new" "$cidr" -exist 2>/dev/null && n=$((n+1)) || true
-  done < "$LIST"
-  if ! ipset list "$SET" >/dev/null 2>&1; then
-    ipset rename "${SET}-new" "$SET"
+build_lists() {
+  # build_lists <tmpdir>  → writes LIST/LIST6/REP/SNITCH (+.new then mv). Needs python3.
+  local T="$1"
+  command -v python3 >/dev/null 2>&1 || { log "python3 нет — оставляю встроенные/старые списки"; return 1; }
+  python3 - "$T" "$DIR" <<'PY'
+import sys, os, re, glob, ipaddress
+T, D = sys.argv[1], sys.argv[2]
+def nets(paths, v=4):
+    out = []
+    for p in paths:
+        try:
+            fh = open(p, errors="ignore")
+        except OSError:
+            continue
+        for line in fh:
+            tok = re.split(r"[\s;#,]", line.strip(), 1)[0] if line.strip() else ""
+            if not tok or tok[0] in "#;":
+                continue
+            try:
+                n = ipaddress.ip_network(tok, strict=False)
+            except ValueError:
+                continue
+            if n.version == v:
+                out.append(n)
+    return out
+def g(*pats):
+    r = []
+    for p in pats:
+        r += glob.glob(p)
+    return r
+never4 = nets(g(D + "/never-block.txt", D + "/builtin-never.txt", D + "/never-dynamic.txt"))
+never6 = nets(g(D + "/never-dynamic.txt", D + "/never-block.txt"), 6)
+mobile = nets(g(D + "/builtin-mobile-ru.txt", D + "/mobile-ru-dynamic.txt"))
+bog4 = [ipaddress.ip_network(x) for x in ("0.0.0.0/8","10.0.0.0/8","100.64.0.0/10","127.0.0.0/8","169.254.0.0/16",
+        "172.16.0.0/12","192.0.0.0/24","192.0.2.0/24","192.168.0.0/16","198.18.0.0/15","198.51.100.0/24",
+        "203.0.113.0/24","224.0.0.0/3")]
+def collapse(lst):
+    return list(ipaddress.collapse_addresses(lst))
+def filt(lst, deny, minpref):
+    import bisect
+    deny = collapse(deny)  # disjoint + sorted
+    starts = [int(n.network_address) for n in deny]
+    ends = [int(n.broadcast_address) for n in deny]
+    keep = []
+    for n in lst:
+        if n.prefixlen < minpref:
+            continue
+        lo, hi = int(n.network_address), int(n.broadcast_address)
+        i = bisect.bisect_right(starts, hi) - 1
+        if i >= 0 and ends[i] >= lo:
+            continue
+        keep.append(n)
+    return collapse(keep)
+def write(path, lst):
+    with open(path + ".new", "w") as fh:
+        fh.write("\n".join(str(n) for n in lst) + ("\n" if lst else ""))
+    os.replace(path + ".new", path)
+    return len(lst)
+deny4 = never4 + bog4 + mobile
+scan = nets(g(T + "/scan/*", D + "/builtin-scanners.txt"))
+scan = filt(scan, deny4, 12)
+rep = nets(g(T + "/rep/*"))
+rep = filt(rep, deny4, 12)
+scan6 = nets(g(T + "/scan6/*"), 6)
+scan6 = filt(scan6, never6 + [ipaddress.ip_network(x) for x in ("::/8","fc00::/7","fe80::/10","ff00::/8")], 24)
+snitch = nets(g(T + "/snitch/*", D + "/builtin-snitch.txt"))
+snitch = filt(snitch, never4 + bog4, 8)
+snitch6 = filt(nets(g(T + "/snitch/*"), 6), never6, 19)
+c = {}
+c["scan"] = write(D + "/blocklist.txt", scan) if scan else 0
+c["rep"] = write(D + "/reputation.txt", rep) if rep else 0
+c["scan6"] = write(D + "/blocklist6.txt", scan6) if scan6 else 0
+c["snitch"] = write(D + "/snitch.txt", snitch) if snitch else 0
+c["snitch6"] = write(D + "/snitch6.txt", snitch6) if snitch6 else 0
+print("BUILT scanners=%(scan)d reputation=%(rep)d scanners6=%(scan6)d snitch=%(snitch)d snitch6=%(snitch6)d" % c)
+PY
+}
+
+ensure_from_builtin() {
+  # no previous list on disk → start from built-in (already filtered)
+  [ -s "$LIST" ] || cp -f "$DIR/builtin-scanners.txt" "$LIST" 2>/dev/null || true
+  [ -s "$SNITCH" ] || cp -f "$DIR/builtin-snitch.txt" "$SNITCH" 2>/dev/null || true
+}
+
+load_set() {
+  # load_set <name> <family inet|inet6> <file>   (atomic swap via ipset restore)
+  local SET="$1" fam="$2" file="$3" tmp
+  ipset create "$SET" hash:net family "$fam" maxelem 1048576 -exist 2>/dev/null || true
+  [ -s "$file" ] || { log "$SET: list empty (set kept)"; return 0; }
+  tmp="$(mktemp)"
+  {
+    echo "create ${SET}-new hash:net family $fam maxelem 1048576 -exist"
+    echo "flush ${SET}-new"
+    grep -vE '^\s*(#|$)' "$file" | sed "s/^/add ${SET}-new /"
+  } >"$tmp"
+  if ipset restore -exist <"$tmp" 2>/dev/null; then
+    ipset swap "${SET}-new" "$SET" && ipset destroy "${SET}-new" 2>/dev/null
   else
-    ipset swap "${SET}-new" "$SET"
-    ipset destroy "${SET}-new"
+    log "$SET: ipset restore failed — keeping previous contents"
+    ipset destroy "${SET}-new" 2>/dev/null || true
   fi
-  if ! iptables -C ufw-before-input -m set --match-set "$SET" src -j DROP 2>/dev/null; then
-    if iptables -L ufw-before-input -n >/dev/null 2>&1; then
-      iptables -I ufw-before-input 3 -m set --match-set "$SET" src -j DROP 2>/dev/null || \
-      iptables -A ufw-before-input -m set --match-set "$SET" src -j DROP 2>/dev/null || true
-    fi
+  rm -f "$tmp"
+  log "$SET: $(ipset list "$SET" -t 2>/dev/null | awk -F': ' '/Number of entries/{print $2}') entries"
+}
+
+load_all() {
+  ensure_from_builtin
+  load_set scanner-block inet "$LIST"
+  load_set gorecshit-rep inet "$REP"
+  load_set gorecshit-snitch inet "$SNITCH"
+  load_set scanner-block6 inet6 "$LIST6"
+  load_set gorecshit-snitch6 inet6 "$DIR/snitch6.txt"
+  # CDN edges (Yandex Cloud CDN / Cloudflare): exempt from per-source anti-probe limits (one edge = many users)
+  grep -hvE '^\s*(#|$)' "$DIR/builtin-never.txt" "$NEVER_DYN" 2>/dev/null | grep -v ':' | sort -u >"$DIR/cdn-edges.txt" || true
+  load_set gorecshit-cdn inet "$DIR/cdn-edges.txt"
+  # Without the UFW hook (blocklist installed without ufw) — minimal INPUT rule (allow-list never in sets)
+  if ! grep -q 'gorecshit-managed-begin' /etc/ufw/before.rules 2>/dev/null; then
+    iptables -C INPUT -m conntrack --ctstate NEW -m set --match-set scanner-block src -j DROP 2>/dev/null \
+      || iptables -I INPUT 1 -m conntrack --ctstate NEW -m set --match-set scanner-block src -j DROP 2>/dev/null || true
   fi
-  # Immediate ban path for scanner IPs hitting SSH is the ipset DROP itself (before UFW user rules).
-  echo "LOADED $n into ipset $SET (size=$(ipset list $SET 2>/dev/null | grep -cE '^[0-9]' || echo 0))"
 }
 
 if [ "$LOCAL_ONLY" -eq 0 ]; then
-  download_lists || echo "using existing list"
+  if ! getent ahostsv4 raw.githubusercontent.com >/dev/null 2>&1 && ! getent ahostsv4 stat.ripe.net >/dev/null 2>&1; then
+    log "DNS не работает — скачивание пропущено, используются встроенные/сохранённые списки (пропишите nameserver 1.1.1.1)"
+    if [ -s "$LIST" ] && [ "$(grep -c . "$LIST")" -gt "$(grep -c . "$DIR/builtin-scanners.txt" 2>/dev/null || echo 0)" ]; then
+      log "оставляю сохранённые списки ($(grep -c . "$LIST") подсетей) — они полнее встроенных"
+    else
+      T="$(mktemp -d)"; build_lists "$T" || true; rm -rf "$T"
+    fi
+  else
+    T="$(mktemp -d)"
+    if download_all "$T"; then
+      build_lists "$T" || log "build failed — keeping previous lists"
+    else
+      log "DOWNLOAD_FAILED all sources"
+      src=""
+      [ -f "$FROM_CONF" ] && src="$(head -1 "$FROM_CONF" | tr -d '\r')"
+      [ -n "${GORECSHIT_BLOCKLIST_FROM:-}" ] && src="$GORECSHIT_BLOCKLIST_FROM"
+      if [ -n "$src" ] && import_from_source "$src" "$T/scan/imported.txt"; then
+        log "imported from $src"
+      fi
+      build_lists "$T" || true
+    fi
+    rm -rf "$T"
+  fi
 fi
-load_ipset
+load_all
+exit 0
 REFRESH_EOF
   chmod 755 /usr/local/sbin/scanner-block-refresh.sh
 
-  cat >/etc/systemd/system/scanner-block.service <<'EOF'
+  cat >/etc/systemd/system/scanner-block.service <<'EOF2'
 [Unit]
-Description=Load scanner IP blocklist into ipset
+Description=Load gorecshit ipsets (scanners / reputation / snitch) before UFW
 DefaultDependencies=no
-Before=ufw.service
-After=network-pre.target systemd-modules-load.service
-Wants=network-pre.target
+# v2.7.0: ufw.service is Before=network-pre.target, so "After=network-pre" here made an ordering
+# cycle and systemd dropped ufw (firewall OFF after reboot) or this unit. Load sets early instead.
+Before=ufw.service network-pre.target
+After=local-fs.target systemd-modules-load.service
 
 [Service]
 Type=oneshot
@@ -4639,11 +5248,11 @@ ExecStart=/usr/local/sbin/scanner-block-refresh.sh --local-only
 
 [Install]
 WantedBy=multi-user.target
-EOF
+EOF2
 
-  cat >/etc/systemd/system/scanner-block-refresh.service <<'EOF'
+  cat >/etc/systemd/system/scanner-block-refresh.service <<'EOF2'
 [Unit]
-Description=Refresh internet scanner IP blocklist
+Description=Refresh gorecshit scanner/reputation/snitch lists
 After=network-online.target
 Wants=network-online.target
 
@@ -4651,38 +5260,38 @@ Wants=network-online.target
 Type=oneshot
 ExecStart=/usr/local/sbin/scanner-block-refresh.sh
 Nice=10
-EOF
+EOF2
 
-  cat >/etc/systemd/system/scanner-block-refresh.timer <<'EOF'
+  cat >/etc/systemd/system/scanner-block-refresh.timer <<'EOF2'
 [Unit]
-Description=Weekly scanner blocklist refresh
+Description=Daily scanner blocklist refresh
 
 [Timer]
-OnCalendar=weekly
+OnCalendar=daily
 Persistent=true
-RandomizedDelaySec=3600
+RandomizedDelaySec=7200
 
 [Install]
 WantedBy=timers.target
-EOF
+EOF2
 
   systemctl daemon-reload
   systemctl enable scanner-block.service >/dev/null 2>&1 || true
   systemctl enable --now scanner-block-refresh.timer >/dev/null 2>&1 || true
 
-  # If --blocklist-from set and current list empty / first run preference
-  if [[ -n "$BLOCKLIST_FROM" && ! -s /etc/scanner-block/blocklist.txt ]]; then
-    log "Пробуем --blocklist-from=${BLOCKLIST_FROM} до сетевой загрузки"
-  fi
-
-  /usr/local/sbin/scanner-block-refresh.sh || warn "Initial blocklist refresh failed; will retry via timer / --blocklist-from"
-  systemctl start scanner-block.service || true
-  local cnt
-  cnt="$(ipset list scanner-block 2>/dev/null | grep -cE '^[0-9]' || echo 0)"
-  if [[ "${cnt:-0}" -eq 0 ]]; then
-    warn "ipset scanner-block пуст после refresh — проверьте сеть/зеркала/--blocklist-from"
+  if [[ "$NET_OFFLINE" -eq 1 ]]; then
+    /usr/local/sbin/scanner-block-refresh.sh --local-only || true
   else
-    ok "Scanner blocklist установлен (${cnt} entries)"
+    /usr/local/sbin/scanner-block-refresh.sh || warn "Обновление списков не удалось — загружены встроенные/старые"
+  fi
+  local cnt rep sn
+  cnt="$(ipset list scanner-block -t 2>/dev/null | awk -F': ' '/Number of entries/{print $2}')"
+  rep="$(ipset list gorecshit-rep -t 2>/dev/null | awk -F': ' '/Number of entries/{print $2}')"
+  sn="$(ipset list gorecshit-snitch -t 2>/dev/null | awk -F': ' '/Number of entries/{print $2}')"
+  if [[ "${cnt:-0}" -eq 0 ]]; then
+    warn "ipset scanner-block пуст — проверьте сеть/зеркала/--blocklist-from"
+  else
+    ok "Сканеры: ${cnt} подсетей (все порты) · репутация: ${rep:-0} (только SSH) · VK/MAX: ${sn:-0} (исходящие)"
   fi
 }
 
@@ -5350,7 +5959,7 @@ maybe_apply_docker_daemon_restart() {
   if [[ "$FORCE_DOCKER_RESTART" -eq 1 ]]; then
     do_it=1
     log "Перезапуск Docker (--docker-restart)"
-  elif [[ -r /dev/tty ]]; then
+  elif _tty_usable; then
     # ALWAYS prompt when a real TTY exists — including menu install (FROM_MENU + ASSUME_YES=1).
     # Menu sets ASSUME_YES only to skip "Продолжить?"; docker restart must still ask.
     local ans=""
@@ -5847,6 +6456,286 @@ fi'
   log "Рекомендация (в панели, не трогаем): routing-правило protocol bittorrent → blackhole/block — меньше DMCA-жалоб хостеру"
 }
 
+# ---------- v2.7.0 netguard: what clients do through the node must not get the IP banned ----------
+# Hosters ban/null-route for: torrents (DMCA), outbound scans/brute-force, SMB worms, spam, attacks on their LAN.
+# Russian apps (MAX/VK, by Минцифры guideline 04.2026) report the exit IP of VPN users → RKN → IP block.
+# Everything here is NEW-connection only (plus the first packets for P2P signatures): no shaping, no
+# per-packet cost on established 80/443 traffic, BBR/fq untouched.
+configure_netguard() {
+  if [[ "$DO_NETGUARD" -eq 0 ]]; then
+    log "netguard пропущен (--no-netguard)"
+    return 0
+  fi
+  step "Netguard: торренты · сканы/брутфорс · SMB · LAN хостера · VK/MAX «стукачи» (только новые соединения)"
+  local script="/usr/local/sbin/gorecshit-netguard.sh"
+  local unit="/etc/systemd/system/gorecshit-netguard.service"
+  local sysf="/etc/sysctl.d/99-gorecshit-netguard.conf"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    printf '%b[DRY]%b %s: p2p=%s abuse=%s private=%s snitch=%s metadata=%s (OUTPUT + docker egress, NEW only)\n' \
+      "${C_YEL}" "${C_RESET}" "$script" "$DO_P2P_BLOCK" "$DO_ABUSE_LIMIT" "$DO_PRIVATE_EGRESS" "$DO_SNITCH_GUARD" "$EGRESS_BLOCK_METADATA"
+    return 0
+  fi
+  local created=0
+  [[ -e "$script" ]] || created=1
+  backup_file "$script"; backup_file "$unit"; backup_file "$sysf"
+  mkdir -p /etc/gorecshit
+  if [[ ! -f /etc/gorecshit/egress-allow.txt ]]; then
+    printf '# CIDR/IP, по одному в строке: исключения из netguard (LAN-сервисы, mesh-VPN и т.п.)\n' >/etc/gorecshit/egress-allow.txt
+  fi
+  local exempt="" a
+  exempt+="${PANEL_IP} "
+  [[ -n "$SSH_CLIENT_IP" ]] && exempt+="${SSH_CLIENT_IP} "
+  while IFS= read -r a; do exempt+="${a} "; done < <(foreach_csv_ip "$ALLOW_SSH_FROM")
+  while IFS= read -r a; do exempt+="${a} "; done < <(foreach_csv_ip "$RELAY_IPS")
+  {
+    echo '#!/bin/bash'
+    echo "# Managed by ${SCRIPT_NAME} ${VERSION} — netguard (idempotent; re-run any time; flush: $0 --flush)"
+    echo 'set -u'
+    echo "P2P=${DO_P2P_BLOCK}"
+    echo "ABUSE=${DO_ABUSE_LIMIT}"
+    echo "PRIV=${DO_PRIVATE_EGRESS}"
+    echo "SNITCH=${DO_SNITCH_GUARD}"
+    echo "META=${EGRESS_BLOCK_METADATA}"
+    echo "EXEMPT=\"${exempt% }\""
+    cat <<'NETGUARD'
+# ports typical for scans / brute-force from abused VPN accounts (max 15 for multiport)
+ABUSE_PORTS="22,23,2323,3389,5900,1433,3306,5432,6379,9200,11211,27017,2375,5985,8291"
+C=GS-NETGUARD
+P2PMARK=0x10000000   # one connmark bit for caught P2P flows (Docker/k8s use other bits)
+LOGLIM="-m limit --limit 6/min --limit-burst 12"
+
+unhook() {
+  local IPT="$1"
+  while "$IPT" -D OUTPUT -j "$C" 2>/dev/null; do :; done
+  while "$IPT" -D DOCKER-USER -i docker+ -j "$C" 2>/dev/null; do :; done
+  while "$IPT" -D DOCKER-USER -i br-+ -j "$C" 2>/dev/null; do :; done
+  while "$IPT" -D FORWARD -i docker+ -j "$C" 2>/dev/null; do :; done
+  while "$IPT" -D FORWARD -i br-+ -j "$C" 2>/dev/null; do :; done
+  local ch
+  for ch in "$C" GS-NG-NEW GS-NG-P2P GS-HIT-P2P GS-HIT-ABUSE GS-HIT-SMB GS-HIT-PRIV GS-HIT-SNITCH; do
+    "$IPT" -F "$ch" 2>/dev/null || true
+  done
+  for ch in "$C" GS-NG-NEW GS-NG-P2P GS-HIT-P2P GS-HIT-ABUSE GS-HIT-SMB GS-HIT-PRIV GS-HIT-SNITCH; do
+    "$IPT" -X "$ch" 2>/dev/null || true
+  done
+}
+if [ "${1:-}" = "--flush" ]; then
+  unhook iptables; unhook ip6tables 2>/dev/null || true
+  echo "netguard removed"; exit 0
+fi
+
+# conntrack accounting for connbytes (P2P handshake match only on the first packets)
+[ "$P2P" = "1" ] && sysctl -qw net.netfilter.nf_conntrack_acct=1 2>/dev/null || true
+CONNBYTES=0
+if [ "$P2P" = "1" ] && iptables -N GS-NG-PROBE 2>/dev/null; then
+  if iptables -A GS-NG-PROBE -m connbytes --connbytes 0:6 --connbytes-dir original --connbytes-mode packets -j RETURN 2>/dev/null; then
+    CONNBYTES=1
+  fi
+  iptables -F GS-NG-PROBE 2>/dev/null; iptables -X GS-NG-PROBE 2>/dev/null
+fi
+
+private_exempt() {
+  # destinations the HOST itself needs: on-link/LAN routes, docker nets, wg/mesh, resolvers, allow file
+  ip -4 route show table main 2>/dev/null | awk '$1!="default" && $1 ~ /^[0-9]/ {print $1}'
+  ip -4 route show table all 2>/dev/null | awk '$1!="default" && $1!="local" && $1!="broadcast" && $1 ~ /^[0-9]/ && $0 ~ / dev (wg|tun|tailscale|zt|nb|netbird|docker|br-)/ {print $1}'
+  grep -hE '^\s*nameserver\s+[0-9.]+' /etc/resolv.conf /run/systemd/resolve/resolv.conf 2>/dev/null | awk '{print $2}'
+  grep -vE '^\s*(#|$)' /etc/gorecshit/egress-allow.txt 2>/dev/null | awk '{print $1}'
+}
+
+apply_v4() {
+  local IPT=iptables x
+  unhook "$IPT"
+  "$IPT" -N "$C"; "$IPT" -N GS-NG-NEW; "$IPT" -N GS-NG-P2P
+  for x in P2P ABUSE SMB PRIV SNITCH; do "$IPT" -N "GS-HIT-$x"; done
+  # hit chains: rate-limited log (prefix shows in journalctl -k / gorecshit --abuse-report) + verdict
+  "$IPT" -A GS-HIT-P2P $LOGLIM -j LOG --log-prefix "[GS-P2P] " --log-level 6
+  # remember the flow: retransmits / later packets of a caught P2P flow are dropped too
+  "$IPT" -A GS-HIT-P2P -j CONNMARK --set-xmark "$P2PMARK/$P2PMARK"
+  "$IPT" -A GS-HIT-P2P -p tcp -j REJECT --reject-with tcp-reset
+  "$IPT" -A GS-HIT-P2P -j DROP
+  "$IPT" -A GS-HIT-ABUSE $LOGLIM -j LOG --log-prefix "[GS-ABUSE] " --log-level 6
+  "$IPT" -A GS-HIT-ABUSE -p tcp -j REJECT --reject-with tcp-reset
+  "$IPT" -A GS-HIT-ABUSE -j DROP
+  "$IPT" -A GS-HIT-SMB $LOGLIM -j LOG --log-prefix "[GS-SMB] " --log-level 6
+  "$IPT" -A GS-HIT-SMB -p tcp -j REJECT --reject-with tcp-reset
+  "$IPT" -A GS-HIT-SMB -j DROP
+  "$IPT" -A GS-HIT-PRIV $LOGLIM -j LOG --log-prefix "[GS-PRIV] " --log-level 6
+  "$IPT" -A GS-HIT-PRIV -p tcp -j REJECT --reject-with tcp-reset
+  "$IPT" -A GS-HIT-PRIV -j REJECT --reject-with icmp-admin-prohibited
+  "$IPT" -A GS-HIT-SNITCH $LOGLIM -j LOG --log-prefix "[GS-SNITCH] " --log-level 6
+  "$IPT" -A GS-HIT-SNITCH -p tcp -j REJECT --reject-with tcp-reset
+  "$IPT" -A GS-HIT-SNITCH -j REJECT --reject-with icmp-admin-prohibited
+
+  # ---- main chain: cheap exits first ----
+  "$IPT" -A "$C" -o lo -j RETURN
+  "$IPT" -A "$C" -m conntrack --ctdir REPLY -j RETURN          # replies to inbound clients/panel/CDN
+  [ "$P2P" = "1" ] && "$IPT" -A "$C" -m connmark --mark "$P2PMARK/$P2PMARK" -j DROP
+  "$IPT" -A "$C" -m conntrack --ctstate NEW -j GS-NG-NEW
+  if [ "$P2P" = "1" ]; then
+    "$IPT" -A "$C" -p tcp --dport 443 -j RETURN
+    [ "$CONNBYTES" = "1" ] || "$IPT" -A "$C" -p tcp --dport 80 -j RETURN
+    "$IPT" -A "$C" -p udp -m multiport --dports 53,123,443 -j RETURN
+    "$IPT" -A "$C" -j GS-NG-P2P
+  fi
+  "$IPT" -A "$C" -j RETURN
+
+  # ---- NEW connections ----
+  for x in $EXEMPT; do "$IPT" -A GS-NG-NEW -d "$x" -j RETURN; done
+  if [ "$ABUSE" = "1" ]; then
+    # SMB/NetBIOS/RPC to the internet: worm-like, instant abuse reports; no legit use over VPN
+    "$IPT" -A GS-NG-NEW -p tcp -m multiport --dports 135,137,138,139,445 -j GS-HIT-SMB
+    "$IPT" -A GS-NG-NEW -p udp -m multiport --dports 137,138 -j GS-HIT-SMB
+    # scan: one port → many hosts (global per port); brute: many tries → one host:port
+    "$IPT" -A GS-NG-NEW -p tcp -m multiport --dports "$ABUSE_PORTS" -m hashlimit --hashlimit-name gs_scan \
+      --hashlimit-mode dstport --hashlimit-above 90/min --hashlimit-burst 180 --hashlimit-htable-expire 120000 -j GS-HIT-ABUSE
+    "$IPT" -A GS-NG-NEW -p tcp -m multiport --dports "$ABUSE_PORTS" -m hashlimit --hashlimit-name gs_brute \
+      --hashlimit-mode dstip,dstport --hashlimit-above 20/min --hashlimit-burst 40 --hashlimit-htable-expire 120000 -j GS-HIT-ABUSE
+  fi
+  if [ "$SNITCH" = "1" ] && ipset list -n gorecshit-snitch >/dev/null 2>&1; then
+    "$IPT" -A GS-NG-NEW -m set --match-set gorecshit-snitch dst -j GS-HIT-SNITCH
+  fi
+  if [ "$PRIV" = "1" ]; then
+    # host needs: DNS/NTP/DHCP anywhere + its own LAN/docker/mesh routes
+    "$IPT" -A GS-NG-NEW -p udp -m multiport --dports 53,67,68,123 -j RETURN
+    "$IPT" -A GS-NG-NEW -p tcp --dport 53 -j RETURN
+    for x in $(private_exempt | sort -u); do "$IPT" -A GS-NG-NEW -d "$x" -j RETURN 2>/dev/null || true; done
+    # (198.18.0.0/15 deliberately not here: xray/sing-box FakeDNS and some hosters' proxies use it)
+    for x in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10; do
+      "$IPT" -A GS-NG-NEW -d "$x" -j GS-HIT-PRIV
+    done
+    if [ "$META" = "1" ]; then
+      "$IPT" -A GS-NG-NEW -d 169.254.0.0/16 -j GS-HIT-PRIV
+    fi
+  fi
+  "$IPT" -A GS-NG-NEW -j RETURN
+
+  # ---- P2P signatures (only small UDP / first TCP packets; 80/443/53 never inspected) ----
+  if [ "$P2P" = "1" ]; then
+    # DHT (bencoded KRPC) and µTP-wrapped handshakes
+    "$IPT" -A GS-NG-P2P -p udp -m length --length 40:1200 -m string --algo bm --string "d1:ad2:id20:" --to 160 -j GS-HIT-P2P
+    "$IPT" -A GS-NG-P2P -p udp -m length --length 40:1200 -m string --algo bm --string "d1:rd2:id20:" --to 160 -j GS-HIT-P2P
+    "$IPT" -A GS-NG-P2P -p udp -m length --length 40:1200 -m string --algo bm --string "BitTorrent protocol" --to 160 -j GS-HIT-P2P
+    # UDP tracker connect: protocol_id 0x41727101980
+    "$IPT" -A GS-NG-P2P -p udp -m u32 --u32 "0>>22&0x3C@8=0x00000417 && 0>>22&0x3C@12=0x27101980" -j GS-HIT-P2P 2>/dev/null || true
+    if [ "$CONNBYTES" = "1" ]; then
+      "$IPT" -A GS-NG-P2P -p tcp -m connbytes --connbytes 0:6 --connbytes-dir original --connbytes-mode packets \
+        -m string --algo bm --string "BitTorrent protocol" --to 160 -j GS-HIT-P2P
+      "$IPT" -A GS-NG-P2P -p tcp -m connbytes --connbytes 0:6 --connbytes-dir original --connbytes-mode packets \
+        -m string --algo bm --string "info_hash=" --to 600 -j GS-HIT-P2P
+    else
+      "$IPT" -A GS-NG-P2P -p tcp -m length --length 60:400 -m string --algo bm --string "BitTorrent protocol" --to 160 -j GS-HIT-P2P
+    fi
+    "$IPT" -A GS-NG-P2P -j RETURN
+  fi
+
+  # hooks: host (xray in network_mode host → OUTPUT) + bridge containers egress
+  "$IPT" -I OUTPUT 1 -j "$C"
+  if "$IPT" -S DOCKER-USER >/dev/null 2>&1; then
+    "$IPT" -I DOCKER-USER 1 -i docker+ -j "$C"
+    "$IPT" -I DOCKER-USER 1 -i br-+ -j "$C"
+  else
+    "$IPT" -I FORWARD 1 -i docker+ -j "$C"
+    "$IPT" -I FORWARD 1 -i br-+ -j "$C"
+  fi
+}
+
+apply_v6() {
+  local IPT=ip6tables
+  command -v "$IPT" >/dev/null 2>&1 || return 0
+  "$IPT" -S OUTPUT >/dev/null 2>&1 || return 0
+  unhook "$IPT"
+  "$IPT" -N "$C"; "$IPT" -N GS-HIT-SMB; "$IPT" -N GS-HIT-ABUSE; "$IPT" -N GS-HIT-P2P
+  "$IPT" -A GS-HIT-SMB $LOGLIM -j LOG --log-prefix "[GS-SMB] " --log-level 6
+  "$IPT" -A GS-HIT-SMB -p tcp -j REJECT --reject-with tcp-reset
+  "$IPT" -A GS-HIT-SMB -j DROP
+  "$IPT" -A GS-HIT-ABUSE $LOGLIM -j LOG --log-prefix "[GS-ABUSE] " --log-level 6
+  "$IPT" -A GS-HIT-ABUSE -p tcp -j REJECT --reject-with tcp-reset
+  "$IPT" -A GS-HIT-ABUSE -j DROP
+  "$IPT" -A GS-HIT-P2P $LOGLIM -j LOG --log-prefix "[GS-P2P] " --log-level 6
+  "$IPT" -A GS-HIT-P2P -j CONNMARK --set-xmark "$P2PMARK/$P2PMARK"
+  "$IPT" -A GS-HIT-P2P -j DROP
+  "$IPT" -A "$C" -o lo -j RETURN
+  "$IPT" -A "$C" -m conntrack --ctdir REPLY -j RETURN
+  [ "$P2P" = "1" ] && "$IPT" -A "$C" -m connmark --mark "$P2PMARK/$P2PMARK" -j DROP
+  if [ "$ABUSE" = "1" ]; then
+    "$IPT" -A "$C" -m conntrack --ctstate NEW -p tcp -m multiport --dports 135,137,138,139,445 -j GS-HIT-SMB
+    "$IPT" -A "$C" -m conntrack --ctstate NEW -p tcp -m multiport --dports "$ABUSE_PORTS" -m hashlimit --hashlimit-name gs_scan6 \
+      --hashlimit-mode dstport --hashlimit-above 90/min --hashlimit-burst 180 -j GS-HIT-ABUSE
+    "$IPT" -A "$C" -m conntrack --ctstate NEW -p tcp -m multiport --dports "$ABUSE_PORTS" -m hashlimit --hashlimit-name gs_brute6 \
+      --hashlimit-mode dstip,dstport --hashlimit-above 20/min --hashlimit-burst 40 -j GS-HIT-ABUSE
+  fi
+  if [ "$SNITCH" = "1" ] && ipset list -n gorecshit-snitch6 >/dev/null 2>&1; then
+    "$IPT" -N GS-HIT-SNITCH
+    "$IPT" -A GS-HIT-SNITCH $LOGLIM -j LOG --log-prefix "[GS-SNITCH] " --log-level 6
+    "$IPT" -A GS-HIT-SNITCH -p tcp -j REJECT --reject-with tcp-reset
+    "$IPT" -A GS-HIT-SNITCH -j REJECT --reject-with icmp6-adm-prohibited
+    "$IPT" -A "$C" -m conntrack --ctstate NEW -m set --match-set gorecshit-snitch6 dst -j GS-HIT-SNITCH
+  fi
+  if [ "$P2P" = "1" ]; then
+    "$IPT" -A "$C" -p udp -m multiport --dports 53,123,443 -j RETURN
+    "$IPT" -A "$C" -p udp -m length --length 40:1200 -m string --algo bm --string "d1:ad2:id20:" --to 180 -j GS-HIT-P2P
+    "$IPT" -A "$C" -p udp -m length --length 40:1200 -m string --algo bm --string "d1:rd2:id20:" --to 180 -j GS-HIT-P2P
+  fi
+  "$IPT" -A "$C" -j RETURN
+  "$IPT" -I OUTPUT 1 -j "$C"
+}
+
+apply_v4 || echo "netguard: IPv4 apply failed" >&2
+apply_v6 || true
+exit 0
+NETGUARD
+  } >"$script"
+  chmod 755 "$script"
+  write_content "$sysf" "# Managed by ${SCRIPT_NAME} ${VERSION} — conntrack byte/packet accounting for P2P first-packets match
+net.netfilter.nf_conntrack_acct = 1
+"
+  cat >"$unit" <<UNITEOF
+[Unit]
+Description=gorecshit netguard (outbound abuse/P2P/LAN/snitch guard; NEW connections only)
+After=network-pre.target ufw.service docker.service scanner-block.service
+
+[Service]
+Type=oneshot
+ExecStart=${script}
+ExecStop=${script} --flush
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+UNITEOF
+  systemctl daemon-reload 2>/dev/null || true
+  systemctl enable gorecshit-netguard.service >/dev/null 2>&1 || true
+  sysctl -q -p "$sysf" >/dev/null 2>&1 || true
+  "$script" || warn "netguard apply returned non-zero"
+  if [[ "$created" -eq 1 ]]; then
+    : >"${BACKUP_DIR}/netguard.created"
+  fi
+  # shellcheck disable=SC2016  # literal rollback code
+  _rb_append_block "gorecshit-netguard-restore" '
+if [[ -f "$BACKUP_DIR/netguard.created" ]]; then
+  /usr/local/sbin/gorecshit-netguard.sh --flush 2>/dev/null || true
+  systemctl disable gorecshit-netguard.service 2>/dev/null || true
+  rm -f /etc/systemd/system/gorecshit-netguard.service /usr/local/sbin/gorecshit-netguard.sh /etc/sysctl.d/99-gorecshit-netguard.conf
+  systemctl daemon-reload 2>/dev/null || true
+  echo "netguard removed"
+elif [[ -x /usr/local/sbin/gorecshit-netguard.sh ]]; then
+  /usr/local/sbin/gorecshit-netguard.sh || true
+fi
+# re-apply restored anti-probe (ufw reload drops its hook), then drop sets nothing references any more
+[[ -x /usr/local/sbin/gorecshit-anti-probe.sh ]] && /usr/local/sbin/gorecshit-anti-probe.sh >/dev/null 2>&1 || true
+iptables -L ufw-reject-input -n >/dev/null 2>&1 && { iptables -C ufw-reject-input -j DROP 2>/dev/null || iptables -I ufw-reject-input 1 -j DROP 2>/dev/null; } || true
+for _s in gorecshit-cdn gorecshit-snitch6 gorecshit-snitch gorecshit-rep; do ipset destroy "$_s" 2>/dev/null || true; done'
+  local what=()
+  [[ "$DO_P2P_BLOCK" -eq 1 ]] && what+=("торренты/DHT")
+  [[ "$DO_ABUSE_LIMIT" -eq 1 ]] && what+=("сканы/брутфорс/SMB")
+  [[ "$DO_PRIVATE_EGRESS" -eq 1 ]] && what+=("LAN хостера")
+  [[ "$DO_SNITCH_GUARD" -eq 1 ]] && what+=("VK/MAX")
+  ok "Netguard: ${what[*]:-ничего} — только новые соединения; 80/443 не инспектируются; скорость не трогаем"
+  if [[ "$DO_SNITCH_GUARD" -eq 1 ]]; then
+    log "VK/MAX/OK/mail.ru через ноду закрыты (MAX сдаёт IP VPN-серверов). Клиентам: РФ-сервисы — напрямую (split-routing в Happ)."
+  fi
+}
+
 configure_decoy_web() {
   # Optional: port 80 → 301 https (как у любого HTTPS-сайта). Only via existing nginx; otherwise recommendation.
   step "Декой :80 (опционально)"
@@ -5966,6 +6855,7 @@ ufw_remove_public_node_port() {
 }
 
 run_hardening() {
+  ensure_network_dns
   system_upgrade
   install_packages
   configure_sysctl
@@ -5978,6 +6868,7 @@ run_hardening() {
   configure_anti_probe
   configure_docker_user
   configure_egress_guard
+  configure_netguard
   configure_stealth
   configure_decoy_web
   configure_hostname_tz
@@ -6012,6 +6903,7 @@ main() {
         && "$DO_AUDIT" -eq 0 \
         && "$DO_FINGERPRINT_ONLY" -eq 0 \
         && "$DO_UPDATE_ONLY" -eq 0 \
+        && "$DO_IP_CHECK" -eq 0 && "$DO_ABUSE_REPORT" -eq 0 \
         && -t 0 && -t 1 ]]; then
     interactive_menu
   fi
@@ -6033,6 +6925,16 @@ main() {
 
   if [[ "$DO_FINGERPRINT_ONLY" -eq 1 ]]; then
     run_fingerprint_only
+    exit 0
+  fi
+
+  if [[ "$DO_IP_CHECK" -eq 1 ]]; then
+    run_ip_check
+    exit 0
+  fi
+
+  if [[ "$DO_ABUSE_REPORT" -eq 1 ]]; then
+    run_abuse_report
     exit 0
   fi
 

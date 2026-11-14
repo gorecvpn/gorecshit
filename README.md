@@ -2,7 +2,7 @@
 
 Однокомандное hardening-окружение для **нод Remnawave** (Debian 11+ / Ubuntu 20.04+).
 
-**Версия: 2.6.0**
+**Версия: 2.7.0**
 
 📍 **[Карта: как вычисляют VPN-ноду и что закрывает gorecshit](docs/detection-vectors.md)** — активное зондирование, DPI, Shodan/Censys, порты, IPv6, PTR, abuse и т.д.
 
@@ -17,7 +17,7 @@
 3. **Интерактивное меню (RU)** — при запуске в TTY без `--yes`: статус-строка + простые пункты с emoji (plain `read` + ANSI, whiptail не обязателен).
 4. **Обновление системы** — перед пакетами: пауза `apt-daily*` / `unattended-upgrades` (без kill dpkg), `dpkg --configure -a`, `apt-get update` + `full-upgrade` (сохранение локальных конфигов); сообщение если нужен reboot (**без** авто-reboot); в конце таймеры возвращаются. Пропуск: `--no-upgrade` / `GORECSHIT_NO_UPGRADE=1`.
 5. **Пакеты** — `ufw`, `fail2ban`, `ipset`, `chrony`, `curl`; при отключении IPv6 — `Acquire::ForceIPv4`.
-6. **UFW** — deny incoming (**DROP**), logging low; `limit 22/tcp`; клиентские TCP/UDP порты; `NODE_PORT` **только с IP панели**; deny публичного `4443/tcp`; whitelist HAProxy-релеев; анти-lockout (`$SSH_CLIENT`, `--allow-ssh-from`, `--relay-ips`).
+6. **UFW** — deny incoming (**DROP**), logging low; SSH 22: `allow` + тихий DROP-лимит 10 NEW/60 с в before.rules (вместо `ufw limit`, который отвечает REJECT и выдаёт сервер); клиентские TCP/UDP порты; `NODE_PORT` **только с IP панели**; deny публичного `4443/tcp`; whitelist HAProxy-релеев; анти-lockout (`$SSH_CLIENT`, `--allow-ssh-from`, `--relay-ips`).
 7. **Скрытие портов и ping** — ICMP echo-request → DROP; закрытые порты без RST/REJECT (DROP); не светить unreachable.
 8. **Anti-probing** — на клиентских портах только для **NEW**; `ESTABLISHED,RELATED` всегда в обход (без hashlimit/connlimit на датаплейне). Потолки NAT-friendly; **без** xt_recent soft-ban. Не ломает REALITY.
 9. **DOCKER-USER** — ограничение `NODE_PORT` на bridge-publish; Docker **не перезапускается**, пока живы remnanode/xray.
@@ -45,10 +45,12 @@
   7) ⬆️  Обновить gorecshit (GitHub)
   8) 🛡️  Проверка на блокировку и палевность ноды
   9) 🕵️  Скрыть отпечатки сервера
+ 10) 🧾 IP в чёрных списках / VPN-базах?
+ 11) 🚨 Что делали клиенты (торренты/сканы/спам/«стукачи»)
 ────────────────────────────────────────
   0) 🚪 Выход
-CLI: gorecshit [--status|--update|--audit|--stealth|--yes|--modules …]
-Выберите пункт [0-9]:
+CLI: gorecshit [--status|--update|--audit|--stealth|--ip-check|--abuse-report|--yes|--modules …]
+Выберите пункт [0-11]:
 ```
 
 ## Проверка DPI/блокировок
@@ -105,6 +107,25 @@ sudo gorecshit --stealth
 ```
 
 ## Changelog
+
+### v2.7.0 — «анти-бан»
+Почему IP нод попадают в бан и что из этого закрывает скрипт — см. [docs/detection-vectors.md](docs/detection-vectors.md) (раздел «v2.7.0»).
+
+- **Netguard** (новый модуль, по умолчанию вкл., `--no-netguard`): клиенты VPN больше не могут из-за ноды получить абуз хостеру. Только **NEW**-соединения, 443/tcp и 53/123/443/udp не инспектируются → **скорость не меняется** (проверено: одинаково с netguard и без; BBR/fq сохранены).
+  - торренты: DHT (`d1:ad2:id20:`), BitTorrent handshake (TCP/UDP), UDP-трекеры, `info_hash=` → DROP; пойманный поток помечается connmark, и его ретрансмиты тоже режутся (`--no-p2p-block`);
+  - сканы/брутфорс с ноды (22/23/3389/5900/БД/Redis/Docker API/WinRM/MikroTik): лимит NEW на порт и на цель → RST (`--no-abuse-limit`); SMB/NetBIOS наружу → REJECT;
+  - LAN хостера (10/8, 172.16/12, 192.168/16, 100.64/10) → REJECT, кроме DNS/NTP/DHCP, своих подсетей, docker/wg и резолверов (`--no-private-egress`); метадата 169.254 — только `--egress-block-metadata`;
+  - **«стукачи»**: VK / MAX / OK / mail.ru через ноду → REJECT (`--no-snitch-guard`). MAX шлёт на api.oneme.ru отчёты о доступности хостов и IP пользователя — с VPN это IP ноды;
+  - всё логируется с префиксами `[GS-P2P]`, `[GS-ABUSE]`, `[GS-SMB]`, `[GS-PRIV]`, `[GS-SNITCH]`; v4 + v6 + Docker (DOCKER-USER).
+- **Репутационные списки только на SSH.** В v2.6 firehol_level2 / blocklist.de / CINS / ipsum резали **все порты** — а в них сотни мобильных CGNAT-адресов МегаФона/МТС/Билайна, т.е. реальные клиенты из РФ. Теперь: сканеры (Shodan/Censys/Modat/Driftnet/ONYPHE/…, OpenFilters, Skipa, Spamhaus DROP) → все порты; атакующие → только SSH. Дополнительно фильтр по ASN мобильных операторов РФ и never-block Яндекс (AS13238/200350/215013, Yandex CDN 188.72.96.0/19, 89.223.9.0/24, 94.131.190.0/23) и Cloudflare.
+- **Встроенные списки** (сканеры, never-block, мобильные РФ, VK/MAX) — защита работает **офлайн**; при отсутствии интернета сохранённые списки не затираются. Обновление раз в сутки со случайной задержкой, атомарная подмена ipset (`ipset restore` + `swap`).
+- **Самолечение DNS**: если интернет по IP есть, а DNS нет — прописываются 1.1.1.1 / 8.8.8.8 / 77.88.8.8 (drop-in systemd-resolved или resolv.conf с бэкапом и откатом). Без сети вообще — понятное сообщение и офлайн-режим (без apt).
+- **Anti-probe**: эджи Yandex Cloud CDN / Cloudflare исключены из per-IP лимитов (один эдж = тысячи пользователей).
+- Меню **10 «Репутация IP»** (`--ip-check`): DNSBL (с защитой от подменяющих резолверов), blocklist.de, IPsum, базы «VPN/прокси» (proxycheck.io, ipapi.is).
+- Меню **11 «Что клиенты делали через ноду»** (`--abuse-report`): счётчики netguard, топ направлений за 24 ч, подсказки.
+- `--audit`: + репутация IP и раздел «Анти-бан» (netguard, роутинг xray: bittorrent / geoip:private / MAX, советы клиентам).
+- Исправления: **цикл systemd** (scanner-block `After=network-pre` + `Before=ufw` → после перезагрузки systemd мог выкинуть **ufw**, и файрвол не поднимался); `backup_file` больше не перезаписывает оригинал при повторном бэкапе; бэкап `ufw user.rules`; `--yes` без TTY больше не падает на `/dev/tty`.
+
 
 ### v2.6.0
 
@@ -263,6 +284,11 @@ sudo bash install.sh --panel-ip X.X.X.X --modules ufw,blocklist,hide_ports,anti_
 
 | Флаг | Описание |
 |------|----------|
+| `--no-netguard` | Без netguard (торренты/сканы/SMB/LAN/«стукачи» через ноду). |
+| `--no-p2p-block` / `--no-abuse-limit` / `--no-private-egress` / `--no-snitch-guard` | Отключить отдельные части netguard. |
+| `--egress-block-metadata` | Дополнительно закрыть 169.254.0.0/16 (метадата облака) для клиентов. |
+| `--ip-check` | Репутация IP ноды (DNSBL, списки атакующих, базы VPN/прокси), read-only. |
+| `--abuse-report` | Что клиенты пытались делать через ноду (счётчики и журнал netguard), read-only. |
 | `--panel-ip IP` | **Обязателен** в non-interactive (или `GORECSHIT_PANEL_IP`). |
 | `--node-port PORT\|auto` | Порт remnanode API (по умолчанию `auto`). |
 | `--client-ports LIST\|auto` | Клиентские TCP-порты (автодетект xray/rw-core/…; **без хардкода**). |
@@ -272,7 +298,7 @@ sudo bash install.sh --panel-ip X.X.X.X --modules ufw,blocklist,hide_ports,anti_
 | `--relay-ips IP,...` | Extra never-block / ACCEPT (по умолчанию HAProxy-релеи). |
 | `--ssh-port N` | Добавить SSH-порт N (22 сохраняется). |
 | `--blocklist-from SRC` | URL / ssh-host / путь — запасной источник blocklist. |
-| `--modules LIST` | `ufw,blocklist,hide_ports,anti_probe,ssh,stealth,fail2ban,sysctl,hostname,docker,egress_guard,decoy_web` или `all`/`minimum` (`decoy_web` не входит в `all`). |
+| `--modules LIST` | `ufw,blocklist,hide_ports,anti_probe,ssh,stealth,fail2ban,sysctl,hostname,docker,egress_guard,netguard,decoy_web` или `all`/`minimum` (`decoy_web` не входит в `all`). |
 | `--no-hide-ports` / `--no-anti-probe` / `--no-stealth` | Отключить соответствующие модули. |
 | `--no-egress-guard` | Не блокировать исходящий SMTP (по умолчанию блокируется TCP 25). |
 | `--egress-block-ports LIST` | Какие исходящие TCP-порты блокировать (по умолчанию `25`; например `25,465,587`). |
@@ -306,6 +332,15 @@ sudo /root/hardening-backups/<timestamp>/rollback.sh
 - Never-block всегда включает панель (когда передана), релеи и текущий `$SSH_CLIENT` — SSH не отрежется.
 - FireHOL/крупные списки фильтруются: private/bogons, prefixlen&lt;12, пересечение с never-block.
 - `--dpi-check` только диагностирует egress; ничего не меняет и не рестартит сервисы.
+- DNS скрипт меняет **только** если он не работает (самолечение, с откатом).
+- Netguard по умолчанию закрывает VK/MAX/OK/mail.ru **через ноду**. Клиентам нужен split-routing (РФ — напрямую), иначе эти сервисы при включённом VPN не откроются. Не нужно — `--no-snitch-guard`.
+
+## Что скрипт НЕ может исправить
+- **Белые списки мобильных операторов** и блокировку по подсети/ASN хостера: режется сам IP, лечится только сменой IP/ASN (или РФ-релеем/CDN).
+- **Заморозка TLS после ~16–20 КБ** к зарубежным ДЦ — свойство ТСПУ; помогают CDN-схемы, xhttp, РФ-релей.
+- **Отпечаток и поведение клиента**: в июне 2026 под подозрением отпечатки chrome/safari/ios и >3 параллельных TLS-рукопожатия за ~100 мс. В подписке: `fingerprint: firefox`, mux/xmux вместо пачки соединений.
+- **Утечки**: опубликованная подписка/конфиг = IP в списках. РФ-приложения (MAX, банки, маркетплейсы) видят IP ноды, если идут через VPN — давайте клиентам split-routing (`geoip:ru`, `geosite:category-ru` → direct).
+- **В профиле Xray** (панель): `protocol: bittorrent → block`, `geoip:private → block`, домены `oneme.ru`, `max.ru` → block; Torrent Blocker плагин Remnawave.
 
 ## Требования
 

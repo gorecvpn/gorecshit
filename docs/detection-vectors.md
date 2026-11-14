@@ -4,7 +4,7 @@
 
 - **как работает**;
 - **источник**;
-- **gorecshit** (v2.6.0):
+- **gorecshit** (v2.7.0):
   - 🛡 — закрывает на сервере (меню 1 / 9);
   - 🔍 — проверяет в аудите (меню 8 / `--audit`);
   - 👤 — сервер это не закрывает: нужна панель, конфиг xray, хостер или клиент. Рядом стоит конкретная рекомендация.
@@ -100,11 +100,24 @@
 
 ---
 
+## I. Почему банят именно IP ноды (v2.7.0)
+
+| # | Способ | Как работает | Источник | gorecshit |
+|---|---|---|---|---|
+| I1 | «Стукачи» в РФ-приложениях | MAX периодически отправляет на `api.oneme.ru` отчёт HOST_REACHABILITY: какие хосты доступны, IP пользователя, признак VPN. С VPN это IP ноды. Методичка Минцифры (апрель 2026) требует от крупных РФ-сервисов передавать IP VPN | [Хабр 1006666](https://habr.com/ru/articles/1006666/), [Xakep: реверс MAX](https://xakep.ru/2026/03/06/max-reverse/), [Хабр 1023352](https://habr.com/ru/articles/1023352/) | 🛡 netguard: VK/MAX/OK/mail.ru (ASN 47541/47764/28709/49797/60863 + домены oneme/max) через ноду → REJECT. 👤 Клиентам split-routing: РФ — напрямую; в профиле xray `domain: oneme.ru, max.ru → block` |
+| I2 | Правила июня 2026: отпечаток + параллельные рукопожатия | Подозрительная подсеть + отпечаток Chrome/Safari/iOS + >3 параллельных TLS-рукопожатий за ~100 мс → заморозка на 120 с; смена отпечатка после этого → 600 с. Firefox проходил | [pvsm.ru 452789](https://www.pvsm.ru/vpn/452789), [Хабр 1046263](https://habr.com/ru/articles/1046263/) | 👤 В подписке `fingerprint: firefox`, mux/xmux вместо пачки соединений |
+| I3 | Белые списки мобильных сетей | На мобильном интернете пропускаются только разрешённые подсети/ASN — зарубежный хостер не проходит вообще | [host.pink: ТСПУ на пальцах](https://host.pink/gaidy/tspu-na-paltsah), [Хабр 1042152](https://habr.com/ru/articles/1042152/) | 👤 Не лечится скриптом: РФ-релей/CDN или IP из списка |
+| I4 | Абуз хостеру от клиентов VPN | Торренты (DMCA), сканы и брутфорс, спам с 25 порта, SMB, атаки на LAN хостера. Хостер блокирует IP/сервер, IP попадает в blocklist.de/FireHOL/Spamhaus, дальше — в «грязные» списки цензора и антифрода | AUP хостеров, [Remnawave Node Plugins](https://wiki.egam.es/configuration/node-plugins) | 🛡 netguard (P2P, сканы, SMB, LAN) + egress_guard (SMTP); 🔍 `--ip-check`, `--abuse-report` |
+| I5 | Ложные баны своих клиентов | Репутационные списки (firehol_level2, blocklist.de, CINS, ipsum) содержат CGNAT-адреса МегаФона/МТС/Билайна. В v2.6 они резали все порты → у клиентов из РФ «нода не работает» | Аудит g4 (≈100 адресов МегаФона в блоклисте) | 🛡 v2.7: репутация только на SSH; фильтр мобильных ASN РФ |
+| I6 | Отпечаток файрвола | `ufw limit` отвечает REJECT (ICMP unreachable) — нестандартный ответ выдаёт защищённый сервер | — | 🛡 v2.7: тихий DROP-лимит |
+| I7 | Сканеры-«сдатчики» | Modat (AS209334), Censys, Driftnet, ONYPHE и др. публикуют найденные сервисы — по этим базам ищут ноды | [OpenFilters internet-scanners](https://github.com/openfilters), RIPEstat | 🛡 встроенные + ежедневные списки, ASN через RIPEstat, Yandex/Cloudflare в never-block |
+
 ## Что может сделать только владелец
 
 1. **PTR** у хостера → нейтральный (например `mail.<ваш-домен>` или имя сайта).
 2. **Панель → inbound REALITY**: порт 443, `flow=xtls-rprx-vision`, `dest` и `serverNames` с одного крупного сайта с TLS1.3+h2. Лучше всего на том же ASN/ДЦ, что нода (RealiTLScanner), плюс несколько `shortIds`.
-3. **Панель → routing**: `protocol: bittorrent → blackhole` (или плагин Torrent Blocker).
+3. **Панель → routing**: `protocol: bittorrent → blackhole` (или плагин Torrent Blocker), `geoip:private → block`, `domain: oneme.ru, max.ru → block`.
+7. **Клиенты (Happ и т.п.)**: split-routing `geoip:ru` / `geosite:category-ru` → direct; `fingerprint: firefox`; не раздавать подписки публично.
 4. **Образ remnanode/xray** ≥ 25.6.8 (обновлять в окно обслуживания, gorecshit Docker не перезапускает).
 5. **Хостер/IP**: если check-host показывает «зарубежье видит, РФ — нет», меняйте IP или ставьте РФ-relay (каскад). Белые списки сервер не обойдёт.
 6. **Не светить** домены панели и подписки на IP ноды. Не публиковать подписки.
