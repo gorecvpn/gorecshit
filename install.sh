@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# gorecshit v2.7.0 — one-command hardening for Remnawave VPN node servers (Debian 11+/Ubuntu 20.04+)
+# gorecshit v2.7.1 — one-command hardening for Remnawave VPN node servers (Debian 11+/Ubuntu 20.04+)
 # Usage:
 #   bash install.sh --panel-ip X.X.X.X [--node-port 2222] [--yes]
 #   bash install.sh --check --panel-ip X.X.X.X
@@ -8,7 +8,7 @@
 # Does NOT restart Docker while remnanode/xray is live. Does NOT deploy itself.
 set -Eeuo pipefail
 
-VERSION="2.7.0"
+VERSION="2.7.1"
 SCRIPT_NAME="gorecshit"
 BACKUP_ROOT="/root/hardening-backups"
 
@@ -67,7 +67,7 @@ DO_DOCKER_JOURNAL=1
 DO_EGRESS_GUARD=1        # --no-egress-guard: skip outbound SMTP block
 EGRESS_BLOCK_PORTS="25"   # --egress-block-ports LIST (e.g. 25,465,587)
 DO_DECOY_WEB=0           # --decoy-web: :80 → 301 https via existing nginx (else asks via /dev/tty, default no)
-# v2.7.0 site camouflage (domain + Let's Encrypt + static site for REALITY self-steal)
+# v2.7.1 site camouflage (domain + Let's Encrypt + static site for REALITY self-steal)
 DO_SITE=0                # module "site" (needs --site-domain)
 DO_SITE_ONLY=0           # --site / menu 10: run only the site module
 SITE_STANDALONE=0
@@ -1380,7 +1380,7 @@ _audit_reachability_from_russia() {
 }
 
 _audit_is_own_site() {
-  # true, если строка dest/SNI/CN указывает на наш сайт-маскировку (v2.7.0 self-steal)
+  # true, если строка dest/SNI/CN указывает на наш сайт-маскировку (v2.7.1 self-steal)
   local s="${1,,}" d="" l="" p=""
   [[ -f /var/lib/gorecshit/site.env ]] || return 1
   d="$(sed -n 's/^SITE_DOMAIN=//p' /var/lib/gorecshit/site.env | head -1)"
@@ -5932,7 +5932,7 @@ configure_decoy_web() {
   step "Декой :80 (опционально)"
   local reason=""
   if [[ "$DO_SITE" -eq 1 || -f "$SITE_NGINX_CONF" ]]; then
-    reason="порт 80 обслуживает сайт-маскировка (v2.7.0: ACME + 301 → https://домен)"
+    reason="порт 80 обслуживает сайт-маскировка (v2.7.1: ACME + 301 → https://домен)"
   elif [[ "$MODE" == "cdn" || "$CADDY_PRESENT" -eq 1 ]]; then
     reason="Caddy/CDN-режим — порт 80 уже ваш"
   elif ss -Hltn '( sport = :80 )' 2>/dev/null | grep -q .; then
@@ -6006,7 +6006,7 @@ fi'
   ok "Декой :80 включён (301 → https, server_tokens off)"
 }
 
-# ---------- v2.7.0: «Сайт-маскировка» — домен ноды + Let's Encrypt + многостраничный сайт ----------
+# ---------- v2.7.1: «Сайт-маскировка» — домен ноды + Let's Encrypt + многостраничный сайт ----------
 # Схема self-steal: nginx отдаёт настоящий сайт с настоящим сертификатом на 127.0.0.1:SITE_PORT,
 # REALITY на 443 использует target=127.0.0.1:SITE_PORT и serverNames=[домен].
 # Скрипт НЕ трогает конфиг панели/инбаунды — печатает значения, которые вставляются вручную.
@@ -6014,6 +6014,8 @@ fi'
 # Слова, которых не должно быть на сайте (проверка генератора и аудита). Кириллица — тремя
 # регистрами явно: grep -i в C-локали не понимает кириллицу.
 SITE_FORBIDDEN_RE='vpn|proxy|xray|v2ray|vless|reality|remnawave|gorec|tunnel|прокси|Прокси|ПРОКСИ|впн|Впн|ВПН|обход|Обход|ОБХОД'
+# Слова в домене — только предупреждение (домен выбирает владелец нод, напр. gorecvpn.top)
+SITE_DOMAIN_FORBIDDEN_RE='vpn|proxy|xray|v2ray|vless|reality|remnawave|tunnel'
 SITE_STATE_FILE="/var/lib/gorecshit/site.env"
 SITE_NGINX_CONF="/etc/nginx/conf.d/gorecshit-site.conf"
 SITE_ACME_ROOT="/var/www/letsencrypt"
@@ -6760,9 +6762,8 @@ configure_site() {
     err "Некорректный домен: ${SITE_DOMAIN} (нужно вида node.example.ru; кириллицу — в punycode xn--…)"
     return 1
   fi
-  if LC_ALL=C grep -qiE "$SITE_FORBIDDEN_RE" <<<"$SITE_DOMAIN"; then
-    err "В домене ${SITE_DOMAIN} есть «палевное» слово ($(LC_ALL=C grep -oiE "$SITE_FORBIDDEN_RE" <<<"$SITE_DOMAIN" | head -1)). SNI виден DPI открытым текстом — возьмите нейтральный поддомен (cdn, static, mail, files…)."
-    return 1
+  if LC_ALL=C grep -qiE "$SITE_DOMAIN_FORBIDDEN_RE" <<<"$SITE_DOMAIN"; then
+    warn "В домене ${SITE_DOMAIN} есть слово «$(LC_ALL=C grep -oiE "$SITE_DOMAIN_FORBIDDEN_RE" <<<"$SITE_DOMAIN" | head -1)» — SNI виден DPI открытым текстом, нейтральное имя заметно надёжнее. Продолжаю по вашему выбору."
   fi
   case "$SITE_THEME" in auto|random|it|photo|translate|coffee) ;; *) err "Неизвестная тема --site-theme ${SITE_THEME} (it|photo|translate|coffee|auto)"; return 1 ;; esac
   case "$SITE_MODE" in auto|selfsteal|public) ;; *) err "--site-mode: auto|selfsteal|public"; return 1 ;; esac
@@ -7155,7 +7156,9 @@ _audit_site() {
       for p in "${paths[@]}"; do
         n=$((n + 1))
         _site_local_get "$p" -o "$tmp/page" 2>/dev/null || true
-        hits="$(LC_ALL=C grep -oiE "$SITE_FORBIDDEN_RE" "$tmp/page" 2>/dev/null | sort -u | paste -sd, - || true)"
+        # сам домен ноды (и его базовый домен в e-mail/ссылках) не считаем — его выбирает владелец
+        local dbase="${d#*.}"; [[ "$dbase" == *.* ]] || dbase="$d"
+        hits="$(sed -E "s/${dbase//./\\.}//Ig" "$tmp/page" 2>/dev/null | LC_ALL=C grep -oiE "$SITE_FORBIDDEN_RE" 2>/dev/null | sort -u | paste -sd, - || true)"
         if [[ -n "$hits" ]]; then
           _audit_warn "Страница ${p}: найдены слова «${hits}» (текст/title/meta/комментарии) — уберите их с сайта"
           bad=1
