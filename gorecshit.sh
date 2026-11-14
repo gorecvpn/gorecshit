@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# gorecshit v2.7.1 — one-command hardening for Remnawave VPN node servers (Debian 11+/Ubuntu 20.04+)
+# gorecshit v2.7.2 — one-command hardening for Remnawave VPN node servers (Debian 11+/Ubuntu 20.04+)
 # Usage:
 #   bash install.sh --panel-ip X.X.X.X [--node-port 2222] [--yes]
 #   bash install.sh --check --panel-ip X.X.X.X
@@ -8,7 +8,7 @@
 # Does NOT restart Docker while remnanode/xray is live. Does NOT deploy itself.
 set -Eeuo pipefail
 
-VERSION="2.7.1"
+VERSION="2.7.2"
 SCRIPT_NAME="gorecshit"
 BACKUP_ROOT="/root/hardening-backups"
 
@@ -67,7 +67,7 @@ DO_DOCKER_JOURNAL=1
 DO_EGRESS_GUARD=1        # --no-egress-guard: skip outbound SMTP block
 EGRESS_BLOCK_PORTS="25"   # --egress-block-ports LIST (e.g. 25,465,587)
 DO_DECOY_WEB=0           # --decoy-web: :80 → 301 https via existing nginx (else asks via /dev/tty, default no)
-# v2.7.1 site camouflage (domain + Let's Encrypt + static site for REALITY self-steal)
+# v2.7.2 site camouflage (domain + Let's Encrypt + static site for REALITY self-steal)
 DO_SITE=0                # module "site" (needs --site-domain)
 DO_SITE_ONLY=0           # --site / menu 10: run only the site module
 SITE_STANDALONE=0
@@ -1380,7 +1380,7 @@ _audit_reachability_from_russia() {
 }
 
 _audit_is_own_site() {
-  # true, если строка dest/SNI/CN указывает на наш сайт-маскировку (v2.7.1 self-steal)
+  # true, если строка dest/SNI/CN указывает на наш сайт-маскировку (v2.7.2 self-steal)
   local s="${1,,}" d="" l="" p=""
   [[ -f /var/lib/gorecshit/site.env ]] || return 1
   d="$(sed -n 's/^SITE_DOMAIN=//p' /var/lib/gorecshit/site.env | head -1)"
@@ -5932,7 +5932,7 @@ configure_decoy_web() {
   step "Декой :80 (опционально)"
   local reason=""
   if [[ "$DO_SITE" -eq 1 || -f "$SITE_NGINX_CONF" ]]; then
-    reason="порт 80 обслуживает сайт-маскировка (v2.7.1: ACME + 301 → https://домен)"
+    reason="порт 80 обслуживает сайт-маскировка (v2.7.2: ACME + 301 → https://домен)"
   elif [[ "$MODE" == "cdn" || "$CADDY_PRESENT" -eq 1 ]]; then
     reason="Caddy/CDN-режим — порт 80 уже ваш"
   elif ss -Hltn '( sport = :80 )' 2>/dev/null | grep -q .; then
@@ -6006,7 +6006,7 @@ fi'
   ok "Декой :80 включён (301 → https, server_tokens off)"
 }
 
-# ---------- v2.7.1: «Сайт-маскировка» — домен ноды + Let's Encrypt + многостраничный сайт ----------
+# ---------- v2.7.2: «Сайт-маскировка» — домен ноды + Let's Encrypt + многостраничный сайт ----------
 # Схема self-steal: nginx отдаёт настоящий сайт с настоящим сертификатом на 127.0.0.1:SITE_PORT,
 # REALITY на 443 использует target=127.0.0.1:SITE_PORT и serverNames=[домен].
 # Скрипт НЕ трогает конфиг панели/инбаунды — печатает значения, которые вставляются вручную.
@@ -6023,7 +6023,17 @@ SITE_THEMES="it photo translate coffee"
 
 site_forbidden_scan() {
   # site_forbidden_scan FILE... — печатает «файл:строка:совпадение»; rc 0 если что-то найдено
-  LC_ALL=C grep -HnoiE "$SITE_FORBIDDEN_RE" "$@" 2>/dev/null
+  # Домен ноды (и его базовый домен в e-mail/ссылках/robots/sitemap) не считаем — его выбирает владелец.
+  local base="${SITE_DOMAIN#*.}" line f rest ln txt m out=""
+  [[ "$base" == *.* ]] || base="$SITE_DOMAIN"
+  while IFS= read -r line; do
+    f="${line%%:*}"; rest="${line#*:}"; ln="${rest%%:*}"; txt="${rest#*:}"
+    [[ -n "$base" ]] && txt="$(sed -E "s/${base//./\\.}//Ig" <<<"$txt")"
+    m="$(LC_ALL=C grep -oiE "$SITE_FORBIDDEN_RE" <<<"$txt" | sort -u | paste -sd, - || true)"
+    [[ -n "$m" ]] && out+="${f}:${ln}:${m}"$'\n'
+  done < <(LC_ALL=C grep -HniE "$SITE_FORBIDDEN_RE" "$@" 2>/dev/null)
+  [[ -n "$out" ]] || return 1
+  printf '%s' "$out"
 }
 
 _site_seed_from() {
