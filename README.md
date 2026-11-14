@@ -2,7 +2,7 @@
 
 Однокомандное hardening-окружение для **нод Remnawave** (Debian 11+ / Ubuntu 20.04+).
 
-**Версия: 2.6.0**
+**Версия: 2.7.0**
 
 📍 **[Карта: как вычисляют VPN-ноду и что закрывает gorecshit](docs/detection-vectors.md)** — активное зондирование, DPI, Shodan/Censys, порты, IPv6, PTR, abuse и т.д.
 
@@ -45,10 +45,11 @@
   7) ⬆️  Обновить gorecshit (GitHub)
   8) 🛡️  Проверка на блокировку и палевность ноды
   9) 🕵️  Скрыть отпечатки сервера
+  10) 🌐 Сайт-маскировка (поддомен + сертификат + сайт)
 ────────────────────────────────────────
   0) 🚪 Выход
-CLI: gorecshit [--status|--update|--audit|--stealth|--yes|--modules …]
-Выберите пункт [0-9]:
+CLI: gorecshit [--status|--update|--audit|--stealth|--site-domain D|--yes|--modules …]
+Выберите пункт [0-10]:
 ```
 
 ## Проверка DPI/блокировок
@@ -87,6 +88,75 @@ sudo bash install.sh --audit
 gorecshit --audit
 ```
 
+## Сайт-маскировка (поддомен + сертификат + сайт)
+
+Модуль v2.7.0 (меню **10** / `--site-domain`). Ставит на поддомен ноды настоящий сертификат Let's Encrypt и правдоподобный многостраничный сайт. Затем REALITY отдаёт этот сайт всем, кто подключается без ключа (схема **self-steal**): зонд ТСПУ или сканер видит обычный сайт-визитку с валидным сертификатом на том же IP, а не чужой `dest`.
+
+**Что нужно заранее:** A-запись `поддомен → IP ноды`. В Cloudflare — серое облако («DNS only»), оранжевое не подойдёт. AAAA либо не создавать, либо указать IPv6 ноды. В имени поддомена не должно быть слов vpn/proxy/xray и т.п.: SNI виден DPI. Скрипт такой домен не примет.
+
+```bash
+sudo gorecshit --update
+sudo gorecshit --site-domain cdn.example.ru --site-email you@example.ru
+# или меню: gorecshit → 10
+```
+
+Что делает:
+
+1. Проверяет DNS через DoH: A/AAAA должны указывать на IP этой ноды. Отдельно ловит оранжевое облако Cloudflare.
+2. Выбирает режим сам и спрашивает подтверждение:
+   - **selfsteal** — 443 занят xray (REALITY). nginx отдаёт сайт только на `127.0.0.1:9443`.
+   - **public** — 443 свободен. nginx слушает и публичный 443, и `127.0.0.1:9443` (для REALITY на другом порту).
+3. Ставит `nginx` и `certbot` (apt). Выпускает сертификат по HTTP-01 через webroot на :80. В UFW открывает `80/tcp`: у обычного сайта 80 открыт и отвечает 301 на https. С `--site-close-80` порт закрывается после выпуска, а при продлении certbot открывает его примерно на минуту и закрывает обратно.
+4. Генерирует статический сайт:
+   - страницы: главная, «О нас», «Услуги»/«Меню»/«Съёмки», «Блог» с 3–5 статьями, «Контакты», 404, `robots.txt`, `sitemap.xml`, `favicon.svg`/`.ico`, CSS;
+   - 4 темы: IT-студия, фотостудия, бюро переводов, кофейня. Тема выбирается от домена, или флагом `--site-theme`;
+   - название, город, палитра, шрифт, раскладка, набор услуг и статей, даты и `Last-Modified` рандомизируются от домена и сида, поэтому ноды не похожи друг на друга;
+   - нет форм, нет сбора данных, нет упоминаний VPN/прокси. Генератор сам проверяет страницы на «палевные» слова и не публикует сайт, если что-то нашёл.
+5. Пишет `/etc/nginx/conf.d/gorecshit-site.conf`:
+   - TLS 1.2/1.3, X25519, h2, HSTS, `server_tokens off`, без access-логов;
+   - `:80` → ACME + 301 на `https://домен`.
+
+   Декой :80 из v2.6.0 и стандартный «Welcome to nginx» заменяются (с бэкапом).
+6. Автопродление: `certbot.timer` (или cron) плюс deploy-hook `reload nginx`.
+7. Печатает **точные значения для панели**. Сам скрипт панель и инбаунды **не меняет**.
+
+**Значения для панели Remnawave** (Config Profiles → inbound VLESS REALITY на 443 → `realitySettings`):
+
+```json
+"target": "127.0.0.1:9443",
+"serverNames": ["cdn.example.ru"],
+"xver": 0
+```
+
+- В старых xray поле называется `dest`.
+- С `--site-proxy-protocol` нужно `"xver": 1`.
+- `privateKey` и `shortIds` не меняются.
+- В **Hosts** поле SNI = `cdn.example.ru`.
+- Плавный переход: добавьте новый домен в `serverNames` рядом со старыми, смените SNI в Hosts, через сутки уберите старые.
+- remnanode по умолчанию работает в `network_mode: host`, поэтому `127.0.0.1` в контейнере — это хост. Если compose не в host-сети, скрипт слушает на IP `docker0` и открывает UFW для `172.16.0.0/12` → порт.
+
+Флаги:
+- `--site-theme it|photo|translate|coffee|auto`
+- `--site-mode auto|selfsteal|public`
+- `--site-port 9443`
+- `--site-listen IP`
+- `--site-proxy-protocol`
+- `--site-close-80`
+- `--site-seed S` — сгенерировать другой сайт
+- `--site-skip-dns-check`
+
+С `--panel-ip` модуль входит в полную установку (`--modules …,site` / меню 2 → 13).
+
+Аудит (меню 8) проверяет:
+- сертификат (ошибка, если истёк; предупреждение, если до конца < 14 дней);
+- автопродление;
+- DNS → IP;
+- сайт через локальный порт (HTTP 200 и заголовки);
+- **все страницы из sitemap + robots + sitemap + 404**: ищет слова vpn/proxy/прокси/впн/xray/v2ray/vless/reality/remnawave/gorec/обход/tunnel в тексте, title, meta и HTML-комментариях;
+- что снаружи `IP:443` с SNI домена отдаёт **ваш** сертификат, то есть панель уже переключена.
+
+Откат: `gorecshit --rollback`. Удаляет конфиг, сайт и выпущенный этим запуском сертификат, правила UFW 80/443, хуки. Декой и дефолтный сайт nginx возвращаются.
+
 ## Скрытие отпечатков сервера
 
 Опциональный модуль (меню «9» / `--stealth`), также вызывается из stealth при полной установке. **Не снижает скорость**, не трогает IPv6, клиентские порты firewall, Docker compose и настройки панели. Рискованные шаги (hostname, stop сервисов) спрашивают через `/dev/tty` (по умолчанию нет). Бэкап + откат через `--rollback`.
@@ -105,6 +175,28 @@ sudo gorecshit --stealth
 ```
 
 ## Changelog
+
+### v2.7.0
+
+- Новый модуль **«Сайт-маскировка»** (меню 10, `--site-domain D [--site-email E]`, `--modules …,site`, меню 2 → 13):
+  - поддомен ноды + Let's Encrypt (certbot webroot, HTTP-01 через :80, автопродление + reload nginx, опционально `--site-close-80` с временным открытием 80 при продлении);
+  - многостраничный сайт из 4 тем с рандомизацией от домена;
+  - nginx для REALITY **self-steal** (`target 127.0.0.1:9443`, `serverNames=[домен]`, опционально PROXY protocol / `xver 1`) или public 443, если он свободен.
+- Проверки перед установкой:
+  - DNS A/AAAA → IP ноды через DoH, детект оранжевого облака Cloudflare;
+  - запрет «палевных» слов в домене;
+  - порты 80 и 9443 не заняты чужими процессами;
+  - remnanode в host-сети (иначе слушаем на docker0).
+- Скрипт печатает точные значения для инбаунда в панели; панель не трогает.
+- Бэкап и откат через `--rollback`. Декой :80 v2.6.0 при установке сайта заменяется, а без сайта работает как раньше.
+- `--audit` / меню 8, новый раздел «Сайт-маскировка»:
+  - сертификат (< 14 дней) и автопродление;
+  - DNS;
+  - отдача через локальный порт;
+  - фильтр слов (vpn, proxy, прокси, впн, xray, v2ray, vless, reality, remnawave, gorec, обход, tunnel) по всем страницам, sitemap, robots, 404, title, meta и комментариям;
+  - внешний `IP:443` с SNI домена отдаёт наш сертификат;
+  - напоминание сверить `serverNames`.
+- `--status` показывает домен, режим и порт сайта.
 
 ### v2.6.0
 
@@ -272,11 +364,14 @@ sudo bash install.sh --panel-ip X.X.X.X --modules ufw,blocklist,hide_ports,anti_
 | `--relay-ips IP,...` | Extra never-block / ACCEPT (по умолчанию HAProxy-релеи). |
 | `--ssh-port N` | Добавить SSH-порт N (22 сохраняется). |
 | `--blocklist-from SRC` | URL / ssh-host / путь — запасной источник blocklist. |
-| `--modules LIST` | `ufw,blocklist,hide_ports,anti_probe,ssh,stealth,fail2ban,sysctl,hostname,docker,egress_guard,decoy_web` или `all`/`minimum` (`decoy_web` не входит в `all`). |
+| `--modules LIST` | `ufw,blocklist,hide_ports,anti_probe,ssh,stealth,fail2ban,sysctl,hostname,docker,egress_guard,decoy_web,site` или `all`/`minimum` (`decoy_web` и `site` не входят в `all`). |
 | `--no-hide-ports` / `--no-anti-probe` / `--no-stealth` | Отключить соответствующие модули. |
 | `--no-egress-guard` | Не блокировать исходящий SMTP (по умолчанию блокируется TCP 25). |
 | `--egress-block-ports LIST` | Какие исходящие TCP-порты блокировать (по умолчанию `25`; например `25,465,587`). |
 | `--decoy-web` | Декой `:80 → 301 https` через существующий nginx (только если безопасно). |
+| `--site-domain D` | Сайт-маскировка: поддомен + Let's Encrypt + сайт для REALITY self-steal. Без `--panel-ip` запускает только этот модуль. |
+| `--site-email E` / `--site-theme T` / `--site-mode M` / `--site-port N` / `--site-listen IP` | Почта для LE; тема `it\|photo\|translate\|coffee\|auto`; режим `auto\|selfsteal\|public`; локальный порт (9443); адрес (127.0.0.1). |
+| `--site-proxy-protocol` / `--site-close-80` / `--site-seed S` / `--site-skip-dns-check` | PROXY protocol (`xver 1`); закрыть 80 после выпуска; другой сайт; без проверки DNS. |
 | `--tcp-timestamps-off` | `net.ipv4.tcp_timestamps=0`. |
 | `--ipv6-off` | Опционально отключить IPv6 (по умолчанию IPv6 **остаётся**). |
 | `--no-ipv6-off` / `--no-blocklist` / `--no-hostname` / … | Как в v2.0 (`--no-ipv6-off` = поведение по умолчанию). |

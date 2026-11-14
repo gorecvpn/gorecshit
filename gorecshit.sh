@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# gorecshit v2.6.0 — one-command hardening for Remnawave VPN node servers (Debian 11+/Ubuntu 20.04+)
+# gorecshit v2.7.0 — one-command hardening for Remnawave VPN node servers (Debian 11+/Ubuntu 20.04+)
 # Usage:
 #   bash install.sh --panel-ip X.X.X.X [--node-port 2222] [--yes]
 #   bash install.sh --check --panel-ip X.X.X.X
@@ -8,7 +8,7 @@
 # Does NOT restart Docker while remnanode/xray is live. Does NOT deploy itself.
 set -Eeuo pipefail
 
-VERSION="2.6.0"
+VERSION="2.7.0"
 SCRIPT_NAME="gorecshit"
 BACKUP_ROOT="/root/hardening-backups"
 
@@ -67,6 +67,26 @@ DO_DOCKER_JOURNAL=1
 DO_EGRESS_GUARD=1        # --no-egress-guard: skip outbound SMTP block
 EGRESS_BLOCK_PORTS="25"   # --egress-block-ports LIST (e.g. 25,465,587)
 DO_DECOY_WEB=0           # --decoy-web: :80 → 301 https via existing nginx (else asks via /dev/tty, default no)
+# v2.7.0 site camouflage (domain + Let's Encrypt + static site for REALITY self-steal)
+DO_SITE=0                # module "site" (needs --site-domain)
+DO_SITE_ONLY=0           # --site / menu 10: run only the site module
+SITE_STANDALONE=0
+SITE_DOMAIN=""           # --site-domain node.example.ru
+SITE_EMAIL=""            # --site-email (Let's Encrypt account, optional)
+SITE_THEME="auto"        # --site-theme it|photo|translate|coffee|auto
+SITE_MODE="auto"         # --site-mode auto|selfsteal|public
+SITE_MODE_ACTIVE=""
+SITE_PORT=9443           # --site-port: local TLS port nginx serves for REALITY target
+SITE_LISTEN="127.0.0.1"  # --site-listen: local address (docker bridge IP if remnanode is not host-network)
+SITE_PP=0                # --site-proxy-protocol: nginx expects PROXY protocol (xver=1)
+SITE_CLOSE80=0           # --site-close-80: close 80/tcp after issue; open briefly on renewal
+SITE_SKIP_DNS=0          # --site-skip-dns-check
+SITE_SEED=""             # --site-seed: change to regenerate a different site
+SITE_ROOT=""
+SITE_PORT_SET=""; SITE_LISTEN_SET=""; SITE_PP_SET=""
+SITE_NET_HOST=2
+SITE_DEFAULT80=1
+SITE_GEN_THEME=""
 AUDIT_PUB_IP=""
 AUDIT_RU_NODES=()
 AUDIT_FOREIGN_NODES=()
@@ -223,6 +243,7 @@ Usage:
   install.sh --dpi-check             # outbound DPI / DNS / TLS checks (node egress)
   install.sh --audit                 # RU reachability + detectability self-audit (read-only)
   install.sh --stealth               # hide server fingerprints (banners/MOTD/ICMP FP/…)
+  install.sh --site-domain D [--site-email E]   # node subdomain + Let's Encrypt + decoy website
 
 Required (non-interactive apply):
   --panel-ip IP              Management/panel host allowed to reach NODE_PORT
@@ -236,8 +257,8 @@ Options:
   --ssh-port N               Add SSH listen port N (ufw first, sshd -t, keep 22 until confirmed)
   --blocklist-from SRC       Copy/fetch blocklist from ssh-host, URL, or local path (fallback)
   --modules LIST             Comma modules: ufw,blocklist,hide_ports,anti_probe,ssh,stealth,
-                             fail2ban,sysctl,hostname,docker,egress_guard,decoy_web
-                             (default: all enabled except decoy_web)
+                             fail2ban,sysctl,hostname,docker,egress_guard,decoy_web,site
+                             (default: all enabled except decoy_web and site)
   --ipv6-off                 Opt-in: disable IPv6 via sysctl (default: keep IPv6 on; safer under dual-stack xray)
   --no-ipv6-off              Keep IPv6 enabled (default; retained for compatibility)
   --no-blocklist             Skip scanner ipset blocklist
@@ -248,6 +269,18 @@ Options:
   --no-egress-guard          Skip outbound SMTP block (abuse guard) for host + docker
   --egress-block-ports LIST  Outbound TCP ports to block (default: 25; e.g. 25,465,587)
   --decoy-web                Port 80 → 301 https via existing nginx (only if safe; else skip)
+  --site                     Only the site module (menu 10): subdomain + Let's Encrypt + website
+  --site-domain DOMAIN       Node subdomain (A record → this IP, Cloudflare "DNS only").
+                             Alone = --site; with --panel-ip = added to full install
+  --site-email EMAIL         Let's Encrypt account e-mail (optional)
+  --site-theme T             it|photo|translate|coffee|auto (default auto, picked from domain)
+  --site-mode M              auto|selfsteal|public (auto: 443 busy by xray → selfsteal)
+  --site-port N              Local TLS port for REALITY target (default 9443)
+  --site-listen IP           Local listen address (default 127.0.0.1; docker0 IP if remnanode not host-net)
+  --site-proxy-protocol      nginx expects PROXY protocol on the local port (set xver=1 in panel)
+  --site-close-80            Close 80/tcp after issuing; certbot opens it briefly on renewal
+  --site-seed S              Different seed = different generated site
+  --site-skip-dns-check      Skip A/AAAA → this IP check
   --tcp-timestamps-off       Set net.ipv4.tcp_timestamps=0
   --tz ZONE|auto             Set timezone (default: leave as-is). auto = IP geolocation
   --yes                      Non-interactive (still requires --panel-ip or GORECSHIT_PANEL_IP)
@@ -385,6 +418,7 @@ apply_modules_csv() {
       hostname|tz) DO_HOSTNAME=1 ;;
       egress_guard|egress|smtp) DO_EGRESS_GUARD=1 ;;
       decoy_web|decoy) DO_DECOY_WEB=1 ;;
+      site|camouflage|website) DO_SITE=1 ;;
       docker|journald|journal)
         DO_DOCKER_JOURNAL=1; DO_DOCKER_USER=1; DO_RESOLV_V4=1; DO_CERTBOT_HOOKS=1; DO_NOFILE=1 ;;
       all)
@@ -422,6 +456,17 @@ parse_args() {
       --no-egress-guard) DO_EGRESS_GUARD=0; shift ;;
       --egress-block-ports) EGRESS_BLOCK_PORTS="${2:-}"; shift 2 ;;
       --decoy-web) DO_DECOY_WEB=1; shift ;;
+      --site) DO_SITE_ONLY=1; shift ;;
+      --site-domain) SITE_DOMAIN="${2:-}"; shift 2 ;;
+      --site-email) SITE_EMAIL="${2:-}"; shift 2 ;;
+      --site-theme) SITE_THEME="${2:-auto}"; shift 2 ;;
+      --site-mode) SITE_MODE="${2:-auto}"; shift 2 ;;
+      --site-port) SITE_PORT="${2:-}"; SITE_PORT_SET=1; shift 2 ;;
+      --site-listen) SITE_LISTEN="${2:-}"; SITE_LISTEN_SET=1; shift 2 ;;
+      --site-proxy-protocol) SITE_PP=1; SITE_PP_SET=1; shift ;;
+      --site-close-80) SITE_CLOSE80=1; shift ;;
+      --site-seed) SITE_SEED="${2:-}"; shift 2 ;;
+      --site-skip-dns-check) SITE_SKIP_DNS=1; shift ;;
       --tcp-timestamps-off) DO_TCP_TIMESTAMPS_OFF=1; shift ;;
       --tz) TZ_OPT="${2:-}"; shift 2 ;;
       --relay-ips) RELAY_IPS="${2:-}"; shift 2 ;;
@@ -472,6 +517,13 @@ parse_args() {
   esac
   if [[ -n "$SSH_PORT_NEW" ]] && ! is_port "$SSH_PORT_NEW"; then
     err "Invalid --ssh-port: $SSH_PORT_NEW"; exit 2
+  fi
+  if [[ -n "$SITE_LISTEN_SET" ]] && ! is_ipv4 "$SITE_LISTEN"; then
+    err "Invalid --site-listen: $SITE_LISTEN (IPv4)"; exit 2
+  fi
+  # --site-domain: alone → site-only run; with --panel-ip → part of the full install
+  if [[ -n "$SITE_DOMAIN" ]]; then
+    if [[ -n "$PANEL_IP" ]]; then DO_SITE=1; else DO_SITE_ONLY=1; fi
   fi
 }
 
@@ -640,6 +692,10 @@ show_status_summary() {
   if command -v fail2ban-client >/dev/null 2>&1; then
     echo "---- fail2ban ----"
     fail2ban-client status 2>/dev/null || true
+  fi
+  if [[ -f "$SITE_STATE_FILE" ]]; then
+    echo "---- сайт-маскировка ----"
+    grep -E '^SITE_(DOMAIN|MODE_ACTIVE|LISTEN|PORT|PP|THEME)=' "$SITE_STATE_FILE" 2>/dev/null || true
   fi
   if remnanode_running; then ok "remnanode/xray контейнер жив"; else warn "remnanode не найден в docker ps"; fi
   if [[ -d "$BACKUP_ROOT" ]]; then
@@ -1323,6 +1379,18 @@ _audit_reachability_from_russia() {
   _audit_info "Внешняя проверка заняла ~${elapsed}с (лимит ~60с)"
 }
 
+_audit_is_own_site() {
+  # true, если строка dest/SNI/CN указывает на наш сайт-маскировку (v2.7.0 self-steal)
+  local s="${1,,}" d="" l="" p=""
+  [[ -f /var/lib/gorecshit/site.env ]] || return 1
+  d="$(sed -n 's/^SITE_DOMAIN=//p' /var/lib/gorecshit/site.env | head -1)"
+  l="$(sed -n 's/^SITE_LISTEN=//p' /var/lib/gorecshit/site.env | head -1)"
+  p="$(sed -n 's/^SITE_PORT=//p' /var/lib/gorecshit/site.env | head -1)"
+  [[ -n "$d" && "$s" == *"$d"* ]] && return 0
+  [[ -n "$l" && -n "$p" && "$s" == *"${l}:${p}"* ]] && return 0
+  return 1
+}
+
 _audit_reality_dest_quality() {
   # stdin unused; args: serverNames/dest strings — prints good|ru|small|unknown
   local s="$1"
@@ -1443,7 +1511,9 @@ _audit_passive_reality_probe() {
       _audit_info "Маскировочный сертификат/домен: ${masked}"
       [[ -n "$sans" ]] && _audit_info "SAN: ${sans}"
       q="$(_audit_reality_dest_quality "$masked")"
+      _audit_is_own_site "$masked" && q="own"
       case "$q" in
+        own)  _audit_ok "CN/SAN = ваш домен сайта-маскировки (${masked}) — self-steal" ;;
         good) _audit_ok "CN/SAN похож на крупный зарубежный сайт — хорошо для REALITY" ;;
         ru)   _audit_warn "CN/SAN российский (${masked}) — лучше gstatic/microsoft/apple" ;;
         small) _audit_warn "CN/SAN мелкий/подозрительный (${masked})" ;;
@@ -1602,7 +1672,9 @@ for ib in inbounds:
         _audit_ok "shortIds заданы"
       fi
       q="$(_audit_reality_dest_quality "${dest}|${sni}")"
+      _audit_is_own_site "${dest}|${sni}" && q="own"
       case "$q" in
+        own)  _audit_ok "dest/serverNames → ваш сайт-маскировка (${dest:-$sni}) — self-steal, свой домен и сертификат" ;;
         good) _audit_ok "dest/serverNames выглядят как крупный зарубежный сайт (${dest:-$sni}) — хорошо" ;;
         ru)   _audit_warn "dest/SNI российский (${dest:-$sni}) — лучше gstatic/microsoft/apple/cloudflare" ;;
         small) _audit_warn "dest/SNI мелкий/подозрительный (${dest:-$sni}) — возьмите крупный зарубежный домен" ;;
@@ -2487,6 +2559,8 @@ run_node_audit() {
   _audit_server_level
   echo
   _audit_giveaways
+  echo
+  _audit_site
 
   echo
   menu_sep
@@ -2738,13 +2812,14 @@ interactive_menu() {
     printf '  %b7)%b ⬆️  Обновить gorecshit (GitHub)\n' "${C_BOLD}" "${C_RESET}"
     printf '  %b8)%b 🛡️  Проверка на блокировку и палевность ноды\n' "${C_BOLD}" "${C_RESET}"
     printf '  %b9)%b 🕵️  Скрыть отпечатки сервера\n' "${C_BOLD}" "${C_RESET}"
+    printf '  %b10)%b 🌐 Сайт-маскировка (поддомен + сертификат + сайт)\n' "${C_BOLD}" "${C_RESET}"
     menu_sep
     printf '  %b0)%b 🚪 Выход\n' "${C_BOLD}" "${C_RESET}"
-    printf '%bCLI: gorecshit [--status|--update|--audit|--stealth|--yes|--modules …]%b\n' "${C_GREY}" "${C_RESET}"
+    printf '%bCLI: gorecshit [--status|--update|--audit|--stealth|--site-domain D|--yes|--modules …]%b\n' "${C_GREY}" "${C_RESET}"
     if [[ -w /dev/tty ]]; then
-      printf '%bВыберите пункт [0-9]:%b ' "${C_BOLD}" "${C_RESET}" > /dev/tty
+      printf '%bВыберите пункт [0-10]:%b ' "${C_BOLD}" "${C_RESET}" > /dev/tty
     else
-      printf '%bВыберите пункт [0-9]:%b ' "${C_BOLD}" "${C_RESET}"
+      printf '%bВыберите пункт [0-10]:%b ' "${C_BOLD}" "${C_RESET}"
     fi
     read_user_input choice
     case "$choice" in
@@ -2793,6 +2868,10 @@ interactive_menu() {
         DO_FINGERPRINT_ONLY=1
         return 0
         ;;
+      10)
+        DO_SITE_ONLY=1
+        return 0
+        ;;
       0|q|Q)
         exit 0
         ;;
@@ -2809,6 +2888,7 @@ interactive_select_modules() {
   echo "  1 ufw  2 blocklist  3 hide_ports  4 anti_probe  5 ssh"
   echo "  6 stealth  7 fail2ban  8 sysctl  9 hostname  10 docker"
   echo "  11 egress_guard (исходящий SMTP)  12 decoy_web (:80 → https, опц.)"
+  echo "  13 site (поддомен + сертификат + сайт для REALITY, нужен домен)"
   echo "  (или: minimum — UFW+SSH+fail2ban+blocklist+BBR)"
   local ans
   prompt_user 'Номера: ' ans
@@ -2817,18 +2897,18 @@ interactive_select_modules() {
   elif [[ "$ans" == "minimum" || "$ans" == "min" ]]; then
     selected="minimum"
   else
-    local map=( "" ufw blocklist hide_ports anti_probe ssh stealth fail2ban sysctl hostname docker egress_guard decoy_web )
+    local map=( "" ufw blocklist hide_ports anti_probe ssh stealth fail2ban sysctl hostname docker egress_guard decoy_web site )
     local n parts=()
     local IFS=,
     for n in $ans; do
       n="$(echo "$n" | tr -d ' ')"
-      [[ "$n" =~ ^[0-9]+$ && "$n" -ge 1 && "$n" -le 12 ]] && parts+=("${map[$n]}")
+      [[ "$n" =~ ^[0-9]+$ && "$n" -ge 1 && "$n" -le 13 ]] && parts+=("${map[$n]}")
     done
     local IFS=,
     selected="${parts[*]}"
   fi
   apply_modules_csv "${selected:-all}"
-  log "Выбраны модули: ufw=$DO_UFW blocklist=$DO_BLOCKLIST hide=$DO_HIDE_PORTS probe=$DO_ANTI_PROBE ssh=$DO_SSH stealth=$DO_STEALTH f2b=$DO_FAIL2BAN sysctl=$DO_SYSCTL host=$DO_HOSTNAME docker=$DO_DOCKER_JOURNAL egress=$DO_EGRESS_GUARD decoy=$DO_DECOY_WEB"
+  log "Выбраны модули: ufw=$DO_UFW blocklist=$DO_BLOCKLIST hide=$DO_HIDE_PORTS probe=$DO_ANTI_PROBE ssh=$DO_SSH stealth=$DO_STEALTH f2b=$DO_FAIL2BAN sysctl=$DO_SYSCTL host=$DO_HOSTNAME docker=$DO_DOCKER_JOURNAL egress=$DO_EGRESS_GUARD decoy=$DO_DECOY_WEB site=$DO_SITE"
 }
 
 preflight() {
@@ -5674,7 +5754,7 @@ final_verify() {
   echo "==== gorecshit ${VERSION} summary ===="
   echo "panel=${PANEL_IP} node_port=${NODE_PORT}"
   echo "clients_tcp=${CLIENT_PORTS:-none} clients_udp=${CLIENT_UDP_PORTS:-none} mode=${MODE}"
-  echo "modules: ufw=$DO_UFW blocklist=$DO_BLOCKLIST hide=$DO_HIDE_PORTS probe=$DO_ANTI_PROBE ssh=$DO_SSH stealth=$DO_STEALTH f2b=$DO_FAIL2BAN sysctl=$DO_SYSCTL host=$DO_HOSTNAME docker=$DO_DOCKER_JOURNAL egress=$DO_EGRESS_GUARD decoy=$DO_DECOY_WEB"
+  echo "modules: ufw=$DO_UFW blocklist=$DO_BLOCKLIST hide=$DO_HIDE_PORTS probe=$DO_ANTI_PROBE ssh=$DO_SSH stealth=$DO_STEALTH f2b=$DO_FAIL2BAN sysctl=$DO_SYSCTL host=$DO_HOSTNAME docker=$DO_DOCKER_JOURNAL egress=$DO_EGRESS_GUARD decoy=$DO_DECOY_WEB site=$DO_SITE"
   if [[ "$DRY_RUN" -eq 1 ]]; then
     echo "(dry-run / --check: live checks skipped)"
     return 0
@@ -5851,7 +5931,9 @@ configure_decoy_web() {
   # Optional: port 80 → 301 https (как у любого HTTPS-сайта). Only via existing nginx; otherwise recommendation.
   step "Декой :80 (опционально)"
   local reason=""
-  if [[ "$MODE" == "cdn" || "$CADDY_PRESENT" -eq 1 ]]; then
+  if [[ "$DO_SITE" -eq 1 || -f "$SITE_NGINX_CONF" ]]; then
+    reason="порт 80 обслуживает сайт-маскировка (v2.7.0: ACME + 301 → https://домен)"
+  elif [[ "$MODE" == "cdn" || "$CADDY_PRESENT" -eq 1 ]]; then
     reason="Caddy/CDN-режим — порт 80 уже ваш"
   elif ss -Hltn '( sport = :80 )' 2>/dev/null | grep -q .; then
     reason="порт 80 уже кем-то слушается"
@@ -5924,6 +6006,1184 @@ fi'
   ok "Декой :80 включён (301 → https, server_tokens off)"
 }
 
+# ---------- v2.7.0: «Сайт-маскировка» — домен ноды + Let's Encrypt + многостраничный сайт ----------
+# Схема self-steal: nginx отдаёт настоящий сайт с настоящим сертификатом на 127.0.0.1:SITE_PORT,
+# REALITY на 443 использует target=127.0.0.1:SITE_PORT и serverNames=[домен].
+# Скрипт НЕ трогает конфиг панели/инбаунды — печатает значения, которые вставляются вручную.
+
+# Слова, которых не должно быть на сайте (проверка генератора и аудита). Кириллица — тремя
+# регистрами явно: grep -i в C-локали не понимает кириллицу.
+SITE_FORBIDDEN_RE='vpn|proxy|xray|v2ray|vless|reality|remnawave|gorec|tunnel|прокси|Прокси|ПРОКСИ|впн|Впн|ВПН|обход|Обход|ОБХОД'
+SITE_STATE_FILE="/var/lib/gorecshit/site.env"
+SITE_NGINX_CONF="/etc/nginx/conf.d/gorecshit-site.conf"
+SITE_ACME_ROOT="/var/www/letsencrypt"
+SITE_THEMES="it photo translate coffee"
+
+site_forbidden_scan() {
+  # site_forbidden_scan FILE... — печатает «файл:строка:совпадение»; rc 0 если что-то найдено
+  LC_ALL=C grep -HnoiE "$SITE_FORBIDDEN_RE" "$@" 2>/dev/null
+}
+
+_site_seed_from() {
+  local s
+  s="$(printf '%s' "$1" | cksum | awk '{print $1}')"
+  SITE_RNG=$(( s % 2147483647 ))
+  [[ "$SITE_RNG" -gt 0 ]] || SITE_RNG=1
+}
+
+_site_next() {
+  SITE_RNG=$(( (SITE_RNG * 1103515245 + 12345) % 2147483648 ))
+}
+
+_site_pick() {
+  # _site_pick VAR item1 item2 ... — детерминированно от сида (без сабшелла: сид обновляется)
+  local __v="$1"; shift
+  _site_next
+  local __i=$(( (SITE_RNG / 7) % $# + 1 ))
+  printf -v "$__v" '%s' "${!__i}"
+}
+
+_site_rint() {
+  # _site_rint VAR MIN MAX
+  _site_next
+  printf -v "$1" '%d' $(( $2 + (SITE_RNG / 7) % ($3 - $2 + 1) ))
+}
+
+_site_shuffle() {
+  # _site_shuffle ARRNAME — Fisher–Yates на месте
+  local -n __a="$1"
+  local i j t
+  for (( i=${#__a[@]}-1; i>0; i-- )); do
+    _site_next
+    j=$(( (SITE_RNG / 7) % (i + 1) ))
+    t="${__a[i]}"; __a[i]="${__a[j]}"; __a[j]="$t"
+  done
+}
+
+_site_html_esc() {
+  local s="$1"
+  s="${s//&/&amp;}"; s="${s//</&lt;}"; s="${s//>/&gt;}"; s="${s//\"/&quot;}"
+  printf '%s' "$s"
+}
+
+_site_ru_date() {
+  # _site_ru_date EPOCH → «12 марта 2026»
+  local d m y
+  local -a months=(января февраля марта апреля мая июня июля августа сентября октября ноября декабря)
+  d="$(date -d "@$1" +%-d)"; m="$(date -d "@$1" +%-m)"; y="$(date -d "@$1" +%Y)"
+  printf '%s %s %s' "$d" "${months[m-1]}" "$y"
+}
+
+_site_write_ico() {
+  # 16x16 32bpp ICO: цветной квадрат со светлой рамкой (чтобы /favicon.ico не был 404)
+  local out="$1" r="$2" g="$3" b="$4" x y px
+  local bg fg
+  printf -v bg '\\x%02x\\x%02x\\x%02x\\xff' "$b" "$g" "$r"
+  fg='\xf5\xf5\xf5\xff'
+  {
+    printf '\x00\x00\x01\x00\x01\x00'
+    printf '\x10\x10\x00\x00\x01\x00\x20\x00\x68\x04\x00\x00\x16\x00\x00\x00'
+    printf '\x28\x00\x00\x00\x10\x00\x00\x00\x20\x00\x00\x00\x01\x00\x20\x00'
+    printf '\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
+    for (( y=0; y<16; y++ )); do
+      for (( x=0; x<16; x++ )); do
+        px="$bg"
+        if (( (x>=4 && x<=11) && (y>=4 && y<=11) && (x==4 || x==11 || y==4 || y==11) )); then px="$fg"; fi
+        printf '%b' "$px"
+      done
+    done
+    for (( y=0; y<64; y++ )); do printf '\x00'; done
+  } >"$out"
+}
+
+# --- Тексты тем. Формат: "Заголовок|Описание" для услуг; "slug|Заголовок|Анонс|Абзац1|Абзац2|Абзац3" для статей.
+_site_theme_data() {
+  local theme="$1"
+  SITE_T_NAMES=(); SITE_T_TAGS=(); SITE_T_SERV=(); SITE_T_POSTS=(); SITE_T_ABOUT=(); SITE_T_KIND=""; SITE_T_SERV_TITLE=""
+  case "$theme" in
+    it)
+      SITE_T_KIND="Студия веб-разработки"
+      SITE_T_SERV_TITLE="Услуги"
+      SITE_T_NAMES=("Северный код" "Ясный пиксель" "Линия сборки" "Тихая гавань" "Два бита" "Кодовая мастерская" "Светлый стек" "Квадрат и точка")
+      SITE_T_TAGS=("Делаем сайты и внутренние сервисы, которыми удобно пользоваться"
+                   "Небольшая команда, аккуратный код и честные сроки"
+                   "Проектируем, разрабатываем и сопровождаем веб-проекты")
+      SITE_T_ABOUT=("Мы начинали как два разработчика, которые делали сайты для знакомых. Сегодня в команде дизайнер, фронтенд- и бэкенд-разработчики и менеджер проектов, но подход остался прежним: сначала разобраться в задаче, потом писать код."
+                    "Работаем с малым и средним бизнесом, образовательными проектами и некоммерческими организациями. Не беремся за всё подряд: если задача не наша, честно скажем и посоветуем, к кому обратиться."
+                    "Каждый проект сопровождаем после запуска: обновления, резервные копии, мониторинг доступности и понятные отчеты раз в месяц.")
+      SITE_T_SERV=("Сайты-визитки|Лёгкие быстрые сайты на статике: открываются мгновенно и почти не требуют обслуживания."
+                   "Интернет-каталоги|Каталог товаров или услуг с поиском, фильтрами и удобной админкой."
+                   "Внутренние сервисы|Учёт заявок, графики смен, личные кабинеты для сотрудников и клиентов."
+                   "Аудит и ускорение|Находим, почему сайт медленный, и исправляем: от картинок до запросов к базе."
+                   "Сопровождение|Обновления, резервные копии, мониторинг и мелкие доработки по подписке."
+                   "Дизайн интерфейсов|Прототипы и макеты, которые проверяем на реальных пользователях до разработки.")
+      SITE_T_POSTS=("static-sites|Почему статический сайт — хороший выбор для малого бизнеса|Разбираем, когда сложная CMS не нужна и как статика экономит деньги.|Большинству небольших компаний сайт нужен, чтобы рассказать о себе, показать услуги и дать контакты. Для этого не требуется база данных, панель администратора и десяток плагинов.|Статический сайт собирается один раз и отдаётся веб-сервером как набор файлов. Он быстро открывается даже на слабом мобильном интернете, его сложно сломать, а хостинг стоит копейки.|Если контент меняется раз в месяц, правки удобно вносить через простой редактор или поручить нам. Когда появятся новые задачи, статический сайт легко дополнить нужными функциями."
+                    "image-optimization|Как ускорить сайт за один вечер: картинки|Простые шаги, которые уменьшают вес страниц в несколько раз.|Чаще всего сайт тормозит не из-за кода, а из-за фотографий в исходном размере. Снимок с телефона весит 4–6 мегабайт, а на странице он показывается шириной 600 пикселей.|Достаточно подготовить несколько размеров изображения и отдавать современный формат вроде WebP или AVIF. Атрибуты width и height помогают браузеру не прыгать при загрузке.|Ленивая загрузка для картинок ниже первого экрана — ещё одна бесплатная оптимизация: браузер не тратит трафик на то, что пользователь может и не увидеть."
+                    "backups|Резервные копии: правило 3-2-1 на практике|Как мы храним копии проектов клиентов и почему это не паранойя.|Правило простое: три копии данных, на двух разных носителях, одна из них — в другом месте. Звучит избыточно, пока не случится первая авария.|Мы делаем ежедневные снимки баз данных и еженедельные полные копии файлов. Раз в квартал проверяем, что из копии действительно можно восстановиться.|Самая частая ошибка — копия, которую никто никогда не пробовал развернуть. Восстановление нужно репетировать так же, как пожарную эвакуацию."
+                    "accessibility|Доступность сайта: с чего начать|Пять проверок, которые можно сделать без специальных инструментов.|Попробуйте пройти по сайту только с клавиатуры: доходит ли фокус до всех ссылок и кнопок, видно ли, где он находится.|Проверьте контраст текста: светло-серый на белом выглядит стильно, но читается плохо. У всех картинок, которые несут смысл, должен быть альтернативный текст.|Заголовки должны идти по порядку, а формы — иметь подписи к полям. Эти простые правила помогают не только людям с особыми потребностями, но и всем остальным."
+                    "estimates|Как мы оцениваем сроки проекта|Почему мы называем диапазон, а не одну дату, и как его сузить.|Точная дата в начале проекта — почти всегда обещание, которое придётся нарушить. Поэтому мы называем диапазон и объясняем, от чего он зависит.|Первая неделя уходит на уточнение требований и прототип. После неё неопределённость сильно уменьшается, и мы фиксируем план по этапам.|Каждые две недели показываем работающую версию. Так заказчик видит прогресс и может вовремя поменять приоритеты.")
+      ;;
+    photo)
+      SITE_T_KIND="Фотостудия"
+      SITE_T_SERV_TITLE="Съёмки"
+      SITE_T_NAMES=("Светотень" "Мягкий свет" "Кадр за кадром" "Полдень" "Серебряная зернистость" "Северное окно" "Тёплый тон" "Длинная выдержка")
+      SITE_T_TAGS=("Портреты, семейные истории и предметная съёмка при естественном свете"
+                   "Спокойные живые фотографии без лишней постановки"
+                   "Снимаем людей, вещи и места такими, какие они есть")
+      SITE_T_ABOUT=("Студия выросла из любви к естественному свету. Мы снимаем у большого окна, на улице и дома у клиентов, стараясь, чтобы человек на фото узнавал себя."
+                    "Перед съёмкой обязательно созваниваемся: обсуждаем идею, одежду, место и время. Это занимает пятнадцать минут, но экономит часы на площадке."
+                    "Готовые фотографии передаём через закрытую галерею в течение двух недель. Ретушь деликатная: убираем случайное, но не меняем лицо.")
+      SITE_T_SERV=("Портрет|Индивидуальная съёмка в студии или на улице, 1 час, 30 обработанных кадров."
+                   "Семейная съёмка|Дома или на прогулке, с детьми и бабушками, без утомительных поз."
+                   "Предметная съёмка|Фото товаров для каталога и маркетплейсов на белом фоне и в интерьере."
+                   "Деловой портрет|Фото для сайта компании и профиля: быстро, аккуратно, в едином стиле."
+                   "Репортаж|Конференции, семинары, открытия — снимаем незаметно и отдаём лучшие кадры."
+                   "Печать и альбомы|Помогаем отобрать снимки и печатаем на хорошей бумаге.")
+      SITE_T_POSTS=("window-light|Как снимать у окна: свет, который всегда с вами|Простые приёмы для портретов при дневном свете.|Большое окно — лучший софтбокс, и он бесплатный. Главное — не ставить человека прямо против света и не снимать в полдень под прямыми лучами.|Если свет слишком контрастный, повесьте на окно тонкую белую ткань. Отражатель можно заменить листом пенокартона или даже белой простынёй.|Попробуйте повернуть модель на три четверти к окну: появится объём, а глаза получат красивый блик."
+                    "what-to-wear|Что надеть на фотосессию|Подсказки, которые мы даём всем клиентам перед съёмкой.|Однотонная одежда спокойных цветов почти всегда выглядит лучше ярких принтов и крупных логотипов. Она не отвлекает от лица.|Если снимаемся семьёй, договоритесь о палитре из двух-трёх оттенков, но не одевайтесь одинаково. Важно, чтобы всем было удобно двигаться.|Возьмите с собой запасной вариант одежды. Иногда на месте становится понятно, что другой цвет лучше подходит к фону."
+                    "product-basics|Предметная съёмка для каталога: базовые правила|Как получить ровные одинаковые фото товаров.|Для каталога важнее всего единообразие: одинаковый фон, ракурс и свет на всех снимках. Покупатель сравнивает товары, и разный свет мешает.|Мы снимаем на штативе с фиксированными настройками и отмечаем положение предмета на столе. Так серия из сотни фото выглядит цельной.|Отдельно делаем несколько кадров в интерьере: они помогают понять размер и настроение вещи."
+                    "film-look|Зачем мы иногда снимаем на плёнку|О медленной фотографии в цифровую эпоху.|Плёнка заставляет думать перед каждым кадром. В катушке всего тридцать шесть снимков, и это меняет темп съёмки.|Цвета и зерно плёнки сложно точно повторить фильтрами. Мы предлагаем добавить несколько плёночных кадров к любой съёмке.|Проявку и сканирование делаем в небольшой лаборатории, с которой работаем много лет."
+                    "photo-archive|Как сохранить семейный фотоархив|Сканирование, подписи и хранение старых снимков.|Старые фотографии выцветают и теряются при переездах. Отсканируйте их с разрешением не меньше 600 dpi и сохраните в нескольких местах.|Самое ценное — подписи: кто изображён, где и когда. Через двадцать лет спросить будет не у кого, поэтому запишите это сейчас.|Оригиналы храните в бескислотных конвертах вдали от батарей и солнца.")
+      ;;
+    translate)
+      SITE_T_KIND="Бюро переводов"
+      SITE_T_SERV_TITLE="Услуги"
+      SITE_T_NAMES=("Слово в слово" "Точный смысл" "Лингва Плюс" "Две строки" "Мост слов" "Ясный текст" "Полиглот" "Верный перевод")
+      SITE_T_TAGS=("Письменные переводы документов, договоров и технических текстов"
+                   "Переводим смысл, а не только слова"
+                   "Технический, юридический и деловой перевод с редактурой")
+      SITE_T_ABOUT=("Бюро объединяет переводчиков и редакторов, которые много лет работают в своих отраслях: машиностроение, медицина, право, IT."
+                    "Каждый текст проходит два этапа: перевод и независимую редактуру. Для крупных проектов ведём глоссарий, чтобы термины не расходились между документами."
+                    "Соблюдаем конфиденциальность: документы хранятся в зашифрованном архиве и удаляются по запросу после завершения работы.")
+      SITE_T_SERV=("Личные документы|Паспорта, дипломы, справки и свидетельства с нотариальным заверением."
+                   "Договоры|Юридический перевод контрактов и уставов с сохранением структуры."
+                   "Технические тексты|Инструкции, спецификации, чертежи и руководства пользователя."
+                   "Локализация|Сайты, приложения и интерфейсы с учётом местных особенностей."
+                   "Медицинский перевод|Выписки, заключения и результаты анализов."
+                   "Редактура|Проверка и вычитка готового перевода носителем языка.")
+      SITE_T_POSTS=("glossary|Зачем нужен глоссарий в переводческом проекте|Как единые термины экономят время и нервы.|Когда документацию переводят несколько человек, один и тот же термин легко получает три разных варианта. Читатель путается, а заказчик тратит время на исправления.|Глоссарий — это таблица терминов и их утверждённых переводов. Мы составляем её на старте и согласуем со специалистами заказчика.|С каждым новым документом глоссарий пополняется, и следующие переводы получаются быстрее и единообразнее."
+                    "notary|Нотариальный перевод: как это устроено|Что нужно знать, если документ требуется для госоргана.|Нотариус заверяет не сам перевод, а подпись переводчика, который его выполнил. Поэтому переводчик должен иметь подтверждённую квалификацию.|Перевод подшивается к копии или оригиналу документа. Перед подачей уточните требования конкретной организации: иногда нужен апостиль.|Обычно вся процедура занимает один-два рабочих дня, срочные заказы возможны за несколько часов."
+                    "machine-translation|Машинный перевод: помощник, но не замена|Где автоматический перевод уместен, а где опасен.|Современные системы машинного перевода хорошо справляются с простыми текстами и помогают быстро понять общий смысл письма.|В договорах, медицинских и технических документах цена ошибки слишком высока. Одно неверно понятое отрицание меняет смысл пункта.|Мы используем инструменты автоматизации для черновиков и терминологии, но каждое предложение проверяет человек."
+                    "localization|Локализация сайта: больше чем перевод|Почему текст на кнопке иногда сложнее договора.|Локализация учитывает формат дат, валюты, длину строк и даже цвета, которые в разных странах воспринимаются по-разному.|Немецкий текст в среднем на треть длиннее английского, и кнопки в интерфейсе могут просто не вместить перевод. Это нужно предусмотреть на этапе дизайна.|Мы просим доступ к тестовой версии, чтобы увидеть перевод в контексте, а не в таблице строк."
+                    "deadlines|Как рассчитать срок перевода|Сколько страниц в день — реальная норма.|Профессиональный переводчик качественно переводит около восьми-десяти страниц в день. Ещё время нужно на редактуру и вёрстку.|Сложный технический текст идёт медленнее: приходится сверяться со стандартами и уточнять термины.|Если срок жёсткий, делим текст между несколькими переводчиками и обязательно проводим финальную сквозную редактуру.")
+      ;;
+    coffee|*)
+      SITE_T_KIND="Кофейня и обжарка"
+      SITE_T_SERV_TITLE="Меню"
+      SITE_T_NAMES=("Медленное утро" "Зерно и чашка" "Тёплый угол" "Утренний рейс" "Кофейный двор" "Пенка" "Добрый помол" "Шесть утра")
+      SITE_T_TAGS=("Свежая обжарка, домашняя выпечка и спокойная атмосфера"
+                   "Обжариваем зерно сами и варим так, как любим"
+                   "Небольшая кофейня для тех, кто никуда не спешит")
+      SITE_T_ABOUT=("Мы открылись как маленький кофейный уголок на шесть мест. Сейчас у нас своя обжарка, но гостей по-прежнему встречают по имени."
+                    "Зерно покупаем у проверенных импортёров и обжариваем небольшими партиями каждую неделю, поэтому кофе всегда свежий."
+                    "Выпечку готовим сами каждое утро: круассаны, сырники, печенье по семейному рецепту.")
+      SITE_T_SERV=("Эспрессо и молочные напитки|Капучино, флэт уайт, латте на зерне свежей обжарки."
+                   "Фильтр-кофе|Воронка, аэропресс и кемекс — расскажем о каждом сорте."
+                   "Чай и какао|Листовой чай, травяные сборы и густое какао."
+                   "Завтраки|Сырники, каши и тосты до полудня."
+                   "Зерно домой|Свежая обжарка в пачках по 250 г и 1 кг, помол под вашу кофеварку."
+                   "Выпечка|Круассаны, печенье и пироги собственного приготовления.")
+      SITE_T_POSTS=("grind-size|Как выбрать помол для домашнего кофе|Почему одна и та же пачка может дать совсем разный вкус.|Чем дольше вода контактирует с кофе, тем крупнее должен быть помол. Для френч-пресса — как крупная соль, для эспрессо — почти пудра.|Слишком мелкий помол даёт горечь, слишком крупный — кислинку и пустоту. Начните со среднего и меняйте понемногу.|Лучше всего молоть зерно прямо перед завариванием: аромат молотого кофе уходит за несколько минут."
+                    "storage|Как хранить кофейное зерно|Простые правила, чтобы кофе оставался вкусным дольше.|Главные враги кофе — кислород, влага, свет и тепло. Храните зерно в непрозрачной банке с плотной крышкой при комнатной температуре.|Холодильник не лучший вариант: при доставании на зёрнах конденсируется влага, а сами зёрна впитывают чужие запахи.|Покупайте столько, сколько выпьете за две-три недели. Свежесть важнее любой хитрой упаковки."
+                    "pour-over|Воронка за пять минут|Пошаговый рецепт фильтр-кофе для начинающих.|Возьмите 15 граммов кофе среднего помола и 250 граммов воды температурой около 93 градусов. Промойте бумажный фильтр горячей водой.|Сначала налейте немного воды, чтобы смочить весь кофе, и подождите тридцать секунд. Затем доливайте остальное медленными кругами.|Вся заварка должна занять около трёх минут. Если кофе горчит — помол крупнее, если кислит — мельче."
+                    "roast-levels|Светлая, средняя, тёмная: что значит степень обжарки|Как обжарка влияет на вкус в чашке.|Светлая обжарка сохраняет фруктовые и цветочные ноты сорта, но требует аккуратного заваривания.|Средняя — баланс сладости и кислотности, её любят для молочных напитков. Тёмная даёт насыщенный горьковато-шоколадный вкус.|Мы обжариваем разные сорта по-разному и всегда подскажем, что лучше подойдёт под ваш способ приготовления."
+                    "seasonal-menu|Сезонное меню: что мы готовим этой осенью|Новые напитки и выпечка на холодные дни.|С наступлением холодов добавили в меню пряный раф с корицей и кардамоном и облепиховый чай с мёдом.|На витрине появились тыквенный пирог и яблочный штрудель по рецепту нашего пекаря.|Заходите попробовать — первые гости каждое утро получают печенье в подарок.")
+      ;;
+  esac
+}
+
+_site_page() {
+  # _site_page FILE TITLE DESCRIPTION ACTIVE BODY_HTML
+  local file="$1" title="$2" desc="$3" active="$4" body="$5"
+  local nav="" item href label cls
+  for item in "/|Главная|home" "/about/|О нас|about" "/services/|${SITE_G_SERV_TITLE}|services" "/blog/|Блог|blog" "/contacts/|Контакты|contacts"; do
+    IFS='|' read -r href label cls <<<"$item"
+    if [[ "$cls" == "$active" ]]; then
+      nav+="<a href=\"${href}\" class=\"active\" aria-current=\"page\">${label}</a>"
+    else
+      nav+="<a href=\"${href}\">${label}</a>"
+    fi
+  done
+  local full_title
+  if [[ "$active" == "home" ]]; then full_title="${SITE_G_BRAND} — ${title}"; else full_title="${title} — ${SITE_G_BRAND}"; fi
+  mkdir -p "$(dirname "$file")"
+  cat >"$file" <<HTML
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>$(_site_html_esc "$full_title")</title>
+<meta name="description" content="$(_site_html_esc "$desc")">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="/favicon.ico" sizes="16x16">
+<link rel="stylesheet" href="/assets/${SITE_G_CSS}">
+<meta property="og:title" content="$(_site_html_esc "$full_title")">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="$(_site_html_esc "$SITE_G_BRAND")">
+</head>
+<body class="${SITE_G_LAYOUT}">
+<header class="site-header">
+<div class="wrap">
+<a class="brand" href="/"><span class="logo">${SITE_G_LETTER}</span>$(_site_html_esc "$SITE_G_BRAND")</a>
+<nav>${nav}</nav>
+</div>
+</header>
+<main class="wrap">
+${body}
+</main>
+<footer class="site-footer">
+<div class="wrap">
+<p>© ${SITE_G_SINCE}–${SITE_G_YEAR} $(_site_html_esc "$SITE_G_BRAND"). ${SITE_G_KIND}, ${SITE_G_CITY}.</p>
+<p><a href="/contacts/">Контакты</a> · <a href="/blog/">Блог</a> · <a href="mailto:${SITE_G_EMAIL}">${SITE_G_EMAIL}</a></p>
+</div>
+</footer>
+</body>
+</html>
+HTML
+}
+
+site_generate() {
+  # site_generate OUTDIR DOMAIN THEME(auto|it|photo|translate|coffee) [SEED_EXTRA]
+  local out="$1" domain="$2" theme="${3:-auto}" extra="${4:-}"
+  _site_seed_from "${domain}|${extra}"
+  if [[ "$theme" == "auto" || "$theme" == "random" || -z "$theme" ]]; then
+    # shellcheck disable=SC2086
+    _site_pick theme $SITE_THEMES
+  fi
+  SITE_GEN_THEME="$theme"
+  _site_theme_data "$theme"
+
+  local base="${domain#*.}"
+  [[ "$base" == *.* ]] || base="$domain"
+  SITE_G_KIND="$SITE_T_KIND"
+  SITE_G_SERV_TITLE="$SITE_T_SERV_TITLE"
+  _site_pick SITE_G_BRAND "${SITE_T_NAMES[@]}"
+  SITE_G_LETTER="${SITE_G_BRAND:0:1}"
+  _site_pick SITE_G_CITY "Казань" "Екатеринбург" "Новосибирск" "Нижний Новгород" "Самара" "Пермь" "Воронеж" "Краснодар" "Тюмень" "Томск" "Ярославль" "Калининград"
+  local tagline; _site_pick tagline "${SITE_T_TAGS[@]}"
+  local email_user; _site_pick email_user info hello mail studio contact
+  SITE_G_EMAIL="${email_user}@${base}"
+  SITE_G_YEAR="$(date +%Y)"
+  local age; _site_rint age 2 9
+  SITE_G_SINCE=$(( SITE_G_YEAR - age ))
+  _site_pick SITE_G_LAYOUT "layout-left" "layout-center" "layout-split"
+  local palette accent accent2 bg fg rgb
+  _site_pick palette \
+    "#2f6f5e|#1f4d41|#f7f5f0|#1d2321|47,111,94" \
+    "#3456a3|#233b73|#f6f7fb|#1a1f2b|52,86,163" \
+    "#a4532d|#733a1f|#fbf7f2|#2a1f1a|164,83,45" \
+    "#6b4fa0|#4a3570|#f8f6fb|#211c2a|107,79,160" \
+    "#8a6d1f|#5f4b15|#fbfaf4|#26231a|138,109,31" \
+    "#b03a48|#7d2833|#fcf7f7|#2a1c1e|176,58,72" \
+    "#1f7a8c|#155563|#f4f9fa|#17262a|31,122,140"
+  IFS='|' read -r accent accent2 bg fg rgb <<<"$palette"
+  local font radius width
+  _site_pick font \
+    "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" \
+    "Georgia, 'Times New Roman', serif" \
+    "'PT Sans', 'Trebuchet MS', Verdana, sans-serif" \
+    "'Noto Sans', 'Segoe UI', Tahoma, sans-serif" \
+    "'IBM Plex Sans', 'Helvetica Neue', Arial, sans-serif"
+  _site_pick radius 0 4px 8px 14px
+  _site_pick width 960px 1040px 1120px
+  local hash
+  hash="$(printf '%s' "${domain}${extra}" | cksum | awk '{printf "%08x", $1}')"
+  SITE_G_CSS="style.${hash:0:8}.css"
+
+  rm -rf "$out"
+  mkdir -p "$out/assets" "$out/blog"
+
+  # --- CSS ---
+  cat >"$out/assets/${SITE_G_CSS}" <<CSS
+:root{--accent:${accent};--accent-dark:${accent2};--bg:${bg};--fg:${fg};--muted:rgba(${rgb},.08);--radius:${radius};--width:${width}}
+*{box-sizing:border-box}
+html{font-size:17px}
+body{margin:0;background:var(--bg);color:var(--fg);font-family:${font};line-height:1.6}
+a{color:var(--accent)}a:hover{color:var(--accent-dark)}
+.wrap{max-width:var(--width);margin:0 auto;padding:0 20px}
+.site-header{border-bottom:1px solid var(--muted);background:#fff}
+.site-header .wrap{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;padding-top:14px;padding-bottom:14px}
+.layout-center .site-header .wrap{flex-direction:column}
+.brand{font-weight:700;font-size:1.15rem;text-decoration:none;color:var(--fg);display:flex;align-items:center;gap:10px}
+.logo{display:inline-flex;width:34px;height:34px;align-items:center;justify-content:center;background:var(--accent);color:#fff;border-radius:var(--radius)}
+nav a{margin-left:18px;text-decoration:none;color:var(--fg);opacity:.8}
+nav a.active,nav a:hover{opacity:1;color:var(--accent)}
+.layout-center nav a{margin:0 9px}
+main{padding:32px 20px 56px}
+.hero{padding:56px 0 40px}
+.layout-split .hero{display:grid;grid-template-columns:3fr 2fr;gap:32px;align-items:center}
+.hero h1{font-size:2.3rem;line-height:1.2;margin:0 0 16px}
+.hero p{font-size:1.15rem;opacity:.85}
+.hero .panel{background:var(--muted);border-radius:var(--radius);padding:24px}
+.btn{display:inline-block;background:var(--accent);color:#fff;padding:10px 20px;border-radius:var(--radius);text-decoration:none}
+.btn:hover{background:var(--accent-dark);color:#fff}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:20px}
+.card{background:#fff;border:1px solid var(--muted);border-radius:var(--radius);padding:20px}
+.card h3{margin-top:0}
+.post-meta{font-size:.85rem;opacity:.65}
+article{max-width:720px}
+article h1{line-height:1.25}
+.site-footer{border-top:1px solid var(--muted);font-size:.9rem;opacity:.85;padding:18px 0}
+@media (max-width:700px){.layout-split .hero{grid-template-columns:1fr}.hero h1{font-size:1.8rem}nav a{margin-left:10px}}
+CSS
+
+  # --- favicon ---
+  local r g b
+  IFS=, read -r r g b <<<"$rgb"
+  cat >"$out/favicon.svg" <<SVG
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="12" fill="${accent}"/><text x="32" y="44" font-size="36" text-anchor="middle" fill="#fff" font-family="Arial, sans-serif">${SITE_G_LETTER}</text></svg>
+SVG
+  _site_write_ico "$out/favicon.ico" "$r" "$g" "$b"
+
+  # --- services (выбираем 4 из 6, порядок случайный) ---
+  local -a serv=("${SITE_T_SERV[@]}")
+  _site_shuffle serv
+  local serv_html="" s st sd n_serv
+  _site_rint n_serv 4 6
+  local i
+  for (( i=0; i<n_serv; i++ )); do
+    IFS='|' read -r st sd <<<"${serv[i]}"
+    serv_html+="<div class=\"card\"><h3>${st}</h3><p>${sd}</p></div>"$'\n'
+  done
+
+  # --- blog posts (3–5 шт., даты в прошлом) ---
+  local -a posts=("${SITE_T_POSTS[@]}")
+  _site_shuffle posts
+  local n_posts now_e
+  _site_rint n_posts 3 5
+  now_e="$(date +%s)"
+  local -a p_slug=() p_title=() p_lead=() p_epoch=()
+  local off=0 dd slug title lead a1 a2 a3
+  for (( i=0; i<n_posts; i++ )); do
+    _site_rint dd 9 55
+    off=$(( off + dd ))
+    IFS='|' read -r slug title lead a1 a2 a3 <<<"${posts[i]}"
+    p_slug+=("$slug"); p_title+=("$title"); p_lead+=("$lead")
+    p_epoch+=($(( now_e - off * 86400 - (SITE_RNG % 36000) )))
+    _site_page "$out/blog/${slug}/index.html" "$title" "$lead" "blog" \
+"<article>
+<p class=\"post-meta\"><a href=\"/blog/\">Блог</a> · $(_site_ru_date "${p_epoch[i]}")</p>
+<h1>${title}</h1>
+<p><strong>${lead}</strong></p>
+<p>${a1}</p>
+<p>${a2}</p>
+<p>${a3}</p>
+<p><a href=\"/blog/\">← Все записи</a></p>
+</article>"
+  done
+
+  local posts_html="" latest_html=""
+  for (( i=0; i<n_posts; i++ )); do
+    posts_html+="<div class=\"card\"><p class=\"post-meta\">$(_site_ru_date "${p_epoch[i]}")</p><h3><a href=\"/blog/${p_slug[i]}/\">${p_title[i]}</a></h3><p>${p_lead[i]}</p></div>"$'\n'
+    if (( i < 2 )); then
+      latest_html+="<div class=\"card\"><p class=\"post-meta\">$(_site_ru_date "${p_epoch[i]}")</p><h3><a href=\"/blog/${p_slug[i]}/\">${p_title[i]}</a></h3><p>${p_lead[i]}</p></div>"$'\n'
+    fi
+  done
+
+  local hours; _site_pick hours "Пн–Пт 10:00–19:00" "Пн–Сб 9:00–18:00" "Вт–Вс 11:00–20:00" "Ежедневно 8:00–21:00"
+
+  # --- index ---
+  _site_page "$out/index.html" "$tagline" "${SITE_G_KIND} «${SITE_G_BRAND}», ${SITE_G_CITY}. ${tagline}." "home" \
+"<section class=\"hero\">
+<div>
+<h1>$(_site_html_esc "$tagline")</h1>
+<p>${SITE_T_ABOUT[0]}</p>
+<p><a class=\"btn\" href=\"/services/\">${SITE_G_SERV_TITLE}</a></p>
+</div>
+<div class=\"panel\"><p><strong>${SITE_G_KIND}</strong><br>${SITE_G_CITY}<br>${hours}</p><p><a href=\"/contacts/\">Как с нами связаться →</a></p></div>
+</section>
+<h2>${SITE_G_SERV_TITLE}</h2>
+<div class=\"grid\">
+${serv_html}</div>
+<h2>Из блога</h2>
+<div class=\"grid\">
+${latest_html}</div>"
+
+  _site_page "$out/about/index.html" "О нас" "Кто мы и как работаем — ${SITE_G_BRAND}." "about" \
+"<article>
+<h1>О нас</h1>
+<p>${SITE_T_ABOUT[0]}</p>
+<p>${SITE_T_ABOUT[1]}</p>
+<p>${SITE_T_ABOUT[2]}</p>
+<p>Работаем с ${SITE_G_SINCE} года, город — ${SITE_G_CITY}.</p>
+</article>"
+
+  _site_page "$out/services/index.html" "$SITE_G_SERV_TITLE" "${SITE_G_SERV_TITLE} — ${SITE_G_BRAND}, ${SITE_G_CITY}." "services" \
+"<h1>${SITE_G_SERV_TITLE}</h1>
+<p>Стоимость и сроки зависят от задачи — напишите нам, и мы ответим в течение рабочего дня.</p>
+<div class=\"grid\">
+${serv_html}</div>"
+
+  _site_page "$out/blog/index.html" "Блог" "Заметки и полезные статьи — ${SITE_G_BRAND}." "blog" \
+"<h1>Блог</h1>
+<div class=\"grid\">
+${posts_html}</div>"
+
+  _site_page "$out/contacts/index.html" "Контакты" "Как связаться — ${SITE_G_BRAND}, ${SITE_G_CITY}." "contacts" \
+"<article>
+<h1>Контакты</h1>
+<p>Электронная почта: <a href=\"mailto:${SITE_G_EMAIL}\">${SITE_G_EMAIL}</a></p>
+<p>Город: ${SITE_G_CITY}</p>
+<p>Режим работы: ${hours}</p>
+<p>Отвечаем на письма в течение рабочего дня. Встречи — по предварительной договорённости.</p>
+</article>"
+
+  _site_page "$out/404.html" "Страница не найдена" "Страница не найдена." "none" \
+"<article>
+<h1>Страница не найдена</h1>
+<p>Возможно, ссылка устарела или в адресе опечатка.</p>
+<p><a href=\"/\">На главную</a> · <a href=\"/blog/\">Блог</a></p>
+</article>"
+
+  printf 'User-agent: *\nAllow: /\n\nSitemap: https://%s/sitemap.xml\n' "$domain" >"$out/robots.txt"
+
+  {
+    echo '<?xml version="1.0" encoding="UTF-8"?>'
+    echo '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+    local u
+    for u in "" "about/" "services/" "blog/" "contacts/"; do
+      printf '  <url><loc>https://%s/%s</loc><lastmod>%s</lastmod></url>\n' "$domain" "$u" "$(date -d "@${p_epoch[0]}" +%Y-%m-%d)"
+    done
+    for (( i=0; i<n_posts; i++ )); do
+      printf '  <url><loc>https://%s/blog/%s/</loc><lastmod>%s</lastmod></url>\n' "$domain" "${p_slug[i]}" "$(date -d "@${p_epoch[i]}" +%Y-%m-%d)"
+    done
+    echo '</urlset>'
+  } >"$out/sitemap.xml"
+
+  # Правдоподобные Last-Modified: статьи — дата статьи, остальное — недели/месяцы назад
+  for (( i=0; i<n_posts; i++ )); do
+    touch -d "@${p_epoch[i]}" "$out/blog/${p_slug[i]}/index.html" 2>/dev/null || true
+  done
+  local f fe
+  while IFS= read -r -d '' f; do
+    [[ "$f" == "$out/blog/"*/index.html && "$f" != "$out/blog/index.html" ]] && continue
+    _site_rint fe 40 300
+    touch -d "@$(( now_e - fe * 86400 - (SITE_RNG % 40000) ))" "$f" 2>/dev/null || true
+  done < <(find "$out" -type f -print0)
+  touch -d "@${p_epoch[0]}" "$out/blog/index.html" "$out/index.html" "$out/sitemap.xml" 2>/dev/null || true
+  chmod -R a+rX "$out" 2>/dev/null || true
+}
+
+_site_ip2int() {
+  local IFS=. a b c d
+  read -r a b c d <<<"$1"
+  printf '%d' $(( (a << 24) | (b << 16) | (c << 8) | d ))
+}
+
+_site_ip_is_cloudflare() {
+  # Публичные IPv4-диапазоны Cloudflare (оранжевое облако = прокси, сертификат по HTTP-01 не выпустить на ноду)
+  local ip="$1" n net bits base mask
+  is_ipv4 "$ip" || return 1
+  n="$(_site_ip2int "$ip")"
+  for net in 173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 141.101.64.0/18 108.162.192.0/18 \
+             190.93.240.0/20 188.114.96.0/20 197.234.240.0/22 198.41.128.0/17 162.158.0.0/15 104.16.0.0/13 \
+             104.24.0.0/14 172.64.0.0/13 131.0.72.0/22; do
+    base="$(_site_ip2int "${net%/*}")"; bits="${net#*/}"
+    mask=$(( (0xFFFFFFFF << (32 - bits)) & 0xFFFFFFFF ))
+    (( (n & mask) == (base & mask) )) && return 0
+  done
+  return 1
+}
+
+_site_resolve() {
+  # _site_resolve A|AAAA DOMAIN — IP-адреса по одному на строку (DoH 1.1.1.1 → 8.8.8.8 → системный резолвер)
+  local type="$1" d="$2" out="" url
+  for url in "https://1.1.1.1/dns-query?name=${d}&type=${type}" "https://dns.google/resolve?name=${d}&type=${type}"; do
+    out="$(curl -fsS --connect-timeout 4 --max-time 8 -H 'accept: application/dns-json' "$url" 2>/dev/null || true)"
+    if [[ "$out" == *'"Status":0'* || "$out" == *'"Status": 0'* ]]; then
+      if [[ "$type" == "A" ]]; then
+        grep -oE '"data": ?"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+"' <<<"$out" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' || true
+      else
+        grep -oE '"type": ?28,[^}]*"data": ?"[0-9a-fA-F:]+"' <<<"$out" | grep -oE '"data": ?"[0-9a-fA-F:]+"' | sed -E 's/.*"([0-9a-fA-F:]+)"$/\1/' || true
+      fi
+      return 0
+    fi
+    [[ "$out" == *'"Status":3'* || "$out" == *'"Status": 3'* ]] && return 0   # NXDOMAIN
+  done
+  if [[ "$type" == "A" ]]; then
+    getent ahostsv4 "$d" 2>/dev/null | awk '{print $1}' | sort -u || true
+  else
+    getent ahostsv6 "$d" 2>/dev/null | awk '{print $1}' | grep ':' | sort -u || true
+  fi
+}
+
+_site_valid_domain() {
+  local d="$1"
+  [[ ${#d} -le 253 ]] || return 1
+  [[ "$d" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9-]{2,63}$ ]] || return 1
+  [[ "$d" == *.* ]]
+}
+
+_site_load_state() {
+  # подгружает SITE_* из state-файла, не перетирая заданные флагами значения
+  [[ -f "$SITE_STATE_FILE" ]] || return 1
+  local k v
+  while IFS='=' read -r k v; do
+    v="${v%\"}"; v="${v#\"}"
+    case "$k" in
+      SITE_DOMAIN) [[ -n "$SITE_DOMAIN" ]] || SITE_DOMAIN="$v" ;;
+      SITE_EMAIL) [[ -n "$SITE_EMAIL" ]] || SITE_EMAIL="$v" ;;
+      SITE_THEME) [[ "$SITE_THEME" != "auto" ]] || SITE_THEME="$v" ;;
+      SITE_MODE_ACTIVE) SITE_MODE_ACTIVE="$v" ;;
+      SITE_PORT) [[ -n "$SITE_PORT_SET" ]] || SITE_PORT="$v" ;;
+      SITE_LISTEN) [[ -n "$SITE_LISTEN_SET" ]] || SITE_LISTEN="$v" ;;
+      SITE_PP) [[ -n "$SITE_PP_SET" ]] || SITE_PP="$v" ;;
+      SITE_ROOT) SITE_ROOT="$v" ;;
+      SITE_SEED) [[ -n "$SITE_SEED" ]] || SITE_SEED="$v" ;;
+      SITE_CLOSE80) [[ "$SITE_CLOSE80" -eq 1 ]] || SITE_CLOSE80="$v" ;;
+    esac
+  done <"$SITE_STATE_FILE"
+  return 0
+}
+
+_site_port_owner() {
+  # _site_port_owner PORT — имя процесса, слушающего TCP-порт (пусто — свободен)
+  ss -Hltnp "( sport = :$1 )" 2>/dev/null | sed -n 's/.*users:(("\([^"]*\)".*/\1/p' | head -1
+}
+
+_site_port_listening() {
+  ss -Hltn "( sport = :$1 )" 2>/dev/null | grep -q .
+}
+
+_site_remnanode_net_host() {
+  # 0 = host network (127.0.0.1 контейнера = хост), 1 = bridge, 2 = не нашли compose
+  local f
+  for f in /opt/remnanode/docker-compose.yml /opt/remnanode/docker-compose.yaml /opt/remnanode/compose.yml /opt/remnanode/compose.yaml; do
+    [[ -f "$f" ]] || continue
+    if grep -qE '^[[:space:]]*network_mode:[[:space:]]*["'"'"']?host' "$f"; then return 0; fi
+    return 1
+  done
+  return 2
+}
+
+_site_nginx_ge_1251() {
+  local v
+  v="$(nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+  [[ -n "$v" ]] || return 1
+  [[ "$(printf '%s\n1.25.1\n' "$v" | sort -V | head -1)" == "1.25.1" ]]
+}
+
+_site_ufw_active() {
+  command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qiE 'Status:\s*active'
+}
+
+_site_ufw_has_public() {
+  # _site_ufw_has_public PORT — уже есть «PORT ALLOW Anywhere»
+  ufw status 2>/dev/null | grep -qE "^$1(/tcp)?[[:space:]]+(ALLOW|LIMIT)[[:space:]]+(IN[[:space:]]+)?Anywhere"
+}
+
+_site_prompt_domain() {
+  [[ -n "$SITE_DOMAIN" ]] && return 0
+  _site_load_state || true
+  [[ -n "$SITE_DOMAIN" ]] && return 0
+  if [[ "${CLI_ASSUME_YES:-0}" -eq 0 ]] && _tty_usable; then
+    echo "Нужен поддомен, который смотрит на IP этой ноды (A-запись, в Cloudflare — серое облако «DNS only»)."
+    prompt_user 'Поддомен ноды (например, cdn.example.ru): ' SITE_DOMAIN
+    SITE_DOMAIN="$(tr -d ' \r' <<<"$SITE_DOMAIN")"; SITE_DOMAIN="${SITE_DOMAIN,,}"
+    if [[ -z "$SITE_EMAIL" ]]; then
+      prompt_user 'E-mail для Let'"'"'s Encrypt (Enter — без почты): ' SITE_EMAIL
+      SITE_EMAIL="$(tr -d ' \r' <<<"$SITE_EMAIL")"
+    fi
+  fi
+  [[ -n "$SITE_DOMAIN" ]]
+}
+
+_site_check_dns() {
+  # rc 0 — ок; иначе печатает понятную ошибку
+  local d="$1" pub4="$2" pub6="$3" a aaaa ip ok4=0 bad=0
+  a="$(_site_resolve A "$d")"
+  aaaa="$(_site_resolve AAAA "$d")"
+  if [[ -z "$a" && -z "$aaaa" ]]; then
+    err "Домен ${d} не резолвится (нет A/AAAA). Создайте A-запись ${d} → ${pub4:-<IP ноды>} и подождите 1–5 минут."
+    return 1
+  fi
+  while IFS= read -r ip; do
+    [[ -n "$ip" ]] || continue
+    if [[ "$ip" == "$pub4" ]]; then ok4=1; continue; fi
+    if _site_ip_is_cloudflare "$ip"; then
+      err "A-запись ${d} → ${ip} — это Cloudflare (оранжевое облако). Переключите запись на «DNS only» (серое облако): REALITY и выпуск сертификата требуют прямого IP ноды."
+    else
+      err "A-запись ${d} → ${ip}, а IP этой ноды ${pub4:-не определён}. Исправьте A-запись."
+    fi
+    bad=1
+  done <<<"$a"
+  if [[ -n "$aaaa" ]]; then
+    while IFS= read -r ip; do
+      [[ -n "$ip" ]] || continue
+      if [[ -n "$pub6" && "${ip,,}" == "${pub6,,}" ]]; then continue; fi
+      err "AAAA-запись ${d} → ${ip} не совпадает с IPv6 ноды (${pub6:-нет IPv6}). Let's Encrypt проверяет IPv6 первым — удалите AAAA или исправьте."
+      bad=1
+    done <<<"$aaaa"
+  fi
+  if [[ "$ok4" -eq 0 && "$bad" -eq 0 && -n "$pub4" ]]; then
+    err "Домен ${d} не указывает на ${pub4}"
+    bad=1
+  fi
+  [[ "$bad" -eq 0 ]] || return 1
+  ok "DNS: ${d} → ${pub4}${aaaa:+ / ${aaaa//$'\n'/ }}"
+}
+
+_site_write_nginx_conf() {
+  # _site_write_nginx_conf PHASE(acme|full)
+  local phase="$1" d="$SITE_DOMAIN" v6=0 dflt=" default_server" h2listen="" h2line="" pp=""
+  [[ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 1)" == "0" ]] && v6=1
+  [[ "$SITE_DEFAULT80" -eq 1 ]] || dflt=""
+  if _site_nginx_ge_1251; then h2line="    http2 on;"; else h2listen=" http2"; fi
+  [[ "$SITE_PP" -eq 1 ]] && pp=" proxy_protocol"
+  local live="/etc/letsencrypt/live/${d}"
+  {
+    echo "# Managed by ${SCRIPT_NAME} ${VERSION} — site ${d} (mode=${SITE_MODE_ACTIVE}, phase=${phase})"
+    echo "server {"
+    echo "    listen 80${dflt};"
+    [[ "$v6" -eq 1 ]] && echo "    listen [::]:80${dflt};"
+    if [[ -n "$dflt" ]]; then echo "    server_name ${d} _;"; else echo "    server_name ${d};"; fi
+    echo "    server_tokens off;"
+    echo "    access_log off;"
+    echo "    location ^~ /.well-known/acme-challenge/ {"
+    echo "        root ${SITE_ACME_ROOT};"
+    echo "        default_type text/plain;"
+    echo "    }"
+    echo "    location / {"
+    echo "        return 301 https://${d}\$request_uri;"
+    echo "    }"
+    echo "}"
+    if [[ "$phase" == "full" ]]; then
+      echo
+      echo "server {"
+      echo "    listen ${SITE_LISTEN}:${SITE_PORT} ssl${h2listen}${pp};"
+      if [[ "$SITE_MODE_ACTIVE" == "public" ]]; then
+        echo "    listen 443 ssl${h2listen};"
+        [[ "$v6" -eq 1 ]] && echo "    listen [::]:443 ssl${h2listen};"
+      fi
+      [[ -n "$h2line" ]] && echo "$h2line"
+      echo "    server_name ${d};"
+      echo "    server_tokens off;"
+      echo "    ssl_certificate ${live}/fullchain.pem;"
+      echo "    ssl_certificate_key ${live}/privkey.pem;"
+      echo "    ssl_protocols TLSv1.2 TLSv1.3;"
+      echo "    ssl_ecdh_curve X25519:prime256v1:secp384r1;"
+      echo "    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;"
+      echo "    ssl_prefer_server_ciphers off;"
+      echo "    ssl_session_cache shared:SITETLS:10m;"
+      echo "    ssl_session_timeout 1d;"
+      echo "    ssl_session_tickets off;"
+      echo "    root ${SITE_ROOT};"
+      echo "    index index.html;"
+      echo "    charset utf-8;"
+      echo "    access_log off;"
+      echo "    gzip on;"
+      echo "    gzip_types text/css image/svg+xml application/xml text/plain;"
+      echo "    add_header Strict-Transport-Security \"max-age=31536000\" always;"
+      echo "    add_header X-Content-Type-Options \"nosniff\" always;"
+      echo "    add_header Referrer-Policy \"strict-origin-when-cross-origin\" always;"
+      echo "    add_header X-Frame-Options \"SAMEORIGIN\" always;"
+      echo "    error_page 404 /404.html;"
+      echo "    location = /404.html { internal; }"
+      echo "    location / {"
+      echo "        try_files \$uri \$uri/ =404;"
+      echo "    }"
+      echo "    location /assets/ {"
+      echo "        expires 30d;"
+      echo "    }"
+      echo "}"
+    fi
+  } >"$SITE_NGINX_CONF"
+}
+
+_site_print_panel_values() {
+  local d="$SITE_DOMAIN" target xver=0
+  target="${SITE_LISTEN}:${SITE_PORT}"
+  [[ "$SITE_PP" -eq 1 ]] && xver=1
+  echo
+  menu_sep
+  printf '%b📋 Что вставить в панель Remnawave (сам скрипт панель НЕ меняет):%b\n' "${C_BOLD}" "${C_RESET}"
+  echo "  Config Profiles → профиль ноды → inbound VLESS REALITY (порт 443) → streamSettings.realitySettings:"
+  echo
+  echo "    \"target\": \"${target}\",          ← в старых xray это поле называется \"dest\""
+  echo "    \"serverNames\": [\"${d}\"],"
+  echo "    \"xver\": ${xver}"
+  echo
+  echo "  privateKey / shortIds НЕ меняйте. Рекомендуется: \"flow\": \"xtls-rprx-vision\" у клиентов."
+  echo "  Hosts → у хостов этой ноды поле SNI = ${d} (иначе клиенты пришлют старый SNI)."
+  echo "  Плавный переход: на время добавьте ${d} в serverNames рядом со старыми именами, смените SNI"
+  echo "  в Hosts, дождитесь обновления подписок (сутки), затем уберите старые имена."
+  if [[ "$SITE_PP" -eq 1 ]]; then
+    echo "  xver=1 обязателен: nginx на ${target} ждёт PROXY protocol — без него сайт через REALITY не откроется."
+  fi
+  if [[ "$SITE_MODE_ACTIVE" == "public" ]]; then
+    echo "  Режим public: nginx сам слушает 443. Если REALITY на другом порту — target тот же (${target})."
+  fi
+  case "$SITE_NET_HOST" in
+    0) echo "  remnanode: network_mode: host — 127.0.0.1 внутри контейнера = хост, target ${target} подходит." ;;
+    1) echo "  remnanode НЕ в host-сети: target ${target} (адрес docker-моста хоста); правило UFW для 172.16.0.0/12 → ${SITE_PORT} добавлено." ;;
+    *) echo "  /opt/remnanode/docker-compose.yml не найден — проверьте, что remnanode в network_mode: host (иначе target = IP docker0, флаг --site-listen)." ;;
+  esac
+  echo "  Проверка: gorecshit --audit (раздел «Сайт-маскировка»)."
+  menu_sep
+}
+
+_site_restore_after_fail() {
+  # вернуть nginx к состоянию до запуска (наш конфиг убрать/восстановить, декой/дефолт вернуть)
+  rm -f "$SITE_NGINX_CONF"
+  local f
+  for f in "$SITE_NGINX_CONF" /etc/nginx/conf.d/gorecshit-decoy.conf /etc/nginx/sites-enabled/default; do
+    [[ -e "${BACKUP_DIR}${f}" || -L "${BACKUP_DIR}${f}" ]] && cp -a "${BACKUP_DIR}${f}" "$f"
+  done
+  nginx -t >/dev/null 2>&1 && systemctl reload nginx 2>/dev/null || true
+}
+
+_site_local_get() {
+  # _site_local_get PATH [-o FILE] — GET через локальный listener (как его видит REALITY)
+  local path="$1"; shift
+  local -a pp=()
+  [[ "${SITE_PP:-0}" -eq 1 ]] && pp=(--haproxy-protocol)
+  curl -sS --connect-timeout 4 --max-time 10 "${pp[@]}" \
+    --resolve "${SITE_DOMAIN}:${SITE_PORT}:${SITE_LISTEN}" "$@" "https://${SITE_DOMAIN}:${SITE_PORT}${path}"
+}
+
+configure_site() {
+  # Сайт-маскировка: поддомен ноды + Let's Encrypt + nginx-сайт для REALITY self-steal
+  if [[ "$DO_SITE" -eq 0 ]]; then return 0; fi
+  step "Сайт-маскировка: поддомен + сертификат + сайт (REALITY self-steal)"
+  _site_load_state || true   # повторный запуск: прежние порт/режим/сид (флаги имеют приоритет)
+  if ! _site_prompt_domain; then
+    if [[ "$SITE_STANDALONE" -eq 1 ]]; then
+      err "Не указан поддомен ноды: gorecshit --site-domain node.example.ru [--site-email you@example.ru]"
+      return 1
+    fi
+    warn "Сайт-маскировка пропущена — не указан --site-domain"
+    return 0
+  fi
+  SITE_DOMAIN="${SITE_DOMAIN%.}"; SITE_DOMAIN="${SITE_DOMAIN,,}"
+  if ! _site_valid_domain "$SITE_DOMAIN"; then
+    err "Некорректный домен: ${SITE_DOMAIN} (нужно вида node.example.ru; кириллицу — в punycode xn--…)"
+    return 1
+  fi
+  if LC_ALL=C grep -qiE "$SITE_FORBIDDEN_RE" <<<"$SITE_DOMAIN"; then
+    err "В домене ${SITE_DOMAIN} есть «палевное» слово ($(LC_ALL=C grep -oiE "$SITE_FORBIDDEN_RE" <<<"$SITE_DOMAIN" | head -1)). SNI виден DPI открытым текстом — возьмите нейтральный поддомен (cdn, static, mail, files…)."
+    return 1
+  fi
+  case "$SITE_THEME" in auto|random|it|photo|translate|coffee) ;; *) err "Неизвестная тема --site-theme ${SITE_THEME} (it|photo|translate|coffee|auto)"; return 1 ;; esac
+  case "$SITE_MODE" in auto|selfsteal|public) ;; *) err "--site-mode: auto|selfsteal|public"; return 1 ;; esac
+  if ! is_port "$SITE_PORT" || [[ "$SITE_PORT" == 80 || "$SITE_PORT" == 443 ]]; then
+    err "Некорректный --site-port ${SITE_PORT} (локальный порт, не 80/443; по умолчанию 9443)"; return 1
+  fi
+  if [[ -n "$SITE_EMAIL" && ! "$SITE_EMAIL" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]]; then
+    err "Некорректный --site-email: ${SITE_EMAIL}"; return 1
+  fi
+
+  # --- режим ---
+  local owner443 prev_mode="${SITE_MODE_ACTIVE:-}"
+  owner443="$(_site_port_owner 443)"
+  if [[ -z "$owner443" ]] && _site_port_listening 443; then owner443="?"; fi
+  SITE_MODE_ACTIVE="$SITE_MODE"
+  if [[ "$SITE_MODE" == "auto" ]]; then
+    if [[ -z "$owner443" ]]; then
+      SITE_MODE_ACTIVE="public"
+    elif [[ "$owner443" == nginx* && "$prev_mode" == "public" && -f "$SITE_NGINX_CONF" ]]; then
+      SITE_MODE_ACTIVE="public"
+    elif [[ "$owner443" == nginx* ]]; then
+      err "443 уже слушает nginx (другой сайт). Освободите 443 или запустите с --site-mode selfsteal (сайт только на ${SITE_LISTEN}:${SITE_PORT})."
+      return 1
+    else
+      SITE_MODE_ACTIVE="selfsteal"
+    fi
+  elif [[ "$SITE_MODE" == "public" && -n "$owner443" && "$owner443" != nginx* ]]; then
+    err "--site-mode public: 443 занят процессом «${owner443}» (REALITY?). Используйте selfsteal."
+    return 1
+  fi
+  if [[ "$SITE_MODE_ACTIVE" == "selfsteal" ]]; then
+    log "Режим selfsteal: 443 держит «${owner443:-никто}», сайт будет на ${SITE_LISTEN}:${SITE_PORT}, REALITY отдаёт его чужим"
+  else
+    log "Режим public: 443 свободен — nginx откроет сайт на 443 + локально на ${SITE_LISTEN}:${SITE_PORT} (для REALITY на другом порту)"
+  fi
+  if [[ "${CLI_ASSUME_YES:-0}" -eq 0 ]] && _tty_usable && [[ "$DRY_RUN" -eq 0 ]]; then
+    local ans=""
+    prompt_user "Домен ${SITE_DOMAIN}, режим ${SITE_MODE_ACTIVE}. Продолжить? [Y/n] " ans
+    if [[ "$ans" =~ ^[NnНн]$ ]]; then warn "Сайт-маскировка отменена"; return 0; fi
+  fi
+
+  # --- сеть remnanode ---
+  SITE_NET_HOST=2
+  _site_remnanode_net_host && SITE_NET_HOST=0 || SITE_NET_HOST=$?
+  if [[ "$SITE_NET_HOST" -eq 1 && -z "$SITE_LISTEN_SET" ]]; then
+    local d0
+    d0="$(ip -4 -o addr show docker0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)"
+    if [[ -n "$d0" ]]; then
+      SITE_LISTEN="$d0"
+      warn "remnanode не в host-сети — 127.0.0.1 контейнера ≠ хост. Сайт слушает ${SITE_LISTEN}:${SITE_PORT} (docker0)"
+    else
+      warn "remnanode не в host-сети, docker0 не найден — укажите адрес вручную: --site-listen <IP моста>"
+    fi
+  elif [[ "$SITE_NET_HOST" -eq 2 ]]; then
+    warn "/opt/remnanode/docker-compose.yml не найден — считаем, что remnanode в network_mode: host"
+  fi
+
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    printf '%b[DRY]%b DNS %s → IP ноды; apt nginx certbot; сайт (тема %s) → /var/www/%s; %s (80 ACME/301, %s:%s ssl h2%s%s); certbot --webroot; UFW 80%s; state %s\n' \
+      "${C_YEL}" "${C_RESET}" "$SITE_DOMAIN" "$SITE_THEME" "$SITE_DOMAIN" "$SITE_NGINX_CONF" "$SITE_LISTEN" "$SITE_PORT" \
+      "$([[ "$SITE_PP" -eq 1 ]] && echo ' proxy_protocol')" "$([[ "$SITE_MODE_ACTIVE" == public ]] && echo ' + public 443')" \
+      "$([[ "$SITE_CLOSE80" -eq 1 ]] && echo ' (закрыть после выпуска)')" "$SITE_STATE_FILE"
+    SITE_ROOT="/var/www/${SITE_DOMAIN}"
+    _site_print_panel_values
+    return 0
+  fi
+  if [[ "$(id -u)" -ne 0 ]]; then err "Нужен root"; return 1; fi
+
+  # --- DNS ---
+  local pub4="" pub6=""
+  pub4="$(_audit_detect_public_ipv4 2>/dev/null || true)"
+  pub6="$(_audit_detect_public_ipv6 2>/dev/null || true)"
+  if [[ "$SITE_SKIP_DNS" -eq 1 ]]; then
+    warn "Проверка DNS пропущена (--site-skip-dns-check)"
+  elif ! _site_check_dns "$SITE_DOMAIN" "$pub4" "$pub6"; then
+    err "Исправьте DNS и повторите: gorecshit --site-domain ${SITE_DOMAIN}"
+    return 1
+  fi
+
+  # --- порты 80 / SITE_PORT ---
+  local o
+  o="$(_site_port_owner 80)"
+  if [[ -n "$o" && "$o" != nginx* ]]; then
+    err "Порт 80 занят «${o}» — он нужен nginx для выпуска сертификата (HTTP-01) и редиректа на https"
+    return 1
+  fi
+  o="$(_site_port_owner "$SITE_PORT")"
+  if [[ -n "$o" && "$o" != nginx* ]]; then
+    err "Порт ${SITE_PORT} занят «${o}» — выберите другой: --site-port 9444"
+    return 1
+  fi
+
+  # --- пакеты ---
+  local nginx_installed=0
+  if ! command -v nginx >/dev/null 2>&1 || ! command -v certbot >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    command -v nginx >/dev/null 2>&1 || nginx_installed=1
+    apt_get_retry update -qq || warn "apt-get update failed (продолжаем)"
+    if ! apt_get_retry install -y -qq nginx certbot; then
+      err "Не удалось установить nginx/certbot"; return 1
+    fi
+  fi
+  NGINX_PRESENT=1
+  if [[ ! -d /etc/nginx/conf.d ]] || ! grep -RqsE 'include[[:space:]]+/etc/nginx/conf\.d/\*\.conf' /etc/nginx/nginx.conf; then
+    err "nginx.conf не подключает /etc/nginx/conf.d/*.conf — нестандартный nginx, не трогаем"
+    return 1
+  fi
+
+  # --- бэкапы и расчистка 80 ---
+  local conf_created=0 state_created=0 root_created=0
+  [[ -e "$SITE_NGINX_CONF" ]] || conf_created=1
+  [[ -e "$SITE_STATE_FILE" ]] || state_created=1
+  SITE_ROOT="/var/www/${SITE_DOMAIN}"
+  [[ -e "$SITE_ROOT" ]] || root_created=1
+  backup_file "$SITE_NGINX_CONF"
+  backup_file "$SITE_STATE_FILE"
+  if [[ -e /etc/nginx/conf.d/gorecshit-decoy.conf ]]; then
+    backup_file /etc/nginx/conf.d/gorecshit-decoy.conf
+    rm -f /etc/nginx/conf.d/gorecshit-decoy.conf
+    log "Декой :80 из v2.6.0 заменён сайтом (80 теперь: ACME + 301 → https://${SITE_DOMAIN})"
+  fi
+  if [[ -e /etc/nginx/sites-enabled/default || -L /etc/nginx/sites-enabled/default ]] \
+     && grep -qs 'default_server' /etc/nginx/sites-enabled/default; then
+    if grep -qs 'Default server configuration' /etc/nginx/sites-enabled/default; then
+      backup_file /etc/nginx/sites-enabled/default
+      rm -f /etc/nginx/sites-enabled/default
+      log "Убран стандартный «Welcome to nginx» (sites-enabled/default) — он выдавал бы голый nginx"
+    fi
+  fi
+  SITE_DEFAULT80=1
+  if grep -RlsE 'listen[^;]*\b80\b[^;]*default_server' /etc/nginx/conf.d /etc/nginx/sites-enabled 2>/dev/null \
+       | grep -vqE "^${SITE_NGINX_CONF}$"; then
+    SITE_DEFAULT80=0
+    warn "В nginx уже есть другой default_server на :80 — наш сервер на 80 только для ${SITE_DOMAIN}"
+  fi
+
+  # --- сайт ---
+  [[ -n "$SITE_SEED" ]] || SITE_SEED="$(od -An -N4 -tu4 /dev/urandom 2>/dev/null | tr -d ' ' || date +%s)"
+  local newroot="${SITE_ROOT}.new.$$"
+  site_generate "$newroot" "$SITE_DOMAIN" "$SITE_THEME" "$SITE_SEED"
+  if site_forbidden_scan -r "$newroot" >/dev/null; then
+    err "Генератор выдал запрещённое слово — сайт не публикуем:"
+    site_forbidden_scan -r "$newroot" | head -5 >&2
+    rm -rf "$newroot"; return 1
+  fi
+  rm -rf "$SITE_ROOT"; mv "$newroot" "$SITE_ROOT"
+  ok "Сайт сгенерирован: тема ${SITE_GEN_THEME}, «${SITE_G_BRAND}», ${SITE_G_CITY} → ${SITE_ROOT}"
+  mkdir -p "${SITE_ACME_ROOT}/.well-known/acme-challenge"
+
+  # --- UFW 80 (нужен для HTTP-01; у обычного сайта 80 открыт) ---
+  local ufw80=0 ufw443=0 ufwbr=0
+  if _site_ufw_active && ! _site_ufw_has_public 80; then
+    ufw allow 80/tcp comment 'gorecshit-site-80' >/dev/null 2>&1 || true
+    ufw80=1
+  fi
+
+  # --- сертификат ---
+  local live="/etc/letsencrypt/live/${SITE_DOMAIN}" cert_new=0
+  if [[ ! -s "${live}/fullchain.pem" ]] || ! openssl x509 -checkend $(( 30 * 86400 )) -noout -in "${live}/fullchain.pem" >/dev/null 2>&1; then
+    _site_write_nginx_conf acme
+    if ! nginx -t >/dev/null 2>&1; then
+      err "nginx -t не прошёл (фаза ACME):"; nginx -t 2>&1 | tail -5 >&2
+      _site_restore_after_fail; return 1
+    fi
+    systemctl enable nginx >/dev/null 2>&1 || true
+    systemctl reload nginx 2>/dev/null || systemctl restart nginx
+    [[ -s "${live}/fullchain.pem" ]] || cert_new=1
+    local -a mail=(--register-unsafely-without-email)
+    [[ -n "$SITE_EMAIL" ]] && mail=(--email "$SITE_EMAIL")
+    log "Выпуск сертификата Let's Encrypt для ${SITE_DOMAIN} (HTTP-01 через :80)…"
+    if ! certbot certonly --webroot -w "$SITE_ACME_ROOT" -d "$SITE_DOMAIN" --cert-name "$SITE_DOMAIN" \
+         --non-interactive --agree-tos "${mail[@]}" --keep-until-expiring \
+         --deploy-hook 'nginx -t && systemctl reload nginx' 2>&1 | tail -15; then
+      :
+    fi
+    if [[ ! -s "${live}/fullchain.pem" ]]; then
+      err "Сертификат не выпущен. Частые причины: A-запись не на этот IP / оранжевое облако Cloudflare; 80/tcp закрыт у хостера; лимит Let's Encrypt (5 в неделю на домен)."
+      err "Лог: /var/log/letsencrypt/letsencrypt.log"
+      _site_restore_after_fail
+      [[ "$ufw80" -eq 1 ]] && ufw --force delete allow 80/tcp >/dev/null 2>&1 || true
+      return 1
+    fi
+    ok "Сертификат: ${live}/fullchain.pem (до $(openssl x509 -enddate -noout -in "${live}/fullchain.pem" | cut -d= -f2))"
+  else
+    ok "Сертификат для ${SITE_DOMAIN} уже есть и действует > 30 дней — используем его"
+  fi
+
+  # --- полный конфиг ---
+  _site_write_nginx_conf full
+  if ! nginx -t >/dev/null 2>&1; then
+    err "nginx -t не прошёл:"; nginx -t 2>&1 | tail -5 >&2
+    _site_restore_after_fail; return 1
+  fi
+  systemctl enable nginx >/dev/null 2>&1 || true
+  systemctl reload nginx 2>/dev/null || systemctl restart nginx
+
+  if _site_ufw_active; then
+    if [[ "$SITE_MODE_ACTIVE" == "public" ]] && ! _site_ufw_has_public 443; then
+      ufw allow 443/tcp comment 'gorecshit-site-443' >/dev/null 2>&1 || true
+      ufw443=1
+    fi
+    if [[ "$SITE_NET_HOST" -eq 1 && "$SITE_LISTEN" != 127.* ]]; then
+      ufw allow from 172.16.0.0/12 to any port "$SITE_PORT" proto tcp comment 'gorecshit-site-bridge' >/dev/null 2>&1 || true
+      ufwbr=1
+    fi
+  fi
+
+  # --- автопродление ---
+  local hookdir=/etc/letsencrypt/renewal-hooks
+  mkdir -p "$hookdir/deploy" "$hookdir/pre" "$hookdir/post"
+  backup_file "$hookdir/deploy/50-gorecshit-site.sh"
+  printf '#!/bin/bash\n# Managed by %s %s — reload nginx after renewal\nnginx -t >/dev/null 2>&1 && systemctl reload nginx || true\n' "$SCRIPT_NAME" "$VERSION" \
+    >"$hookdir/deploy/50-gorecshit-site.sh"
+  chmod 755 "$hookdir/deploy/50-gorecshit-site.sh"
+  if [[ "$SITE_CLOSE80" -eq 1 ]]; then
+    cat >"$hookdir/pre/10-gorecshit-open80.sh" <<'HOOK'
+#!/bin/bash
+# Managed by gorecshit — open 80/tcp only for the renewal (HTTP-01)
+if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qiE 'Status:\s*active'; then
+  if ! ufw status 2>/dev/null | grep -qE '^80(/tcp)?[[:space:]]+ALLOW[[:space:]]+(IN[[:space:]]+)?Anywhere'; then
+    ufw allow 80/tcp comment 'gorecshit-acme-tmp' >/dev/null 2>&1 && : >/run/gorecshit-acme-80
+  fi
+fi
+HOOK
+    cat >"$hookdir/post/90-gorecshit-close80.sh" <<'HOOK'
+#!/bin/bash
+# Managed by gorecshit — close 80/tcp again after renewal
+if [ -f /run/gorecshit-acme-80 ]; then
+  ufw --force delete allow 80/tcp >/dev/null 2>&1 || true
+  rm -f /run/gorecshit-acme-80
+fi
+HOOK
+    chmod 755 "$hookdir/pre/10-gorecshit-open80.sh" "$hookdir/post/90-gorecshit-close80.sh"
+    if [[ "$ufw80" -eq 1 ]]; then
+      ufw --force delete allow 80/tcp >/dev/null 2>&1 || true
+      ufw80=0
+    fi
+    ok "80/tcp закрыт; при продлении certbot откроет его на минуту и закроет обратно"
+  else
+    rm -f "$hookdir/pre/10-gorecshit-open80.sh" "$hookdir/post/90-gorecshit-close80.sh"
+  fi
+  if systemctl list-unit-files certbot.timer >/dev/null 2>&1 && systemctl list-unit-files certbot.timer 2>/dev/null | grep -q certbot.timer; then
+    systemctl enable --now certbot.timer >/dev/null 2>&1 || true
+    ok "Автопродление: systemd certbot.timer (2 раза в сутки) + reload nginx"
+  elif [[ -f /etc/cron.d/certbot ]]; then
+    ok "Автопродление: /etc/cron.d/certbot + reload nginx"
+  else
+    printf '# Managed by %s\n17 3,15 * * * root certbot renew -q\n' "$SCRIPT_NAME" >/etc/cron.d/gorecshit-certbot
+    ok "Автопродление: /etc/cron.d/gorecshit-certbot + reload nginx"
+  fi
+
+  # --- состояние ---
+  mkdir -p "$(dirname "$SITE_STATE_FILE")"
+  {
+    echo "SITE_DOMAIN=${SITE_DOMAIN}"
+    echo "SITE_EMAIL=${SITE_EMAIL}"
+    echo "SITE_THEME=${SITE_GEN_THEME}"
+    echo "SITE_MODE_ACTIVE=${SITE_MODE_ACTIVE}"
+    echo "SITE_PORT=${SITE_PORT}"
+    echo "SITE_LISTEN=${SITE_LISTEN}"
+    echo "SITE_PP=${SITE_PP}"
+    echo "SITE_ROOT=${SITE_ROOT}"
+    echo "SITE_SEED=${SITE_SEED}"
+    echo "SITE_CLOSE80=${SITE_CLOSE80}"
+    echo "SITE_VERSION=${VERSION}"
+  } >"$SITE_STATE_FILE"
+
+  # --- откат ---
+  local rb_body
+  rb_body="$(printf 'SITE_RB_DOMAIN=%q\nSITE_RB_ROOT=%q\nSITE_RB_PORT=%q\n' "$SITE_DOMAIN" "$SITE_ROOT" "$SITE_PORT")"
+  [[ "$conf_created" -eq 1 ]] && rb_body+=$'\n'"rm -f $(printf '%q' "$SITE_NGINX_CONF")"
+  [[ "$state_created" -eq 1 ]] && rb_body+=$'\n'"rm -f $(printf '%q' "$SITE_STATE_FILE")"
+  [[ "$root_created" -eq 1 ]] && rb_body+=$'\n''rm -rf "$SITE_RB_ROOT"'
+  [[ "$state_created" -eq 1 ]] && rb_body+=$'\n''rm -f /etc/letsencrypt/renewal-hooks/deploy/50-gorecshit-site.sh'
+  [[ "$cert_new" -eq 1 ]] && rb_body+=$'\n''certbot delete --cert-name "$SITE_RB_DOMAIN" --non-interactive >/dev/null 2>&1 || true'
+  rb_body+=$'\n''rm -f /etc/letsencrypt/renewal-hooks/pre/10-gorecshit-open80.sh /etc/letsencrypt/renewal-hooks/post/90-gorecshit-close80.sh /etc/cron.d/gorecshit-certbot'
+  [[ "$ufw80" -eq 1 ]] && rb_body+=$'\n''command -v ufw >/dev/null && ufw --force delete allow 80/tcp >/dev/null 2>&1 || true'
+  [[ "$ufw443" -eq 1 ]] && rb_body+=$'\n''command -v ufw >/dev/null && ufw --force delete allow 443/tcp >/dev/null 2>&1 || true'
+  [[ "$ufwbr" -eq 1 ]] && rb_body+=$'\n''command -v ufw >/dev/null && ufw --force delete allow from 172.16.0.0/12 to any port "$SITE_RB_PORT" proto tcp >/dev/null 2>&1 || true'
+  if [[ "$nginx_installed" -eq 1 ]]; then
+    rb_body+=$'\n''if ls /etc/nginx/conf.d/*.conf >/dev/null 2>&1; then nginx -t >/dev/null 2>&1 && systemctl reload nginx 2>/dev/null || true; else systemctl disable --now nginx >/dev/null 2>&1 || true; fi'
+  else
+    rb_body+=$'\n''nginx -t >/dev/null 2>&1 && systemctl reload nginx 2>/dev/null || true'
+  fi
+  _rb_append_block "gorecshit-site-restore" "$rb_body"
+
+  # --- самопроверка ---
+  local code
+  code="$(_site_local_get / -o /dev/null -w '%{http_code}' 2>/dev/null || true)"
+  if [[ "$code" == "200" ]]; then
+    ok "Самопроверка: https://${SITE_DOMAIN} через ${SITE_LISTEN}:${SITE_PORT} → 200, сертификат валиден"
+  else
+    warn "Самопроверка: ${SITE_LISTEN}:${SITE_PORT} ответил «${code:-нет ответа}» — проверьте: nginx -t; journalctl -u nginx"
+  fi
+  if [[ "$SITE_MODE_ACTIVE" == "public" ]]; then
+    ok "Сайт открыт: https://${SITE_DOMAIN}/"
+  fi
+  _site_print_panel_values
+}
+
+run_site_only() {
+  if [[ "$(id -u)" -ne 0 && "$DRY_RUN" -eq 0 ]]; then
+    err "Нужен root для сайта-маскировки"
+    exit 1
+  fi
+  DO_SITE=1
+  SITE_STANDALONE=1
+  preflight
+  write_rollback_script
+  if ! configure_site; then
+    err "Сайт-маскировка не установлена — см. ошибку выше (при сбое nginx возвращается как был). Откат запуска: $(rollback_hint_cmd)"
+    install_cli_command
+    exit 1
+  fi
+  install_cli_command
+  ok "Откат сайта: $(rollback_hint_cmd)   (или ${BACKUP_DIR}/rollback.sh)"
+}
+
+_audit_site() {
+  step "Сайт-маскировка (домен ноды + сертификат)"
+  SITE_DOMAIN=""; SITE_MODE_ACTIVE=""
+  if ! _site_load_state || [[ -z "$SITE_DOMAIN" ]]; then
+    _audit_info "Не установлена. С ней REALITY отдаёт зондам ваш собственный сайт с настоящим сертификатом (self-steal):"
+    _audit_info "gorecshit --site-domain node.example.ru   |   меню → 10"
+    return 0
+  fi
+  local d="$SITE_DOMAIN" live="/etc/letsencrypt/live/${SITE_DOMAIN}/fullchain.pem" end
+  _audit_info "Домен: ${d}  режим: ${SITE_MODE_ACTIVE}  локально: ${SITE_LISTEN}:${SITE_PORT}$([[ "$SITE_PP" -eq 1 ]] && echo ' (proxy_protocol, xver=1)')"
+
+  # 1) сертификат
+  if [[ ! -s "$live" ]]; then
+    _audit_err "Нет сертификата ${live} — повторите: gorecshit --site-domain ${d}"
+  else
+    end="$(openssl x509 -enddate -noout -in "$live" 2>/dev/null | cut -d= -f2)"
+    if ! openssl x509 -checkend 0 -noout -in "$live" >/dev/null 2>&1; then
+      _audit_err "Сертификат ИСТЁК (${end}) — certbot renew --force-renewal; проверьте 80/tcp и DNS"
+    elif ! openssl x509 -checkend $(( 14 * 86400 )) -noout -in "$live" >/dev/null 2>&1; then
+      _audit_warn "Сертификат истекает < 14 дней (${end}) — автопродление не сработало? certbot renew --dry-run"
+    else
+      _audit_ok "Сертификат Let's Encrypt действует до ${end}"
+    fi
+  fi
+  if systemctl is-enabled --quiet certbot.timer 2>/dev/null || [[ -f /etc/cron.d/certbot || -f /etc/cron.d/gorecshit-certbot ]]; then
+    _audit_ok "Автопродление настроено (certbot.timer / cron)"
+  else
+    _audit_warn "Автопродление не найдено — systemctl enable --now certbot.timer"
+  fi
+
+  # 2) DNS
+  local a pub="${AUDIT_PUB_IP:-}"
+  a="$(_site_resolve A "$d" | paste -sd' ' -)"
+  if [[ -z "$a" ]]; then
+    _audit_err "${d} не резолвится (нет A-записи)"
+  elif [[ -n "$pub" && " $a " == *" $pub "* ]]; then
+    _audit_ok "DNS: ${d} → ${a}"
+  else
+    local ip cf=0
+    for ip in $a; do _site_ip_is_cloudflare "$ip" && cf=1; done
+    if [[ "$cf" -eq 1 ]]; then
+      _audit_err "DNS: ${d} → ${a} — оранжевое облако Cloudflare; нужно «DNS only» (серое)"
+    else
+      _audit_warn "DNS: ${d} → ${a}, а IP ноды ${pub:-не определён}"
+    fi
+  fi
+
+  # 3) сайт через локальный порт (так его видит REALITY)
+  if [[ "$SITE_PP" -eq 1 ]] && ! curl --help all 2>/dev/null | grep -q -- '--haproxy-protocol'; then
+    _audit_warn "curl без --haproxy-protocol — локальную проверку сайта с proxy_protocol пропускаем"
+  else
+    local tmp code hdr srv
+    tmp="$(mktemp -d)"
+    code="$(_site_local_get / -o "$tmp/index" -D "$tmp/hdr" -w '%{http_code}' 2>/dev/null || true)"
+    if [[ "$code" != "200" ]]; then
+      _audit_err "Сайт на ${SITE_LISTEN}:${SITE_PORT} ответил «${code:-нет ответа}» — REALITY-зонды увидят ошибку (nginx -t; systemctl status nginx)"
+    else
+      _audit_ok "Сайт отдаётся через ${SITE_LISTEN}:${SITE_PORT} (HTTPS 200, сертификат проверен curl)"
+      srv="$(grep -i '^server:' "$tmp/hdr" | tr -d '\r' | cut -d' ' -f2-)"
+      if [[ -n "$srv" && "$srv" != "nginx" ]]; then
+        _audit_warn "Заголовок Server: ${srv} — версия видна (server_tokens off)"
+      fi
+      grep -qi '^strict-transport-security:' "$tmp/hdr" || _audit_warn "Нет HSTS-заголовка"
+      # все страницы из sitemap + служебные
+      local -a paths=(/ /robots.txt /sitemap.xml)
+      local p n=0 bad=0 hits
+      _site_local_get /sitemap.xml -o "$tmp/sitemap" 2>/dev/null || true
+      while IFS= read -r p; do
+        [[ -n "$p" ]] && paths+=("$p")
+      done < <(grep -oE "<loc>https://${d//./\\.}(/[^<]*)</loc>" "$tmp/sitemap" 2>/dev/null | sed -E 's#<loc>https://[^/]+(/[^<]*)</loc>#\1#' | sort -u)
+      paths+=("/$(od -An -N4 -tx4 /dev/urandom 2>/dev/null | tr -d ' ')-missing")
+      for p in "${paths[@]}"; do
+        n=$((n + 1))
+        _site_local_get "$p" -o "$tmp/page" 2>/dev/null || true
+        hits="$(LC_ALL=C grep -oiE "$SITE_FORBIDDEN_RE" "$tmp/page" 2>/dev/null | sort -u | paste -sd, - || true)"
+        if [[ -n "$hits" ]]; then
+          _audit_warn "Страница ${p}: найдены слова «${hits}» (текст/title/meta/комментарии) — уберите их с сайта"
+          bad=1
+        fi
+      done
+      if [[ "$bad" -eq 0 ]]; then
+        _audit_ok "Проверено ${n} адресов (страницы из sitemap, robots, sitemap, 404): слов vpn/proxy/xray/reality/gorec/обход… нет"
+      fi
+    fi
+    rm -rf "$tmp"
+  fi
+
+  # 4) снаружи: 443 с SNI домена должен отдавать НАШ сертификат (= панель переключена на self-steal)
+  if [[ -n "$pub" && -s "$live" ]] && command -v openssl >/dev/null 2>&1; then
+    local ext loc
+    ext="$(timeout 8 openssl s_client -connect "${pub}:443" -servername "$d" </dev/null 2>/dev/null | openssl x509 -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2 || true)"
+    loc="$(openssl x509 -noout -fingerprint -sha256 -in "$live" 2>/dev/null | cut -d= -f2 || true)"
+    if [[ -z "$ext" ]]; then
+      _audit_warn "${pub}:443 с SNI ${d} не отдал сертификат — REALITY на 443 не настроен на этот домен?"
+    elif [[ "$ext" == "$loc" ]]; then
+      _audit_ok "Снаружи ${pub}:443 (SNI ${d}) отдаёт ваш сертификат — маскировка работает"
+    else
+      _audit_warn "Снаружи ${pub}:443 (SNI ${d}) отдаёт ЧУЖОЙ сертификат — в панели ещё старый target/dest"
+    fi
+  fi
+  _audit_info "Сверьте в панели: target/dest = ${SITE_LISTEN}:${SITE_PORT}, serverNames содержит ${d}, xver = $([[ "$SITE_PP" -eq 1 ]] && echo 1 || echo 0), SNI в Hosts = ${d}"
+}
+
 ufw_remove_public_node_port() {
   # Delete "NODE_PORT ALLOW Anywhere" (v4/v6) — only for a family where no non-panel
   # established peer exists on NODE_PORT (never cut the panel↔node link).
@@ -5980,6 +7240,7 @@ run_hardening() {
   configure_egress_guard
   configure_stealth
   configure_decoy_web
+  configure_site || warn "Сайт-маскировка не установлена (остальная защита применена) — повтор: gorecshit --site-domain <домен>"
   configure_hostname_tz
   configure_docker_journal
   maybe_apply_docker_daemon_restart
@@ -6011,6 +7272,7 @@ main() {
         && "$DO_REFRESH_LISTS_ONLY" -eq 0 && "$DO_STATUS_ONLY" -eq 0 && "$DO_DPI_CHECK" -eq 0 \
         && "$DO_AUDIT" -eq 0 \
         && "$DO_FINGERPRINT_ONLY" -eq 0 \
+        && "$DO_SITE_ONLY" -eq 0 \
         && "$DO_UPDATE_ONLY" -eq 0 \
         && -t 0 && -t 1 ]]; then
     interactive_menu
@@ -6033,6 +7295,11 @@ main() {
 
   if [[ "$DO_FINGERPRINT_ONLY" -eq 1 ]]; then
     run_fingerprint_only
+    exit 0
+  fi
+
+  if [[ "$DO_SITE_ONLY" -eq 1 ]]; then
+    run_site_only
     exit 0
   fi
 
