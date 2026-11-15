@@ -2,7 +2,7 @@
 
 Однокомандное hardening-окружение для **нод Remnawave** (Debian 11+ / Ubuntu 20.04+).
 
-**Версия: 2.8.0**
+**Версия: 2.8.1**
 
 📍 **[Карта: как вычисляют VPN-ноду и что закрывает gorecshit](docs/detection-vectors.md)** — активное зондирование, DPI, Shodan/Censys, порты, IPv6, PTR, abuse и т.д.
 
@@ -28,7 +28,7 @@
 14. **Egress guard** (v2.6.0, по умолчанию вкл., `--no-egress-guard`) — исходящий **TCP 25** (SMTP) → REJECT с хоста и из Docker (IPv4+IPv6), чтобы через ноду нельзя было слать спам и хостер не получал abuse-жалобы. Порты: `--egress-block-ports 25,465,587`. Также режутся исходящие ICMP port/proto-unreachable и time-exceeded (PMTU frag-needed/packet-too-big **не** трогаются). Рекомендация (в панели): routing `bittorrent → blackhole`.
 15. **IPv6 = IPv4** (v2.6.0) — UFW `IPV6=yes`, ping6 DROP, DOCKER-USER для NODE_PORT и по v6; публичные `ALLOW Anywhere` для NODE_PORT удаляются (кроме семейства, где есть живое соединение не с панели).
 16. **Декой :80** (опционально, `--decoy-web` / вопрос y/N) — только если уже есть nginx, 80 свободен и REALITY на 443: `301 → https` как у обычного сайта; иначе только рекомендация.
-17. **`--check` / `--rollback` / `--status` / `--version` / `--refresh-lists` / `--dpi-check` / `--audit` / `--stealth` / `--update` / `--no-upgrade`**.
+17. **`--check` / `--rollback` / `--status` / `--version` / `--refresh-lists` / `--dpi-check` / `--audit` / `--stealth` / `--update` / `--fix-boot` / `--no-upgrade`**.
 
 ## Меню (TTY)
 
@@ -195,6 +195,17 @@ sudo gorecshit --stealth
 ```
 
 ## Changelog
+
+### v2.8.1
+- **Исправлено: после перезагрузки нода могла стать недоступной.** У `scanner-block.service` было `Before=ufw.service` и одновременно `After=network-pre.target`, а сам `ufw.service` стоит `Before=network-pre.target` — получался цикл. systemd выкидывал `scanner-block` из загрузки, ipset `scanner-block` не создавался, `/etc/ufw/before.rules` падал на `Set scanner-block doesn't exist`, UFW оставался загруженным наполовину (нет правила RELATED,ESTABLISHED при политике INPUT DROP): панель, SSH и Xray не отвечали, а `gorecshit-anti-probe` падал с `Index of insertion too big`.
+- `scanner-block.service`: `DefaultDependencies=no`, `After=systemd-modules-load.service local-fs.target`, `Before=ufw.service network-pre.target`, `WantedBy=multi-user.target ufw.service`. `--local-only` работает без сети, всегда завершается успешно и оставляет хотя бы пустой ipset.
+- Новый drop-in `/etc/systemd/system/ufw.service.d/gorecshit-ipset.conf`: ufw сам создаёт пустой ipset (`hash:net family inet maxelem 500000`, как в refresh-скрипте) перед загрузкой before.rules — UFW не упадёт, даже если список ещё не загружен.
+- `gorecshit-anti-probe`: запускается после `ufw.service` и `scanner-block.service`; цепочка вставляется сразу после правила RELATED,ESTABLISHED, а не по фиксированному номеру 4; на короткой цепочке или без ufw — безопасная позиция или INPUT, без ошибок. То же для правила scanner-block в refresh-скрипте (раньше — позиция 3).
+- Остальные юниты gorecshit (fingerprint, egress-guard, nic-tune, docker-user) проверены `systemd-analyze verify` — других циклов нет.
+- Новый флаг `--fix-boot`: переписывает юниты и скрипты на уже установленной ноде, делает daemon-reload и, если UFW упал или загружен наполовину, чинит его: снимок `iptables-save` в `/root/hardening-backups/iptables-<время>-before-ufw-repair.v4`, создаёт ipset, `ufw reload` (без disable/enable — SSH не рвётся), перезапускает anti-probe и остальные цепочки gorecshit. Повторный запуск ничего не ломает.
+- Миграция запускается сама: после `gorecshit --update` (начиная со следующих обновлений), при установке защиты (пункт 1) и один раз при первом запуске новой версии под root (кроме `--audit`, `--status`, `--dpi-check`, `--rollback`, `--check`).
+- `--audit`: новый раздел «Порядок запуска firewall»: циклы порядка (`systemd-analyze verify` и журнал текущей загрузки), UFW активен и загружен полностью, scanner-block и ipset на месте, drop-in есть, anti-probe активен и подключён.
+- Обновление существующей ноды (2.8.0 сам миграцию не запустит): `sudo gorecshit --update && sudo gorecshit --fix-boot`.
 
 ### v2.8.0
 - Сайт-маскировка: **8 новых шаблонов** со своей разметкой и CSS, а не перекраской: `architect` (журнальная вёрстка), `bakery` (мягкий стиль), `bike` (тёмная тема), `accounting` (боковое меню), `lingua` (лендинг), `florist` (две колонки), `furniture` (сетка с колонкой дат), `travel` (минималистичный блог). Всего 12.
