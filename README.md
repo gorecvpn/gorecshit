@@ -2,7 +2,7 @@
 
 Однокомандное hardening-окружение для **нод Remnawave** (Debian 11+ / Ubuntu 20.04+).
 
-**Версия: 2.8.2**
+**Версия: 2.8.3**
 
 📍 **[Карта: как вычисляют VPN-ноду и что закрывает gorecshit](docs/detection-vectors.md)** — активное зондирование, DPI, Shodan/Censys, порты, IPv6, PTR, abuse и т.д.
 
@@ -28,7 +28,7 @@
 14. **Egress guard** (v2.6.0, по умолчанию вкл., `--no-egress-guard`) — исходящий **TCP 25** (SMTP) → REJECT с хоста и из Docker (IPv4+IPv6), чтобы через ноду нельзя было слать спам и хостер не получал abuse-жалобы. Порты: `--egress-block-ports 25,465,587`. Также режутся исходящие ICMP port/proto-unreachable и time-exceeded (PMTU frag-needed/packet-too-big **не** трогаются). Рекомендация (в панели): routing `bittorrent → blackhole`.
 15. **IPv6 = IPv4** (v2.6.0) — UFW `IPV6=yes`, ping6 DROP, DOCKER-USER для NODE_PORT и по v6; публичные `ALLOW Anywhere` для NODE_PORT удаляются (кроме семейства, где есть живое соединение не с панели).
 16. **Декой :80** (опционально, `--decoy-web` / вопрос y/N) — только если уже есть nginx, 80 свободен и REALITY на 443: `301 → https` как у обычного сайта; иначе только рекомендация.
-17. **`--check` / `--rollback` / `--status` / `--version` / `--refresh-lists` / `--dpi-check` / `--audit` / `--stealth` / `--update` / `--fix-boot` / `--no-upgrade`**.
+17. **`--check` / `--rollback` / `--status` / `--version` / `--refresh-lists` / `--dpi-check` / `--audit` / `--stealth` / `--update` / `--fix-boot` / `--site-fix-443` / `--no-upgrade`**.
 
 ## Меню (TTY)
 
@@ -104,8 +104,8 @@ sudo gorecshit --site-domain cdn.example.ru --site-email you@example.ru
 
 1. Проверяет DNS через DoH: A/AAAA должны указывать на IP этой ноды. Отдельно ловит оранжевое облако Cloudflare.
 2. Выбирает режим сам и спрашивает подтверждение:
-   - **selfsteal** — 443 занят xray (REALITY). nginx отдаёт сайт только на `127.0.0.1:9443`.
-   - **public** — 443 свободен. nginx слушает и публичный 443, и `127.0.0.1:9443` (для REALITY на другом порту).
+   - **selfsteal** — на хосте есть remnanode (compose/`.env` в `/opt/remnanode`, контейнер — даже остановленный — или процесс xray) **или** 443 занят xray. nginx отдаёт сайт только на `127.0.0.1:9443` (+80 для сертификата), публичный 443 остаётся Xray. На нодах это режим **всегда** (v2.8.3).
+   - **public** — только если remnanode на хосте нет и 443 свободен. nginx слушает и публичный 443, и `127.0.0.1:9443`. Явный `--site-mode public` на ноде печатает крупное предупреждение и требует подтверждения (или `--yes`): любой профиль с 443 после этого не запустится.
 3. Ставит `nginx` и `certbot` (apt). Выпускает сертификат по HTTP-01 через webroot на :80. В UFW открывает `80/tcp`: у обычного сайта 80 открыт и отвечает 301 на https. С `--site-close-80` порт закрывается после выпуска, а при продлении certbot открывает его примерно на минуту и закрывает обратно.
 4. Генерирует статический сайт:
    - страницы: главная, «О нас», «Услуги» (у каждой темы свои названия разделов), блог с 3–5 статьями, «Контакты», 404, `robots.txt`, `sitemap.xml`, `favicon.svg`/`.ico`, CSS;
@@ -158,6 +158,7 @@ sudo gorecshit --site-domain cdn.example.ru --site-email you@example.ru
 - `--site-theme random|<имя>` — по умолчанию `random` (`auto` = `random`)
 - `--site-regen` — при повторном запуске сгенерировать новый случайный сайт
 - `--site-mode auto|selfsteal|public`
+- `--site-fix-443` — перевести уже установленный сайт из public в selfsteal (nginx уходит с 443; бэкап, `nginx -t`, reload, при ошибке — возврат)
 - `--site-port 9443`
 - `--site-listen IP`
 - `--site-proxy-protocol`
@@ -195,6 +196,16 @@ sudo gorecshit --stealth
 ```
 
 ## Changelog
+
+### v2.8.3
+- **Исправлено: после меню 10 Xray на ноде падал с `failed to listen TCP on 443 ... bind: address already in use`.** Режим `auto` выбирал `public`, если в момент установки 443 никто не слушал. На нодах Remnawave так бывает часто: профиль на 8443, контейнер в перезапуске, а позже панель переводит ноду на профиль с 443. nginx уже держал `0.0.0.0:443` / `[::]:443`, и Xray не мог занять порт.
+- Теперь `auto` на хосте с remnanode (compose/`.env` в `/opt/remnanode*`, контейнер remnanode в любом состоянии или процесс xray/rw-core) **всегда** выбирает `selfsteal`: nginx слушает только `127.0.0.1:9443` и 80 (выпуск сертификата и 301 на https — как раньше). `public` в `auto` — только когда remnanode на хосте нет.
+- Явный `--site-mode public` на ноде: крупное предупреждение, что профили с 443 сломаются, и вопрос y/N; без терминала — только с `--yes`.
+- Миграция уже установленных сайтов: если в `/var/lib/gorecshit/site.env` режим `public` (или конфиг nginx слушает 443) и на хосте есть remnanode, конфиг пересобирается в `selfsteal`: бэкап в `/var/lib/gorecshit/backups/site-fix-443-<время>/`, `nginx -t`, reload; при ошибке прежний конфиг возвращается. Шаблон, сид и сертификат не меняются. В конце печатается, что вписать в REALITY: `target 127.0.0.1:9443`, `serverNames` — домен ноды.
+- Миграция запускается сама: из `--fix-boot` (его вызывает `--update` в версиях 2.8.1 и 2.8.2), при любом запуске от root (кроме `--audit`, `--status`, `--dpi-check`, `--rollback`, `--check`) и при повторном запуске меню 10. Отдельный флаг: `sudo gorecshit --site-fix-443`.
+- `--audit`: новый раздел «Порт 443: Xray против сайта / веб-сервера». Ошибка, если на ноде публичный 443 держит nginx, caddy или любой другой процесс, кроме Xray, или если порт из профиля ноды занят не Xray. Предупреждение, если сайт стоит в режиме public на ноде или профиль содержит 443, а 443 никто не слушает. Рядом печатается команда для исправления.
+- Меню 10 сразу пишет, что на ноде сайт ставится на `127.0.0.1:9443`, а 443 остаётся Xray.
+- Обновление: `sudo gorecshit --update`. На 2.8.1/2.8.2 миграция пройдёт сама. С 2.8.0 и старше после обновления выполните `sudo gorecshit --site-fix-443`.
 
 ### v2.8.2
 - **Исправлено: на Ubuntu 22.10+/24.04 с `ssh.socket` раздел «SSH hardening drop-in» падал** с `Missing privilege separation directory: /run/sshd` и `sshd -t failed`, после чего скрипт останавливался. При сокет-активации каталог `/run/sshd` создаётся только когда sshd запущен, поэтому `sshd -t` падал при любом конфиге. По той же причине проверка `DebianBanner` ошибочно писала «not supported».

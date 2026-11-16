@@ -8,7 +8,7 @@
 # Does NOT restart Docker while remnanode/xray is live. Does NOT deploy itself.
 set -Eeuo pipefail
 
-VERSION="2.8.2"
+VERSION="2.8.3"
 SCRIPT_NAME="gorecshit"
 BACKUP_ROOT="/root/hardening-backups"
 # scanner-block ipset: one definition for the refresh script, ufw drop-in and repair (v2.8.1)
@@ -121,6 +121,7 @@ DO_AUDIT=0
 DO_FINGERPRINT_ONLY=0
 DO_UPDATE_ONLY=0
 DO_FIX_BOOT_ONLY=0
+DO_SITE_FIX443_ONLY=0     # --site-fix-443: перевести сайт public → selfsteal (освободить 443 для Xray)
 # audit reachability side-channel (ICMP via check-host)
 AUDIT_PING_DONE=0
 AUDIT_PING_RU_OK=0
@@ -292,7 +293,8 @@ Options:
                                furniture  — joinery workshop (ledger grid)
                                travel     — travel blog (minimal single column)
                              Re-run keeps the installed site; random/--site-regen = new one
-  --site-mode M              auto|selfsteal|public (auto: 443 busy by xray → selfsteal)
+  --site-mode M              auto|selfsteal|public (auto: remnanode on host or 443 busy → selfsteal;
+                             public only without remnanode; public on a node needs confirmation/--yes)
   --site-port N              Local TLS port for REALITY target (default 9443)
   --site-listen IP           Local listen address (default 127.0.0.1; docker0 IP if remnanode not host-net)
   --site-proxy-protocol      nginx expects PROXY protocol on the local port (set xver=1 in panel)
@@ -317,6 +319,9 @@ Options:
   --update                   Self-update from GitHub by commit SHA (jsDelivr / cache-buster fallback)
   --fix-boot                 Rewrite ufw/scanner-block/anti-probe units (boot order) and repair a
                              half-loaded UFW via ufw reload (keeps SSH); also runs after --update
+                             (v2.8.3+: also moves a public-mode site off 443 on a remnanode host)
+  --site-fix-443             Site module: public → selfsteal (nginx leaves 443 to Xray, site only on
+                             127.0.0.1:9443); backup + nginx -t + reload, restore on failure
   --version                  Print script version and exit
   --dpi-check                Check DPI/DNS/TLS from this node (egress diagnostics)
   --audit                    RU block check + Shodan InternetDB + port/IPv6 exposure + active
@@ -631,6 +636,7 @@ parse_args() {
       --status) DO_STATUS_ONLY=1; shift ;;
       --update) DO_UPDATE_ONLY=1; shift ;;
       --fix-boot|--repair-firewall) DO_FIX_BOOT_ONLY=1; shift ;;
+      --site-fix-443) DO_SITE_FIX443_ONLY=1; shift ;;
       --version|-V) printf '%s\n' "$VERSION"; exit 0 ;;
       --dpi-check) DO_DPI_CHECK=1; shift ;;
       --audit) DO_AUDIT=1; shift ;;
@@ -679,7 +685,7 @@ parse_args() {
 
 prompt_panel_ip() {
   if [[ -n "$PANEL_IP" ]]; then return 0; fi
-  if [[ "$DO_ROLLBACK" -eq 1 || "$DO_STATUS_ONLY" -eq 1 || "$DO_REFRESH_LISTS_ONLY" -eq 1 || "$DO_DPI_CHECK" -eq 1 || "$DO_AUDIT" -eq 1 || "$DO_FINGERPRINT_ONLY" -eq 1 || "$DO_UPDATE_ONLY" -eq 1 || "$DO_FIX_BOOT_ONLY" -eq 1 ]]; then return 0; fi
+  if [[ "$DO_ROLLBACK" -eq 1 || "$DO_STATUS_ONLY" -eq 1 || "$DO_REFRESH_LISTS_ONLY" -eq 1 || "$DO_DPI_CHECK" -eq 1 || "$DO_AUDIT" -eq 1 || "$DO_FINGERPRINT_ONLY" -eq 1 || "$DO_UPDATE_ONLY" -eq 1 || "$DO_FIX_BOOT_ONLY" -eq 1 || "$DO_SITE_FIX443_ONLY" -eq 1 ]]; then return 0; fi
   if [[ "$ASSUME_YES" -eq 1 ]]; then
     err "--panel-ip is required (or set GORECSHIT_PANEL_IP). Refusing non-interactive without it."
     exit 2
@@ -2711,6 +2717,8 @@ run_node_audit() {
   echo
   _audit_site
   echo
+  _audit_site_port443
+  echo
   _audit_boot_order
 
   echo
@@ -2967,7 +2975,7 @@ interactive_menu() {
     printf '  %b7)%b ⬆️  Обновить gorecshit (GitHub)\n' "${C_BOLD}" "${C_RESET}"
     printf '  %b8)%b 🛡️  Проверка на блокировку и палевность ноды\n' "${C_BOLD}" "${C_RESET}"
     printf '  %b9)%b 🕵️  Скрыть отпечатки сервера\n' "${C_BOLD}" "${C_RESET}"
-    printf '  %b10)%b 🌐 Сайт-маскировка (поддомен + сертификат + сайт, 12 шаблонов)\n' "${C_BOLD}" "${C_RESET}"
+    printf '  %b10)%b 🌐 Сайт-маскировка (поддомен + сертификат + сайт для REALITY на 127.0.0.1:9443, 12 шаблонов)\n' "${C_BOLD}" "${C_RESET}"
     menu_sep
     printf '  %b0)%b 🚪 Выход\n' "${C_BOLD}" "${C_RESET}"
     printf '%bCLI: gorecshit [--status|--update|--audit|--stealth|--site-domain D|--yes|--modules …]%b\n' "${C_GREY}" "${C_RESET}"
@@ -5206,6 +5214,8 @@ run_fix_boot_only() {
   if [[ "$(id -u)" -ne 0 && "$DRY_RUN" -eq 0 ]]; then
     err "Нужен root: sudo gorecshit --fix-boot"; exit 1
   fi
+  # v2.8.3: сайт в режиме public на ноде → selfsteal (сюда же приходит --update из v2.8.1+)
+  site_fix_443 0 || warn "Сайт-маскировка не переведена в selfsteal — повтор: sudo gorecshit --site-fix-443"
   if migrate_boot_order 1; then
     ok "Готово. После следующей перезагрузки проверьте: gorecshit --audit (раздел «Порядок запуска firewall»)"
   else
@@ -6615,6 +6625,7 @@ SITE_FORBIDDEN_RE='vpn|proxy|xray|v2ray|vless|reality|remnawave|gorec|tunnel|п�
 SITE_DOMAIN_FORBIDDEN_RE='vpn|proxy|xray|v2ray|vless|reality|remnawave|tunnel'
 SITE_STATE_FILE="/var/lib/gorecshit/site.env"
 SITE_NGINX_CONF="/etc/nginx/conf.d/gorecshit-site.conf"
+SITE_FIX_BACKUP_ROOT="/var/lib/gorecshit/backups"   # бэкапы --site-fix-443 (site-fix-443-<время>/)
 SITE_ACME_ROOT="/var/www/letsencrypt"
 SITE_THEMES="it photo translate coffee architect bakery bike accounting lingua florist furniture travel"
 
@@ -8101,6 +8112,12 @@ _site_menu_choose_theme() {
     cur_brand="$(sed -n 's/^SITE_BRAND=//p' "$SITE_STATE_FILE" | head -1 | tr -d '"')"
   fi
   echo
+  if _site_remnanode_present; then
+    echo "На этой ноде есть remnanode → режим selfsteal: nginx слушает только ${SITE_LISTEN}:${SITE_PORT} (+80 для сертификата),"
+    echo "публичный 443 остаётся Xray. В панели: REALITY target = ${SITE_LISTEN}:${SITE_PORT}, serverNames = поддомен ноды."
+  else
+    echo "Сайт для REALITY: nginx на ${SITE_LISTEN}:${SITE_PORT} (+80 для сертификата); 443 nginx займёт, только если он свободен и remnanode нет."
+  fi
   echo "Шаблон сайта:"
   if [[ -n "$cur" ]]; then
     echo "  Enter) оставить текущий: ${cur}${cur_brand:+ «${cur_brand}»} (обновить сертификат/настройки)"
@@ -8175,6 +8192,41 @@ _site_remnanode_net_host() {
     return 1
   done
   return 2
+}
+
+_site_remnanode_present() {
+  # rc 0 — на хосте есть remnanode: compose/.env в /opt/remnanode*, контейнер (запущен или нет)
+  # или процесс xray/rw-core. Xray может быть не на 443 прямо сейчас (профиль 8443, контейнер
+  # перезапускается), а панель позже переключит ноду на профиль с 443 — поэтому смотрим не на ss.
+  local d f
+  for d in /opt/remnanode /opt/remnanode-*; do
+    [[ -d "$d" ]] || continue
+    for f in docker-compose.yml docker-compose.yaml compose.yml compose.yaml .env; do
+      [[ -f "${d}/${f}" ]] && return 0
+    done
+  done
+  if command -v docker >/dev/null 2>&1 \
+     && docker ps -a --format '{{.Names}} {{.Image}}' 2>/dev/null | grep -qiE 'remnanode|remnawave/node'; then
+    return 0
+  fi
+  if command -v pgrep >/dev/null 2>&1 && pgrep -x 'xray|Xray|rw-core|remnanode|rw-node' >/dev/null 2>&1; then
+    return 0
+  fi
+  return 1
+}
+
+_site_conf_has_public443() {
+  # rc 0 — наш nginx-конфиг сайта слушает публичный 443 (режим public)
+  [[ -f "$SITE_NGINX_CONF" ]] || return 1
+  grep -qE '^[[:space:]]*listen[[:space:]]+(\[::\]:|0\.0\.0\.0:|\*:)?443([[:space:]]|;)' "$SITE_NGINX_CONF"
+}
+
+_site_xray_proc() {
+  # rc 0 — имя процесса из ss относится к Xray/remnanode (или docker-proxy для bridge-сети)
+  case "$1" in
+    xray|Xray|rw-core|remnanode|rw-node|docker-proxy|sing-box|singbox|hysteria|hysteria2|hy2) return 0 ;;
+  esac
+  return 1
 }
 
 _site_nginx_ge_1251() {
@@ -8333,6 +8385,7 @@ _site_print_panel_values() {
   fi
   if [[ "$SITE_MODE_ACTIVE" == "public" ]]; then
     echo "  Режим public: nginx сам слушает 443. Если REALITY на другом порту — target тот же (${target})."
+    echo "  На ноде с remnanode public ломает профили с 443 — вернуть selfsteal: sudo gorecshit --site-fix-443"
   fi
   case "$SITE_NET_HOST" in
     0) echo "  remnanode: network_mode: host — 127.0.0.1 внутри контейнера = хост, target ${target} подходит." ;;
@@ -8401,12 +8454,21 @@ configure_site() {
   fi
 
   # --- режим ---
-  local owner443 prev_mode="${SITE_MODE_ACTIVE:-}"
+  # v2.8.3: на хосте с remnanode auto = ВСЕГДА selfsteal. Свободный сейчас 443 ничего не значит:
+  # Xray может быть на 8443 / в перезапуске, а панель позже переведёт ноду на профиль с 443 —
+  # если nginx займёт 0.0.0.0:443, Xray упадёт с «bind: address already in use».
+  local owner443 prev_mode="${SITE_MODE_ACTIVE:-}" rn=0
+  _site_remnanode_present && rn=1
   owner443="$(_site_port_owner 443)"
   if [[ -z "$owner443" ]] && _site_port_listening 443; then owner443="?"; fi
   SITE_MODE_ACTIVE="$SITE_MODE"
   if [[ "$SITE_MODE" == "auto" ]]; then
-    if [[ -z "$owner443" ]]; then
+    if [[ "$rn" -eq 1 ]]; then
+      SITE_MODE_ACTIVE="selfsteal"
+      if [[ "$prev_mode" == "public" ]] || _site_conf_has_public443; then
+        warn "Сайт стоял в режиме public (nginx на 443) — на ноде это ломает Xray-профили с портом 443. Перевожу в selfsteal: nginx уходит с 443"
+      fi
+    elif [[ -z "$owner443" ]]; then
       SITE_MODE_ACTIVE="public"
     elif [[ "$owner443" == nginx* && "$prev_mode" == "public" && -f "$SITE_NGINX_CONF" ]]; then
       SITE_MODE_ACTIVE="public"
@@ -8419,16 +8481,23 @@ configure_site() {
   elif [[ "$SITE_MODE" == "public" && -n "$owner443" && "$owner443" != nginx* ]]; then
     err "--site-mode public: 443 занят процессом «${owner443}» (REALITY?). Используйте selfsteal."
     return 1
-  fi
-  if [[ "$SITE_MODE_ACTIVE" == "selfsteal" ]]; then
-    log "Режим selfsteal: 443 держит «${owner443:-никто}», сайт будет на ${SITE_LISTEN}:${SITE_PORT}, REALITY отдаёт его чужим"
-  else
-    log "Режим public: 443 свободен — nginx откроет сайт на 443 + локально на ${SITE_LISTEN}:${SITE_PORT} (для REALITY на другом порту)"
-  fi
-  if [[ "${CLI_ASSUME_YES:-0}" -eq 0 ]] && _tty_usable && [[ "$DRY_RUN" -eq 0 ]]; then
-    local ans=""
-    prompt_user "Домен ${SITE_DOMAIN}, режим ${SITE_MODE_ACTIVE}. Продолжить? [Y/n] " ans
-    if [[ "$ans" =~ ^[NnНн]$ ]]; then warn "Сайт-маскировка отменена"; return 0; fi
+  elif [[ "$SITE_MODE" == "public" && "$rn" -eq 1 ]]; then
+    printf '%b' "${C_RED}${C_BOLD}" >&2
+    echo "  ⛔ ВНИМАНИЕ: на этом хосте есть remnanode, а выбран --site-mode public." >&2
+    echo "  ⛔ nginx займёт публичный 443 (0.0.0.0:443 и [::]:443). Любой профиль ноды с портом 443" >&2
+    echo "  ⛔ (например VLESS REALITY 443) НЕ запустится: «failed to listen TCP on 443: address already in use»." >&2
+    echo "  ⛔ Для ноды нужен selfsteal (по умолчанию): сайт на ${SITE_LISTEN}:${SITE_PORT}, REALITY отдаёт его зондам." >&2
+    printf '%b' "${C_RESET}" >&2
+    if [[ "${CLI_ASSUME_YES:-0}" -eq 1 ]]; then
+      warn "--yes: ставлю public по вашему явному выбору"
+    elif [[ "$DRY_RUN" -eq 1 ]]; then
+      warn "[DRY] на реальном запуске потребуется подтверждение (или --yes)"
+    elif _tty_ask_yn "Всё равно занять 443 nginx-ом (Xray на 443 сломается)?"; then
+      warn "Ставлю public по вашему подтверждению"
+    else
+      err "public на ноде не подтверждён. Запустите без --site-mode (будет selfsteal) или добавьте --yes, если понимаете последствия."
+      return 1
+    fi
   fi
 
   # --- сеть remnanode ---
@@ -8445,6 +8514,21 @@ configure_site() {
     fi
   elif [[ "$SITE_NET_HOST" -eq 2 ]]; then
     warn "/opt/remnanode/docker-compose.yml не найден — считаем, что remnanode в network_mode: host"
+  fi
+
+  if [[ "$SITE_MODE_ACTIVE" == "selfsteal" ]]; then
+    if [[ "$rn" -eq 1 ]]; then
+      log "Режим selfsteal (на хосте remnanode): nginx НЕ слушает 443, сайт только на ${SITE_LISTEN}:${SITE_PORT} (+80 для сертификата). 443 держит «${owner443:-пока никто}» — он остаётся Xray"
+    else
+      log "Режим selfsteal: 443 держит «${owner443:-никто}», сайт будет на ${SITE_LISTEN}:${SITE_PORT}, REALITY отдаёт его чужим"
+    fi
+  else
+    log "Режим public: nginx откроет сайт на 443 + локально на ${SITE_LISTEN}:${SITE_PORT} (для REALITY на другом порту)"
+  fi
+  if [[ "${CLI_ASSUME_YES:-0}" -eq 0 ]] && _tty_usable && [[ "$DRY_RUN" -eq 0 ]]; then
+    local ans=""
+    prompt_user "Домен ${SITE_DOMAIN}, режим ${SITE_MODE_ACTIVE}, сайт на ${SITE_LISTEN}:${SITE_PORT}$([[ "$SITE_MODE_ACTIVE" == public ]] && echo ' + публичный 443'). Продолжить? [Y/n] " ans
+    if [[ "$ans" =~ ^[NnНн]$ ]]; then warn "Сайт-маскировка отменена"; return 0; fi
   fi
 
   if [[ "$DRY_RUN" -eq 1 ]]; then
@@ -8818,6 +8902,138 @@ _audit_site() {
   _audit_info "Сверьте в панели: target/dest = ${SITE_LISTEN}:${SITE_PORT}, serverNames содержит ${d}, xver = $([[ "$SITE_PP" -eq 1 ]] && echo 1 || echo 0), SNI в Hosts = ${d}"
 }
 
+site_fix_443() {
+  # v2.8.3: сайт public (nginx на 0.0.0.0:443) на хосте с remnanode → selfsteal.
+  # $1=1 — явный --site-fix-443 (подробно; переводит даже без remnanode).
+  # $1=0 — авто-хук (--fix-boot / после --update / любой запуск от root): только public + remnanode.
+  local explicit="${1:-0}"
+  if [[ ! -f "$SITE_STATE_FILE" && ! -f "$SITE_NGINX_CONF" ]]; then
+    [[ "$explicit" -eq 1 ]] && log "Сайт-маскировка не установлена — освобождать 443 не нужно"
+    return 0
+  fi
+  local SITE_DOMAIN="" SITE_MODE_ACTIVE="" SITE_ROOT="" SITE_PORT="$SITE_PORT" SITE_LISTEN="$SITE_LISTEN" \
+        SITE_PP="$SITE_PP" SITE_DEFAULT80=0 SITE_NET_HOST=2 SITE_EMAIL="$SITE_EMAIL" \
+        SITE_THEME="$SITE_THEME" SITE_PREV_THEME="$SITE_PREV_THEME" SITE_SEED="$SITE_SEED" \
+        SITE_CLOSE80="$SITE_CLOSE80" SITE_BRAND="$SITE_BRAND" SITE_CITY="$SITE_CITY"
+  _site_load_state || true
+  local conf443=0 rn=0
+  _site_conf_has_public443 && conf443=1
+  if [[ "$SITE_MODE_ACTIVE" != "public" && "$conf443" -eq 0 ]]; then
+    [[ "$explicit" -eq 1 ]] && ok "Сайт уже в режиме selfsteal: nginx не слушает 443 (сайт на ${SITE_LISTEN}:${SITE_PORT})"
+    return 0
+  fi
+  _site_remnanode_present && rn=1
+  if [[ "$rn" -eq 0 && "$explicit" -eq 0 ]]; then
+    return 0
+  fi
+  step "Сайт-маскировка: освобождаем 443 для Xray (public → selfsteal)"
+  [[ "$rn" -eq 0 ]] && warn "remnanode на хосте не найден — перевожу в selfsteal по явному --site-fix-443"
+  if [[ -z "$SITE_DOMAIN" && -f "$SITE_NGINX_CONF" ]]; then
+    SITE_DOMAIN="$(sed -n 's/^[[:space:]]*server_name[[:space:]]\+\([^ ;_][^ ;]*\).*/\1/p' "$SITE_NGINX_CONF" | head -1)"
+  fi
+  if [[ -z "$SITE_DOMAIN" ]]; then
+    err "Не удалось определить домен сайта (${SITE_STATE_FILE}) — запустите меню 10 / gorecshit --site-domain <домен>"
+    return 1
+  fi
+  [[ -n "$SITE_ROOT" ]] || SITE_ROOT="/var/www/${SITE_DOMAIN}"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    printf '%b[DRY]%b backup %s → %s/site-fix-443-%s/; nginx conf без listen 443 (только %s:%s + 80); nginx -t; reload; %s: SITE_MODE_ACTIVE=selfsteal\n' \
+      "${C_YEL}" "${C_RESET}" "$SITE_NGINX_CONF" "$SITE_FIX_BACKUP_ROOT" "$TS" "$SITE_LISTEN" "$SITE_PORT" "$SITE_STATE_FILE"
+    return 0
+  fi
+  if [[ "$(id -u)" -ne 0 ]]; then err "Нужен root: sudo gorecshit --site-fix-443"; return 1; fi
+  local bdir="${SITE_FIX_BACKUP_ROOT}/site-fix-443-${TS}"
+  mkdir -p "$bdir"
+  [[ -f "$SITE_NGINX_CONF" ]] && cp -a "$SITE_NGINX_CONF" "$bdir/"
+  [[ -f "$SITE_STATE_FILE" ]] && cp -a "$SITE_STATE_FILE" "$bdir/"
+  local bconf
+  bconf="${bdir}/$(basename "$SITE_NGINX_CONF")"
+  _site_remnanode_net_host && SITE_NET_HOST=0 || SITE_NET_HOST=$?
+  SITE_MODE_ACTIVE="selfsteal"
+  if [[ -f "$SITE_NGINX_CONF" ]]; then
+    grep -qE 'listen[^;]*\b80\b[^;]*default_server' "$SITE_NGINX_CONF" && SITE_DEFAULT80=1
+    _site_write_nginx_conf full
+    if ! nginx -t >/dev/null 2>&1; then
+      err "nginx -t не прошёл с новым конфигом — возвращаю прежний (${bconf}):"
+      nginx -t 2>&1 | tail -5 >&2
+      cp -a "$bconf" "$SITE_NGINX_CONF"
+      nginx -t >/dev/null 2>&1 && { systemctl reload nginx 2>/dev/null || true; }
+      return 1
+    fi
+    if ! systemctl reload nginx 2>/dev/null && ! systemctl restart nginx 2>/dev/null; then
+      err "nginx не перезагрузился — возвращаю прежний конфиг (${bconf})"
+      cp -a "$bconf" "$SITE_NGINX_CONF"
+      nginx -t >/dev/null 2>&1 && { systemctl restart nginx 2>/dev/null || true; }
+      return 1
+    fi
+  fi
+  if [[ -f "$SITE_STATE_FILE" ]]; then
+    if grep -q '^SITE_MODE_ACTIVE=' "$SITE_STATE_FILE"; then
+      sed -i 's/^SITE_MODE_ACTIVE=.*/SITE_MODE_ACTIVE=selfsteal/' "$SITE_STATE_FILE"
+    else
+      echo "SITE_MODE_ACTIVE=selfsteal" >>"$SITE_STATE_FILE"
+    fi
+    if grep -q '^SITE_VERSION=' "$SITE_STATE_FILE"; then
+      sed -i "s/^SITE_VERSION=.*/SITE_VERSION=${VERSION}/" "$SITE_STATE_FILE"
+    fi
+  fi
+  ok "nginx ушёл с 443: сайт ${SITE_DOMAIN} теперь только на ${SITE_LISTEN}:${SITE_PORT} (+80). Бэкап: ${bdir}"
+  local o
+  o="$(_site_port_owner 443)"
+  if [[ -n "$o" ]] && ! _site_xray_proc "$o"; then
+    warn "443 всё ещё слушает «${o}» — это не наш конфиг: grep -Rn 'listen.*443' /etc/nginx /etc/caddy 2>/dev/null"
+  fi
+  echo "  Если Xray уже упал с «address already in use» — перезапустите ноду: в панели Nodes → Restart"
+  echo "  (или: cd /opt/remnanode && docker compose restart). Правило UFW для 443 оставлено — оно нужно Xray."
+  _site_print_panel_values
+}
+
+_audit_site_port443() {
+  step "Порт 443: Xray против сайта / веб-сервера"
+  if ! _site_remnanode_present; then
+    _audit_info "remnanode на хосте не найден — проверку конфликта 443 с Xray пропускаем"
+    return 0
+  fi
+  local fix="sudo gorecshit --site-fix-443" bad=0 line addr proc p o have443=0
+  # 1) кто слушает публичный 443
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    addr="$(ss_local_addr "$line")"
+    ss_is_loopback_addr "$addr" && continue
+    have443=1
+    proc="$(sed -n 's/.*users:(("\([^"]*\).*/\1/p' <<<"$line" | head -1 || true)"
+    [[ -z "$proc" ]] && continue
+    _site_xray_proc "$proc" && continue
+    if [[ "$proc" == nginx* ]] && _site_conf_has_public443; then
+      _audit_err "443 (${addr}) слушает nginx сайта-маскировки (режим public) — профиль ноды с 443 не запустится («address already in use»). Исправить: ${fix}"
+    else
+      _audit_err "443 (${addr}) слушает «${proc}», а не Xray — профиль ноды с 443 не запустится. Перенесите веб-сервер на 127.0.0.1:9443$(_site_conf_has_public443 && echo "; сайт gorecshit: ${fix}")"
+    fi
+    bad=1
+  done < <(ss -Hltnp '( sport = :443 )' 2>/dev/null || true)
+  # 2) порты из профиля (inbounds) держит кто-то кроме Xray
+  for p in "${DETECTED_CLIENT_PORTS[@]:-}"; do
+    [[ "$p" =~ ^[0-9]+$ ]] || continue
+    o="$(_site_port_owner "$p")"
+    if [[ -n "$o" ]] && ! _site_xray_proc "$o"; then
+      [[ "$p" == 443 && "$bad" -eq 1 ]] && continue
+      _audit_err "Профиль ноды использует ${p}/tcp, но его держит «${o}» — Xray не поднимет этот inbound$([[ "$o" == nginx* ]] && _site_conf_has_public443 && echo ". Исправить: ${fix}")"
+      bad=1
+    elif [[ "$p" == 443 && -z "$o" && "$have443" -eq 0 ]]; then
+      _audit_warn "В профиле ноды есть 443, но 443 никто не слушает — Xray не стартовал? docker logs remnanode 2>&1 | grep -i 'address already in use'"
+    fi
+  done
+  # 3) сайт в режиме public на ноде
+  local st_mode=""
+  [[ -f "$SITE_STATE_FILE" ]] && st_mode="$(sed -n 's/^SITE_MODE_ACTIVE=//p' "$SITE_STATE_FILE" | head -1)"
+  if [[ "$st_mode" == "public" ]] || _site_conf_has_public443; then
+    _audit_warn "Сайт-маскировка в режиме public на ноде: nginx займёт 443, как только он освободится, и Xray-профиль на 443 сломается. Исправить: ${fix}"
+    bad=1
+  fi
+  [[ "$bad" -eq 0 ]] && _audit_ok "443 не занят сторонним веб-сервером; сайт (если есть) только на локальном порту для REALITY"
+  return 0
+}
+
 ufw_remove_public_node_port() {
   # Delete "NODE_PORT ALLOW Anywhere" (v4/v6) — only for a family where no non-panel
   # established peer exists on NODE_PORT (never cut the panel↔node link).
@@ -8906,10 +9122,21 @@ main() {
     exit 0
   fi
 
+  if [[ "$DO_SITE_FIX443_ONLY" -eq 1 ]]; then
+    if [[ "$(id -u)" -ne 0 && "$DRY_RUN" -eq 0 ]]; then err "Нужен root: sudo gorecshit --site-fix-443"; exit 1; fi
+    site_fix_443 1 || exit 1
+    exit 0
+  fi
+
   # v2.8.1 one-time migration on existing nodes (not for read-only audit / dpi / rollback / dry-run)
   if [[ "$(id -u)" -eq 0 && "$DRY_RUN" -eq 0 && "$DO_AUDIT" -eq 0 && "$DO_DPI_CHECK" -eq 0 \
         && "$DO_STATUS_ONLY" -eq 0 && "$DO_ROLLBACK" -eq 0 && ! -f "$BOOT_ORDER_MARKER" ]]; then
     migrate_boot_order 0 || warn "Миграция порядка запуска firewall не завершена — повтор: sudo gorecshit --fix-boot"
+  fi
+  # v2.8.3: сайт public на ноде держит 443 → selfsteal (ничего не делает, если режим уже selfsteal)
+  if [[ "$(id -u)" -eq 0 && "$DRY_RUN" -eq 0 && "$DO_AUDIT" -eq 0 && "$DO_DPI_CHECK" -eq 0 \
+        && "$DO_STATUS_ONLY" -eq 0 && "$DO_ROLLBACK" -eq 0 && "$DO_SITE_ONLY" -eq 0 && "$DO_SITE" -eq 0 ]]; then
+    site_fix_443 0 || warn "Сайт-маскировка не переведена в selfsteal — повтор: sudo gorecshit --site-fix-443"
   fi
 
   # Interactive menu when TTY and no --yes and not a one-shot action flag
@@ -8921,6 +9148,7 @@ main() {
         && "$DO_SITE_ONLY" -eq 0 \
         && "$DO_UPDATE_ONLY" -eq 0 \
         && "$DO_FIX_BOOT_ONLY" -eq 0 \
+        && "$DO_SITE_FIX443_ONLY" -eq 0 \
         && -t 0 && -t 1 ]]; then
     interactive_menu
   fi
