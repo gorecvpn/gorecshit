@@ -2,7 +2,7 @@
 
 Однокомандное hardening-окружение для **нод Remnawave** (Debian 11+ / Ubuntu 20.04+).
 
-**Версия: 2.8.1**
+**Версия: 2.8.2**
 
 📍 **[Карта: как вычисляют VPN-ноду и что закрывает gorecshit](docs/detection-vectors.md)** — активное зондирование, DPI, Shodan/Censys, порты, IPv6, PTR, abuse и т.д.
 
@@ -195,6 +195,14 @@ sudo gorecshit --stealth
 ```
 
 ## Changelog
+
+### v2.8.2
+- **Исправлено: на Ubuntu 22.10+/24.04 с `ssh.socket` раздел «SSH hardening drop-in» падал** с `Missing privilege separation directory: /run/sshd` и `sshd -t failed`, после чего скрипт останавливался. При сокет-активации каталог `/run/sshd` создаётся только когда sshd запущен, поэтому `sshd -t` падал при любом конфиге. По той же причине проверка `DebianBanner` ошибочно писала «not supported».
+- Новые хелперы `sshd_prepare_test` (`install -d -m 0755 -o root /run/sshd`, при необходимости `/var/run/sshd`) и `sshd_run`/`sshd_test`: через них идут все вызовы `sshd -t` / `sshd -T` — hardening, скрытие отпечатков (меню 9), откат (`--rollback` и `rollback.sh`).
+- Проверка опций (`DebianBanner`) различает «опция не поддерживается» (`Bad configuration option` / `Unsupported option`) и прочие ошибки; в последнем случае опция пропускается и печатается вывод sshd.
+- Если `sshd -t` не прошёл: печатается полный вывод `sshd -t`, прежний конфиг восстанавливается и перепроверяется, ssh не перезапускается, установка **продолжается** (раньше `exit 1`).
+- Применение конфига с учётом `ssh.socket`: при смене `Port`/`ListenAddress` — `systemctl daemon-reload && systemctl restart ssh.socket`, иначе `reload ssh.service` только если он запущен; без сокета — как раньше `reload`/`restart ssh`. После применения проверяется, что sshd слушает порт, иначе ssh поднимается снова. Текущие SSH-сессии не рвутся.
+- Откат перезапускает ssh только если восстановленный конфиг проходит `sshd -t`.
 
 ### v2.8.1
 - **Исправлено: после перезагрузки нода могла стать недоступной.** У `scanner-block.service` было `Before=ufw.service` и одновременно `After=network-pre.target`, а сам `ufw.service` стоит `Before=network-pre.target` — получался цикл. systemd выкидывал `scanner-block` из загрузки, ipset `scanner-block` не создавался, `/etc/ufw/before.rules` падал на `Set scanner-block doesn't exist`, UFW оставался загруженным наполовину (нет правила RELATED,ESTABLISHED при политике INPUT DROP): панель, SSH и Xray не отвечали, а `gorecshit-anti-probe` падал с `Index of insertion too big`.
