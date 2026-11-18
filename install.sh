@@ -8,7 +8,7 @@
 # Does NOT restart Docker while remnanode/xray is live. Does NOT deploy itself.
 set -Eeuo pipefail
 
-VERSION="2.8.3"
+VERSION="2.8.4"
 SCRIPT_NAME="gorecshit"
 BACKUP_ROOT="/root/hardening-backups"
 # scanner-block ipset: one definition for the refresh script, ufw drop-in and repair (v2.8.1)
@@ -8104,19 +8104,26 @@ _site_random_theme() {
 
 _site_menu_choose_theme() {
   # меню 10: оставить текущий сайт / новый случайный шаблон / выбрать конкретный
+  # $1=reask — короткий повторный вопрос после смены домена (без вступления про remnanode)
   _tty_usable || return 0
+  local brief="${1:-}"
   local cur="" cur_brand="" ans t n=0
   local -a list=()
-  if [[ -f "$SITE_STATE_FILE" ]]; then
+  if [[ -n "${SITE_THEME:-}" ]]; then
+    cur="$SITE_THEME"
+    cur_brand="${SITE_BRAND:-}"
+  elif [[ -f "$SITE_STATE_FILE" ]]; then
     cur="$(sed -n 's/^SITE_THEME=//p' "$SITE_STATE_FILE" | head -1)"
     cur_brand="$(sed -n 's/^SITE_BRAND=//p' "$SITE_STATE_FILE" | head -1 | tr -d '"')"
   fi
-  echo
-  if _site_remnanode_present; then
-    echo "На этой ноде есть remnanode → режим selfsteal: nginx слушает только ${SITE_LISTEN}:${SITE_PORT} (+80 для сертификата),"
-    echo "публичный 443 остаётся Xray. В панели: REALITY target = ${SITE_LISTEN}:${SITE_PORT}, serverNames = поддомен ноды."
-  else
-    echo "Сайт для REALITY: nginx на ${SITE_LISTEN}:${SITE_PORT} (+80 для сертификата); 443 nginx займёт, только если он свободен и remnanode нет."
+  if [[ "$brief" != "reask" ]]; then
+    echo
+    if _site_remnanode_present; then
+      echo "На этой ноде есть remnanode → режим selfsteal: nginx слушает только ${SITE_LISTEN}:${SITE_PORT} (+80 для сертификата),"
+      echo "публичный 443 остаётся Xray. В панели: REALITY target = ${SITE_LISTEN}:${SITE_PORT}, serverNames = поддомен ноды."
+    else
+      echo "Сайт для REALITY: nginx на ${SITE_LISTEN}:${SITE_PORT} (+80 для сертификата); 443 nginx займёт, только если он свободен и remnanode нет."
+    fi
   fi
   echo "Шаблон сайта:"
   if [[ -n "$cur" ]]; then
@@ -8415,6 +8422,86 @@ _site_local_get() {
     --resolve "${SITE_DOMAIN}:${SITE_PORT}:${SITE_LISTEN}" "$@" "https://${SITE_DOMAIN}:${SITE_PORT}${path}"
 }
 
+_site_warn_domain_words() {
+  # предупреждение, если в домене есть vpn/proxy/… (один раз на текущее имя)
+  local w
+  LC_ALL=C grep -qiE "$SITE_DOMAIN_FORBIDDEN_RE" <<<"$SITE_DOMAIN" || return 0
+  [[ "${SITE_DOMAIN_WORDS_WARNED:-}" == "$SITE_DOMAIN" ]] && return 0
+  SITE_DOMAIN_WORDS_WARNED="$SITE_DOMAIN"
+  w="$(LC_ALL=C grep -oiE "$SITE_DOMAIN_FORBIDDEN_RE" <<<"$SITE_DOMAIN" | head -1)"
+  if [[ "${CLI_ASSUME_YES:-0}" -eq 0 ]] && _tty_usable && [[ "${DRY_RUN:-0}" -eq 0 ]]; then
+    warn "В домене ${SITE_DOMAIN} есть слово «${w}» — SNI виден DPI открытым текстом, нейтральное имя заметно надёжнее. Чтобы сменить домен, нажмите n."
+  else
+    warn "В домене ${SITE_DOMAIN} есть слово «${w}» — SNI виден DPI открытым текстом, нейтральное имя заметно надёжнее. Продолжаю по вашему выбору."
+  fi
+}
+
+_site_preview_dns() {
+  # предварительная проверка A/AAAA → IP ноды (тот же _site_check_dns, что после подтверждения)
+  [[ "${SITE_SKIP_DNS:-0}" -eq 1 ]] && return 0
+  local p4 p6
+  p4="$(_audit_detect_public_ipv4 2>/dev/null || true)"
+  p6="$(_audit_detect_public_ipv6 2>/dev/null || true)"
+  if _site_check_dns "$SITE_DOMAIN" "$p4" "$p6"; then
+    return 0
+  fi
+  warn "Домен ${SITE_DOMAIN} сейчас не указывает на эту ноду. Можно указать другой (n) или отменить (0)."
+  return 1
+}
+
+_site_change_domain_interactive() {
+  # спрашивает новый домен; пустой ввод — назад к подтверждению (домен не меняется)
+  local d=""
+  while true; do
+    prompt_user 'Новый поддомен ноды (например, www.example.ru; Enter — назад): ' d
+    d="$(tr -d ' \r' <<<"$d")"
+    d="${d%.}"; d="${d,,}"
+    [[ -n "$d" ]] || return 1
+    if ! _site_valid_domain "$d"; then
+      err "Некорректный домен: ${d} (нужно вида node.example.ru; кириллицу — в punycode xn--…)"
+      continue
+    fi
+    SITE_DOMAIN="$d"
+    break
+  done
+  _site_warn_domain_words
+  echo "Можно сменить шаблон сайта (Enter — оставить текущий${SITE_THEME:+: ${SITE_THEME}})."
+  _site_menu_choose_theme reask
+  if [[ "$SITE_REGEN" -eq 1 && -z "${SITE_SEED_SET:-}" ]]; then
+    SITE_SEED=""
+  fi
+  if [[ "$SITE_THEME" == "random" && -z "${SITE_SEED_SET:-}" ]]; then
+    SITE_THEME="$(_site_random_theme "$SITE_PREV_THEME")"
+  fi
+  return 0
+}
+
+_site_confirm_setup() {
+  # Y/Enter — продолжить; n — изменить домен (цикл); 0 — отмена.
+  # Без TTY / с --yes / --dry-run — сразу продолжить (поведение как раньше).
+  [[ "${CLI_ASSUME_YES:-0}" -eq 0 ]] && _tty_usable && [[ "${DRY_RUN:-0}" -eq 0 ]] || return 0
+  local ans pub=""
+  while true; do
+    _site_warn_domain_words
+    _site_preview_dns || true
+    pub=""
+    [[ "$SITE_MODE_ACTIVE" == public ]] && pub=' + публичный 443'
+    ans=""
+    prompt_user "Домен ${SITE_DOMAIN}, режим ${SITE_MODE_ACTIVE}, сайт на ${SITE_LISTEN}:${SITE_PORT}${pub}. [Y] продолжить / [n] изменить домен / [0] отмена: " ans
+    ans="$(tr -d ' \r' <<<"$ans")"
+    if [[ -z "$ans" || "$ans" =~ ^[YyДд]$ || "$ans" =~ ^([Yy][Ee][Ss]|[Дд][Аа])$ ]]; then
+      return 0
+    elif [[ "$ans" == "0" ]]; then
+      warn "Сайт-маскировка отменена"
+      return 1
+    elif [[ "$ans" =~ ^[NnНн]$ || "$ans" =~ ^([Nn][Oo]|[Нн][Ее][Тт])$ ]]; then
+      _site_change_domain_interactive || true
+    else
+      warn "Нажмите Y (продолжить), n (изменить домен) или 0 (отмена)"
+    fi
+  done
+}
+
 configure_site() {
   # Сайт-маскировка: поддомен ноды + Let's Encrypt + nginx-сайт для REALITY self-steal
   if [[ "$DO_SITE" -eq 0 ]]; then return 0; fi
@@ -8433,9 +8520,7 @@ configure_site() {
     err "Некорректный домен: ${SITE_DOMAIN} (нужно вида node.example.ru; кириллицу — в punycode xn--…)"
     return 1
   fi
-  if LC_ALL=C grep -qiE "$SITE_DOMAIN_FORBIDDEN_RE" <<<"$SITE_DOMAIN"; then
-    warn "В домене ${SITE_DOMAIN} есть слово «$(LC_ALL=C grep -oiE "$SITE_DOMAIN_FORBIDDEN_RE" <<<"$SITE_DOMAIN" | head -1)» — SNI виден DPI открытым текстом, нейтральное имя заметно надёжнее. Продолжаю по вашему выбору."
-  fi
+  _site_warn_domain_words
   [[ -z "$SITE_THEME" || "$SITE_THEME" == "auto" ]] && SITE_THEME="random"
   if [[ " random ${SITE_THEMES} " != *" ${SITE_THEME} "* ]]; then
     err "Неизвестная тема --site-theme ${SITE_THEME} (random ${SITE_THEMES// /|})"; return 1
@@ -8525,10 +8610,8 @@ configure_site() {
   else
     log "Режим public: nginx откроет сайт на 443 + локально на ${SITE_LISTEN}:${SITE_PORT} (для REALITY на другом порту)"
   fi
-  if [[ "${CLI_ASSUME_YES:-0}" -eq 0 ]] && _tty_usable && [[ "$DRY_RUN" -eq 0 ]]; then
-    local ans=""
-    prompt_user "Домен ${SITE_DOMAIN}, режим ${SITE_MODE_ACTIVE}, сайт на ${SITE_LISTEN}:${SITE_PORT}$([[ "$SITE_MODE_ACTIVE" == public ]] && echo ' + публичный 443'). Продолжить? [Y/n] " ans
-    if [[ "$ans" =~ ^[NnНн]$ ]]; then warn "Сайт-маскировка отменена"; return 0; fi
+  if ! _site_confirm_setup; then
+    return 0
   fi
 
   if [[ "$DRY_RUN" -eq 1 ]]; then
