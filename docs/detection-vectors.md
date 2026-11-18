@@ -69,7 +69,7 @@
 |---|---|---|---|---|
 | E1 | TTL / окно / опции (nmap, p0f) | Нестандартный TTL или стек выделяет сервер | — | 🛡 `ip_default_ttl=64` (как у обычного Linux) |
 | E2 | MSS/MTU (JA4T) | Туннели и clamp дают MSS ≠ 1460, а это классический признак VPN | [FoxIO JA4T](https://foxio.io/blog/ja4t-tcp-fingerprinting) | 🔍 MTU интерфейса и правила TCPMSS в mangle. 👤 Не ставить MSS-clamp на ноде без нужды |
-| E3 | tcp_timestamps | Аптайм по timestamps. При этом отключённые timestamps сами по себе редкость | — | Оставляем по умолчанию (опция `--tcp-timestamps-off`) |
+| E3 | tcp_timestamps | Аптайм по timestamps. При этом отключённые timestamps сами по себе редкость | — | Оставляем включёнными. `--tcp-timestamps-off` с v2.9.0 игнорируется: timestamps=0 сам выделяет сервер. 🔍 Аудит v2.9.0 показывает отклонения TCP-отпечатка |
 | E4 | ICMP echo/timestamp/mask | Ping и ICMP-отпечатки | — | 🛡 DROP echo (v4 и v6), DROP timestamp/address-mask (`--stealth`) |
 
 ## F. DNS и имена
@@ -113,7 +113,7 @@
 ## Что может сделать только владелец
 
 1. **PTR** у хостера → нейтральный (например `mail.<ваш-домен>` или имя сайта).
-2. **Панель → inbound REALITY** (или self-steal: `gorecshit --site-domain <поддомен>` и значения, которые он напечатает): порт 443, `flow=xtls-rprx-vision`, `dest` и `serverNames` с одного крупного сайта с TLS1.3+h2. Лучше всего на том же ASN/ДЦ, что нода (RealiTLScanner), плюс несколько `shortIds`.
+2. **Панель → inbound REALITY**: self-steal на **своём** домене (`gorecshit --site-domain <поддомен>`, значения он напечатает): порт 443, `flow=xtls-rprx-vision` (для xhttp — без flow), `target 127.0.0.1:9443`, `serverNames` = ваш поддомен, несколько `shortIds`, `limitFallbackUpload/Download`. **Не ставьте** чужие бренды (google/microsoft/apple/…) в `dest`/`serverNames` на IP хостера: с февраля 2026 это «SNI ≠ сеть», за ним идут активный зонд и блок IP/подсети. «Белые» РФ-SNI — только на РФ-входе. Свой домен нельзя — `gorecshit --find-sni` (сосед по /24 с TLS1.3+h2).
 3. **Панель → routing**: `protocol: bittorrent → blackhole` (или плагин Torrent Blocker).
 4. **Образ remnanode/xray** ≥ 25.6.8 (обновлять в окно обслуживания, gorecshit Docker не перезапускает).
 5. **Хостер/IP**: если check-host показывает «зарубежье видит, РФ — нет», меняйте IP или ставьте РФ-relay (каскад). Белые списки сервер не обойдёт.
@@ -125,3 +125,20 @@
 sudo gorecshit --update   # затем меню 1 (защита) и меню 8 (аудит)
 sudo gorecshit --audit
 ```
+
+---
+
+## v2.9.0: что добавлено против обнаружения
+
+| Вектор | Что делает gorecshit |
+|---|---|
+| Чужой бренд в SNI на IP хостера (SNI ≠ сеть) | 🔍 Аудит: ошибка + готовые значения self-steal; учитывает страну ноды и РФ-«белые» SNI только на РФ-входе. `--find-sni` — сосед по /24 |
+| Активное зондирование | 🔍 Зонды «как ТСПУ»: SNI домена / без SNI / случайный / google / TLS 1.2 / HTTP на 443 / > 16 КБ — везде должен быть один сертификат сайта. 🛡 nginx: `error_page 497`, ETag, gzip, кэш-заголовки |
+| Заморозка «16 КБ» по IP хостера | 🔍 `--freeze-test`, раздел 6 `--dpi-check`: маленький и большой файл с РФ-точек check-host |
+| «Мёртвый» сайт-шаблон | 🛡 `--site-alive`: новости, lastmod, rss.xml по таймеру; `--suggest-domains`: уникальная тема/сид на ноду |
+| Тишина вместо RST/ping | 🛡 `--web-profile on` (opt-in) |
+| Слишком много абонентов на одном IP | 🔍 Нагрузка на IP с порогом `--conn-warn`, советы по разносу |
+| «Голый» IP ноды в подписке | 🔍 `--sub-check URL` |
+| Политика TLS-сессий Vision на 443 | 🛡 `--helper-xhttp` (запасной вход), `--helper-hy2` (UDP) |
+| Узнать о блоке раньше пользователей | 🛡 `--selfcheck-install`, `--canary` на РФ-VPS, `--probe-alert` (ловушка сканеров) |
+| Быстрая замена заблокированной ноды | 🛡 `--spare-export` / `--spare-import` |

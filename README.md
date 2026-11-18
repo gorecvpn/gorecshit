@@ -2,7 +2,7 @@
 
 Однокомандное hardening-окружение для **нод Remnawave** (Debian 11+ / Ubuntu 20.04+).
 
-**Версия: 2.8.4**
+**Версия: 2.9.0**
 
 📍 **[Карта: как вычисляют VPN-ноду и что закрывает gorecshit](docs/detection-vectors.md)** — активное зондирование, DPI, Shodan/Censys, порты, IPv6, PTR, abuse и т.д.
 
@@ -21,7 +21,7 @@
 7. **Скрытие портов и ping** — ICMP echo-request → DROP; закрытые порты без RST/REJECT (DROP); не светить unreachable.
 8. **Anti-probing** — на клиентских портах только для **NEW**; `ESTABLISHED,RELATED` всегда в обход (без hashlimit/connlimit на датаплейне). Потолки NAT-friendly; **без** xt_recent soft-ban. Не ломает REALITY.
 9. **DOCKER-USER** — ограничение `NODE_PORT` на bridge-publish; Docker **не перезапускается**, пока живы remnanode/xray.
-10. **sysctl / скорость** — BBR + `fq`, буферы **64MB**, `tcp_fastopen=3`, `tcp_slow_start_after_idle=0`, `tcp_mtu_probing=1`, `tcp_notsent_lowat=16384`, `somaxconn`/`netdev_max_backlog`, `conntrack_max`, `txqueuelen=10000`, `irqbalance`; `nf_conntrack_tcp_be_liberal=1`; IPv6 **включён по умолчанию** (`--ipv6-off` опционально); `nofile` 1048576; `--tcp-timestamps-off` опционально.
+10. **sysctl / скорость** — BBR + `fq`, буферы **64MB**, `tcp_fastopen=3`, `tcp_slow_start_after_idle=0`, `tcp_mtu_probing=1`, `tcp_notsent_lowat=16384`, `somaxconn`/`netdev_max_backlog`, `conntrack_max`, `txqueuelen=10000`, `irqbalance`; `nf_conntrack_tcp_be_liberal=1`; IPv6 **включён по умолчанию** (`--ipv6-off` опционально); `nofile` 1048576; `--tcp-timestamps-off` с v2.9.0 устарел и игнорируется (timestamps=0 сам выделяет сервер).
 11. **SSH** — Banner none, MaxAuthTries 3, опция `--ssh-port N` (сначала UFW, `sshd -t`, **22 сохраняется**). Парольный и root-логин **не** отключаются. fail2ban sshd + **recidive**; сканеры из ipset режутся до SSH.
 12. **Блоклист сканеров** — ipset + weekly timer; **зеркала** raw.githubusercontent.com → cdn.jsdelivr.net / fastly.jsdelivr.net; `--blocklist-from`; never-block для панели/релеев/`$SSH_CLIENT`/private/bogons.
 13. **Стелс** — нейтральный hostname `web-<hex>`, без баннеров, предупреждение о лишних слушателях, отключение nginx default site; NODE_PORT только с панели.
@@ -46,10 +46,11 @@
   8) 🛡️  Проверка на блокировку и палевность ноды
   9) 🕵️  Скрыть отпечатки сервера
   10) 🌐 Сайт-маскировка (поддомен + сертификат + сайт, 12 шаблонов)
+  11) 🧭 Защита от обнаружения: SNI-соседи, новости сайта, «обычный сайт», xhttp/Hysteria2, тест 16 КБ, …
 ────────────────────────────────────────
   0) 🚪 Выход
 CLI: gorecshit [--status|--update|--audit|--stealth|--site-domain D|--yes|--modules …]
-Выберите пункт [0-10]:
+Выберите пункт [0-11]:
 ```
 
 ## Проверка DPI/блокировок
@@ -196,6 +197,42 @@ sudo gorecshit --stealth
 ```
 
 ## Changelog
+
+### v2.9.0 — защита от обнаружения ноды
+
+Цель: по активному зондированию, SNI, сертификату и поведению нода не отличается от обычного маленького сайта. Всё, что меняет поведение живой ноды, — **только по флагу или из меню 11**. `--update` ничего нового не включает.
+
+**Аудит (`--audit`, read-only; работает сразу после `--update`)**
+- Убран вредный совет «dest/serverNames с крупного сайта». Теперь чужой бренд (google/microsoft/apple/…) на IP хостера — ошибка: с февраля 2026 это «SNI ≠ сеть», за ним идут активный зонд и блок IP/подсети. Рекомендация — self-steal на своём домене (меню 10). «Белые» РФ-SNI считаются нормой только на РФ-входе. Учитываются страна ноды, unix-socket target, xhttp (flow не нужен).
+- Новые поля REALITY: число shortIds, maxTimeDiff, limitFallbackUpload/Download, xver, «говорящий» path у xhttp.
+- Зонды «как ТСПУ» на публичный IP:443: SNI домена, без SNI, случайный SNI, google SNI, только TLS 1.2, HTTP на 443, ответ > 16 КБ. Все должны получить один и тот же сертификат вашего сайта.
+- Сертификат: одно имя, без vpn-слов. Отклонения TCP-отпечатка (TTL, timestamps, SACK, window scaling, ECN, MSS). Anti-probe против зондов. Слова vpn/proxy на публичных страницах.
+- nginx в Docker (CDN/xhttp-цепочка): имена, DNS, срок и SAN сертификата, «говорящие» пути, что отдаёт «/».
+- Объём трафика и **нагрузка на IP**: соединения и уникальные клиенты на портах Xray, порог `--conn-warn IPS[:CONNS]` (по умолчанию 150:3000, env `GORECSHIT_CONN_WARN`), советы, как разгрузить IP.
+- Реестр ноды `/var/lib/gorecshit/node.env` (0600): IP, страна, домен, SNI, target, порты.
+- `--sub-check URL` (или env `GORECSHIT_SUB_URL`; с `--audit` — внутри аудита): скачивает подписку, разбирает base64/ссылки/JSON и предупреждает, если вместо домена стоит «голый» IP ноды. Ссылка не печатается и не попадает в argv.
+- `--dpi-check`: честно помечено, что разделы 1–5 — исходящие проверки с ноды. Добавлена доступность из РФ и тест заморозки «16 КБ» (`--freeze-test`).
+
+**Сайт-маскировка**
+- nginx: gzip_vary/уровень/типы, ETag, кэш-заголовки, `error_page 497` (HTTP на TLS-порт → 301, как у обычного nginx). `--site-http-page` — сайт и на :80 вместо 301. Применяется при следующем `--site-domain`.
+- Тяжёлая SVG-обложка (120–260 КБ) — настоящий большой ресурс для теста 16 КБ.
+- Домены с vpn/proxy/xray/… для новых сайтов **блокируются** (обход: `--site-allow-vpn-word`); уже установленный сайт не ломается.
+- `--site-refresh` / `--site-alive [on|off]`: новости `/news/`, `lastmod` в sitemap.xml, `rss.xml`; шаг `--site-news-days N` (таймер по умолчанию — 3 дня). Ежедневный таймер в случайное время, nginx не трогается.
+- `--suggest-domains`: нейтральные имена + случайные тема и сид, чтобы сайты нод не повторяли один шаблон.
+
+**Опционально (по умолчанию выключено)**
+- `--web-profile on|off` — «обычный сайт»: ping отвечает (≤5/с), закрытые TCP-порты → RST (≤50/с). Через before/after.rules UFW, только IPv4, с бэкапом.
+- `--helper-xhttp [PORT]`, `--helper-hy2 [PORT]` — печатают JSON для панели (запасной вход xhttp+REALITY, Hysteria2+Salamander). Порт открывается только по согласию (`--open-ports`).
+- `--find-sni [IP]` — поиск соседей по /24 с TLS1.3+h2+валидным сертификатом (read-only).
+- `--selfcheck` / `--selfcheck-install` — ежедневная самопроверка, Telegram по желанию (токен в `/etc/gorecshit/selfcheck.env`, 0600, не попадает в argv).
+- `--probe-alert on|off` — ловушка сканеров: nginx сайта пишет короткий лог (ответы не меняются), раз в 10 минут разбор (сканерные UA, «говорящие» пути, подсети из блок-листа). В Telegram уходит /24 источника, не чаще раза в сутки на подсеть. `--probe-scan` — разобрать сейчас.
+- `--canary on|off`, `--canary-add "HOST[:PORT] [SNI] [имя]"`, `--canary-run` — ставится на **VPS в РФ**: раз в час TCP + TLS с SNI до каждой ноды, алерт после 2 неудач подряд и при восстановлении.
+- `--bg-traffic on|off` — редкие HTTPS-запросы к обычным сайтам (зеркала, CDN), < 10 МБ/сутки. Проверьте ToS хостера.
+- `--spare-export [FILE]` / `--spare-import FILE` — запасной комплект для замены ноды: шаблон настроек, варианты нового домена, новая тема/сид, `bringup.sh`. Без ключей, сертификатов и токенов.
+- `--tcp-timestamps-off` устарел и игнорируется. Меню 9 предлагает вернуть timestamps=1.
+- `--rollback` убирает профиль «обычный сайт», лог ловушки и все таймеры v2.9.0.
+
+**На нодах:** `sudo gorecshit --update && sudo gorecshit --audit`, дальше по желанию — меню 11.
 
 ### v2.8.4
 - В подтверждении сайта-маскировки `n` больше не отменяет установку, а предлагает **изменить домен**. Текст вопроса: `Домен X, режим selfsteal, сайт на 127.0.0.1:9443. [Y] продолжить / [n] изменить домен / [0] отмена:`. Enter или Y — продолжить, 0 — отмена (как раньше по n).
@@ -443,7 +480,7 @@ sudo bash install.sh --panel-ip X.X.X.X --modules ufw,blocklist,hide_ports,anti_
 | `--site-domain D` | Сайт-маскировка: поддомен + Let's Encrypt + сайт для REALITY self-steal. Без `--panel-ip` запускает только этот модуль. |
 | `--site-email E` / `--site-theme T` / `--site-mode M` / `--site-port N` / `--site-listen IP` | Почта для LE; шаблон `random` (по умолчанию) или имя из 12 (`it`, `architect`, `bakery`, `bike`, `accounting`, `lingua`, `florist`, `furniture`, `travel`…); режим `auto\|selfsteal\|public`; локальный порт (9443); адрес (127.0.0.1). |
 | `--site-proxy-protocol` / `--site-close-80` / `--site-seed S` / `--site-regen` / `--site-skip-dns-check` | PROXY protocol (`xver 1`); закрыть 80 после выпуска; воспроизводимый сайт по сиду; новый случайный сайт при повторном запуске; без проверки DNS. |
-| `--tcp-timestamps-off` | `net.ipv4.tcp_timestamps=0`. |
+| `--tcp-timestamps-off` | **Устарел (v2.9.0)**: игнорируется с предупреждением. Вернуть timestamps=1 — меню 9 / `--stealth`. |
 | `--ipv6-off` | Опционально отключить IPv6 (по умолчанию IPv6 **остаётся**). |
 | `--no-ipv6-off` / `--no-blocklist` / `--no-hostname` / … | Как в v2.0 (`--no-ipv6-off` = поведение по умолчанию). |
 | `--yes` | Без подтверждения / без меню. |

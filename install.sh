@@ -8,7 +8,7 @@
 # Does NOT restart Docker while remnanode/xray is live. Does NOT deploy itself.
 set -Eeuo pipefail
 
-VERSION="2.8.4"
+VERSION="2.9.0"
 SCRIPT_NAME="gorecshit"
 BACKUP_ROOT="/root/hardening-backups"
 # scanner-block ipset: one definition for the refresh script, ufw drop-in and repair (v2.8.1)
@@ -122,6 +122,43 @@ DO_FINGERPRINT_ONLY=0
 DO_UPDATE_ONLY=0
 DO_FIX_BOOT_ONLY=0
 DO_SITE_FIX443_ONLY=0     # --site-fix-443: перевести сайт public → selfsteal (освободить 443 для Xray)
+# v2.9.0 защита от обнаружения (всё opt-in, кроме аудита)
+DO_FIND_SNI=0             # --find-sni [IP]: соседи по /24 с TLS1.3+h2 (только чтение)
+FIND_SNI_IP=""
+DO_SITE_REFRESH=0         # --site-refresh: новости/sitemap на сайте-маскировке (без nginx)
+SITE_AUTOREFRESH=""       # --site-autorefresh on|off: таймер обновления контента
+WEB_PROFILE=""            # --web-profile on|off: ping отвечает, закрытые порты → RST
+HELPER_XHTTP=0            # --helper-xhttp [PORT]: JSON для xhttp+REALITY
+HELPER_XHTTP_PORT=8443
+HELPER_HY2=0              # --helper-hy2 [PORT]: JSON для Hysteria2
+HELPER_HY2_PORT=443
+OPEN_PORTS=0              # --open-ports: помощники сами открывают порт в UFW
+DO_FREEZE_TEST=0          # --freeze-test: тест заморозки 16 КБ из РФ (check-host)
+CONN_WARN_IPS=150         # --conn-warn IPS[:CONNS]: порог аудита «много пользователей на IP»
+CONN_WARN_CONNS=3000
+CONN_WARN_SET=""
+SUB_CHECK_URL=""          # --sub-check URL: проверка подписки на «голый» IP ноды
+DO_SUB_CHECK=0
+SITE_ALIVE=""             # --site-alive on|off
+BG_TRAFFIC=""             # --bg-traffic on|off (по умолчанию выкл)
+DO_BG_RUN=0               # --bg-traffic-run (из таймера)
+PROBE_ALERT=""            # --probe-alert on|off
+DO_PROBE_SCAN=0           # --probe-scan
+CANARY_MODE=""            # --canary on|off
+CANARY_ADD=""             # --canary-add "HOST[:PORT] [SNI] [имя]"
+DO_CANARY_RUN=0           # --canary-run
+SPARE_EXPORT=""; DO_SPARE_EXPORT=0; SPARE_IMPORT=""
+SPARE_THEME=""; SPARE_SEED=""
+DO_SUGGEST=0              # --suggest-domains
+DO_SELFCHECK=0            # --selfcheck: короткая самопроверка (rc 1 при проблемах)
+SELFCHECK_MODE=""         # --selfcheck-install / --selfcheck-remove
+SITE_TRAP=0               # --probe-alert: лог ловушки сканеров в nginx сайта
+SITE_NEWS_DAYS=""         # --site-news-days N: шаг новостей «живого» сайта
+SITE_STATE_DOMAIN=""      # домен из state-файла уже установленного сайта
+SITE_ALLOW_VPN_WORD=0     # --site-allow-vpn-word: разрешить vpn/proxy в домене сайта (по умолчанию блок)
+SITE_HTTP_PAGE=0          # --site-http-page: на :80 отдавать сайт, а не только 301
+SITE_HTTP_PAGE_SET=""
+SITE_EPOCH=""
 # audit reachability side-channel (ICMP via check-host)
 AUDIT_PING_DONE=0
 AUDIT_PING_RU_OK=0
@@ -249,7 +286,7 @@ Usage:
   install.sh --refresh-lists         # only refresh scanner blocklist
   install.sh --status                # show hardening status
   install.sh --version               # print version
-  install.sh --dpi-check             # outbound DPI / DNS / TLS checks (node egress)
+  install.sh --dpi-check             # node egress DNS/TLS checks + RU reachability/16 KB freeze test
   install.sh --audit                 # RU reachability + detectability self-audit (read-only)
   install.sh --stealth               # hide server fingerprints (banners/MOTD/ICMP FP/…)
   install.sh --site-domain D [--site-email E]   # node subdomain + Let's Encrypt + decoy website
@@ -302,7 +339,7 @@ Options:
   --site-seed S              Fixed seed: same domain+seed(+theme) = same site (reproducible)
   --site-regen               Re-run: new random template, palette, layout and texts
   --site-skip-dns-check      Skip A/AAAA → this IP check
-  --tcp-timestamps-off       Set net.ipv4.tcp_timestamps=0
+  --tcp-timestamps-off       DEPRECATED (v2.9.0): ignored — timestamps=0 itself marks the server
   --tz ZONE|auto             Set timezone (default: leave as-is). auto = IP geolocation
   --yes                      Non-interactive (still requires --panel-ip or GORECSHIT_PANEL_IP)
   --relay-ips IP,...         Extra never-block / ACCEPT IPs (default: HAProxy relays)
@@ -323,7 +360,35 @@ Options:
   --site-fix-443             Site module: public → selfsteal (nginx leaves 443 to Xray, site only on
                              127.0.0.1:9443); backup + nginx -t + reload, restore on failure
   --version                  Print script version and exit
-  --dpi-check                Check DPI/DNS/TLS from this node (egress diagnostics)
+
+Anti-detection (v2.9.0; all opt-in, audit is read-only):
+  --find-sni [IP]            Scan this /24 for neighbours with TLS1.3 + h2 + valid cert (slow, read-only)
+  --site-refresh             Add dated news + sitemap to the decoy site (no nginx changes)
+  --site-autorefresh on|off  Daily timer for --site-refresh
+  --site-http-page           Site module: serve the site on :80 too (default: 301 → https)
+  --site-allow-vpn-word      Site module: allow vpn/proxy/… in the domain (blocked by default)
+  --web-profile on|off       "Normal website": ping replies, closed TCP ports send RST (via UFW rules)
+  --helper-xhttp [PORT]      Print panel JSON for VLESS+xhttp(packet-up)+REALITY on PORT (default 8443)
+  --helper-hy2 [PORT]        Print panel JSON for Hysteria2 + Salamander on UDP PORT (default 443)
+  --open-ports               With --helper-*: open the port in UFW without asking
+  --freeze-test              RU reachability + "16 KB freeze" test via check-host (needs decoy site)
+  --selfcheck                Short self-check (443, site, cert, DNS, RU reachability); rc 1 on problems
+  --selfcheck-install        Daily self-check timer (optional Telegram: GORECSHIT_TG_TOKEN/_CHAT or prompt)
+  --selfcheck-remove         Remove the daily self-check timer
+  --site-alive [on|off]      "Live" decoy site: daily timer adds news (every --site-news-days N, default 3),
+                             updates sitemap.xml lastmod and rss.xml (no nginx changes)
+  --bg-traffic on|off        OFF by default. Light random outbound HTTPS to ordinary sites (check hoster ToS)
+  --probe-alert on|off       Scanner trap: nginx site log + 10-min parser, Telegram alert per /24 (rate-limited)
+  --probe-scan               Parse the trap log now
+  --canary on|off            Run on a RU VPS: hourly TCP+TLS(SNI) check of nodes in /etc/gorecshit/canary.list
+  --canary-add "H[:P] [SNI] [name]"  Add a node to the canary list;  --canary-run  check now
+  --spare-export [FILE]      Reserve bundle for a replacement node (no keys/certs/tokens) + bringup.sh
+  --spare-import FILE        Unpack a reserve bundle and show the steps
+  --suggest-domains          Neutral domain ideas + random theme/seed (unique site per node)
+  --conn-warn IPS[:CONNS]    Audit threshold "too many users on one IP" (default 150:3000; env GORECSHIT_CONN_WARN)
+  --sub-check [URL]          Check a subscription link: warn if this node's raw IP is used instead of a domain
+                             (URL or env GORECSHIT_SUB_URL; the URL is never printed; with --audit runs inside it)
+  --dpi-check                Egress DNS/TLS from this node + RU reachability / 16 KB freeze test (check-host)
   --audit                    RU block check + Shodan InternetDB + port/IPv6 exposure + active
                              REALITY probe + giveaways (PTR/banners/MTU/egress) — read-only
   --stealth                  Hide server fingerprints (SSH banner/MOTD/TTL/ICMP FP; ask before risky)
@@ -620,7 +685,61 @@ parse_args() {
       --site-close-80) SITE_CLOSE80=1; shift ;;
       --site-seed) SITE_SEED="${2:-}"; SITE_SEED_SET=1; shift 2 ;;
       --site-skip-dns-check) SITE_SKIP_DNS=1; shift ;;
-      --tcp-timestamps-off) DO_TCP_TIMESTAMPS_OFF=1; shift ;;
+      --tcp-timestamps-off)
+        warn "--tcp-timestamps-off устарел (v2.9.0) и игнорируется: tcp_timestamps=0 сам выделяет сервер. Вернуть: gorecshit --stealth"
+        shift ;;
+      --find-sni)
+        DO_FIND_SNI=1
+        if [[ "${2:-}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then FIND_SNI_IP="$2"; shift 2; else shift; fi ;;
+      --site-refresh) DO_SITE_REFRESH=1; shift ;;
+      --site-autorefresh)
+        SITE_AUTOREFRESH="${2:-}"
+        [[ "$SITE_AUTOREFRESH" == "on" || "$SITE_AUTOREFRESH" == "off" ]] || { err "--site-autorefresh on|off"; exit 2; }
+        shift 2 ;;
+      --site-http-page) SITE_HTTP_PAGE=1; SITE_HTTP_PAGE_SET=1; shift ;;
+      --site-allow-vpn-word) SITE_ALLOW_VPN_WORD=1; shift ;;
+      --web-profile)
+        if [[ "${2:-}" == "on" || "${2:-}" == "off" ]]; then WEB_PROFILE="$2"; shift 2; else WEB_PROFILE="on"; shift; fi ;;
+      --helper-xhttp)
+        HELPER_XHTTP=1
+        if [[ "${2:-}" =~ ^[0-9]+$ ]]; then HELPER_XHTTP_PORT="$2"; shift 2; else shift; fi ;;
+      --helper-hy2)
+        HELPER_HY2=1
+        if [[ "${2:-}" =~ ^[0-9]+$ ]]; then HELPER_HY2_PORT="$2"; shift 2; else shift; fi ;;
+      --open-ports) OPEN_PORTS=1; shift ;;
+      --freeze-test) DO_FREEZE_TEST=1; shift ;;
+      --selfcheck) DO_SELFCHECK=1; shift ;;
+      --selfcheck-install) SELFCHECK_MODE="on"; shift ;;
+      --selfcheck-remove) SELFCHECK_MODE="off"; shift ;;
+      --site-alive)
+        if [[ "${2:-}" == "on" || "${2:-}" == "off" ]]; then SITE_ALIVE="$2"; shift 2; else SITE_ALIVE="on"; shift; fi ;;
+      --site-news-days)
+        [[ "${2:-}" =~ ^[0-9]+$ && "$2" -ge 1 && "$2" -le 60 ]] || { err "--site-news-days 1..60"; exit 1; }
+        SITE_NEWS_DAYS="$2"; shift 2 ;;
+      --bg-traffic)
+        if [[ "${2:-}" == "on" || "${2:-}" == "off" ]]; then BG_TRAFFIC="$2"; shift 2; else BG_TRAFFIC="on"; shift; fi ;;
+      --bg-traffic-run) DO_BG_RUN=1; shift ;;
+      --probe-alert)
+        if [[ "${2:-}" == "on" || "${2:-}" == "off" ]]; then PROBE_ALERT="$2"; shift 2; else PROBE_ALERT="on"; shift; fi ;;
+      --probe-scan) DO_PROBE_SCAN=1; shift ;;
+      --canary)
+        if [[ "${2:-}" == "on" || "${2:-}" == "off" ]]; then CANARY_MODE="$2"; shift 2; else CANARY_MODE="on"; shift; fi ;;
+      --canary-add) CANARY_ADD="${2:-}"; [[ -n "$CANARY_ADD" ]] || { err "--canary-add \"HOST[:PORT] [SNI] [имя]\""; exit 1; }; shift 2 ;;
+      --canary-run) DO_CANARY_RUN=1; shift ;;
+      --spare-export)
+        DO_SPARE_EXPORT=1
+        if [[ -n "${2:-}" && "${2:-}" != --* ]]; then SPARE_EXPORT="$2"; shift 2; else shift; fi ;;
+      --spare-import) SPARE_IMPORT="${2:-}"; [[ -n "$SPARE_IMPORT" ]] || { err "--spare-import ФАЙЛ"; exit 1; }; shift 2 ;;
+      --suggest-domains) DO_SUGGEST=1; shift ;;
+      --conn-warn)
+        if [[ "${2:-}" =~ ^[0-9]+(:[0-9]+)?$ ]]; then
+          CONN_WARN_SET=1; CONN_WARN_IPS="${2%%:*}"; [[ "$2" == *:* ]] && CONN_WARN_CONNS="${2##*:}"; shift 2
+        else
+          err "--conn-warn IPS[:CONNS], например --conn-warn 200:5000"; exit 1
+        fi ;;
+      --sub-check)
+        if [[ "${2:-}" =~ ^https?:// ]]; then SUB_CHECK_URL="$2"; shift 2; else SUB_CHECK_URL=""; shift; fi
+        DO_SUB_CHECK=1 ;;
       --tz) TZ_OPT="${2:-}"; shift 2 ;;
       --relay-ips) RELAY_IPS="${2:-}"; shift 2 ;;
       --no-docker-user) DO_DOCKER_USER=0; shift ;;
@@ -994,7 +1113,9 @@ _dpi_row() {
 }
 
 run_dpi_check() {
-  step "Проверка DPI / DNS / TLS (egress с ноды)"
+  step "Проверка DPI / DNS / TLS (egress с ноды) + доступность из РФ"
+  echo "Разделы 1–5 смотрят связь С НОДЫ наружу (как DNS/TLS работают у хостера). Блокирует ли Россия саму ноду,"
+  echo "они не покажут — для этого раздел 6 (точки check-host в РФ) и тест заморозки «16 КБ»."
   echo "Источник идей: github.com/Runnin4ik/dpi-detector — облегчённый bash-порт для VPN-ноды."
   echo "Инструменты: bash, curl, openssl, timeout (без Python/GitHub-установок)."
   echo
@@ -1119,8 +1240,23 @@ run_dpi_check() {
     warn "remnanode не виден — проверьте docker ps отдельно"
   fi
   echo
-  ok "DPI-check завершён. На зарубежной VPS чаще всего всё OK — это нормально (DPI у провайдера РФ)."
-  echo "Если DETECTED/TLS DROP на EU-ноде — смотрите firewall/маршрут хостера, не «российский DPI»."
+  echo "=== 6) Снаружи из России (check-host) ==="
+  local _pub=""
+  _pub="$(_audit_detect_public_ipv4 2>/dev/null || true)"
+  if [[ -n "$_pub" ]]; then
+    _audit_ensure_client_ports 2>/dev/null || true
+    local -a _dports=()
+    [[ ${#DETECTED_CLIENT_PORTS[@]} -gt 0 ]] && _dports=("${DETECTED_CLIENT_PORTS[@]}")
+    [[ ${#_dports[@]} -gt 0 ]] || _dports=(443)
+    AUDIT_PUB_IP="$_pub"
+    _audit_reachability_from_russia "$_pub" "${_dports[@]}" || true
+    run_freeze_test || true
+  else
+    warn "Публичный IPv4 не определён — проверку из РФ пропускаем"
+  fi
+  echo
+  ok "DPI-check завершён. Разделы 1–5 на зарубежной VPS почти всегда OK — DPI стоит у провайдера в РФ (раздел 6)."
+  echo "Если DETECTED/TLS DROP в разделах 1–5 — смотрите firewall/маршрут хостера, не «российский DPI»."
 }
 
 # ---------- Node block / detectability audit (read-only; --audit / menu 8) ----------
@@ -1546,28 +1682,6 @@ _audit_is_own_site() {
   return 1
 }
 
-_audit_reality_dest_quality() {
-  # stdin unused; args: serverNames/dest strings — prints good|ru|small|unknown
-  local s="$1"
-  s="$(printf '%s' "$s" | tr '[:upper:]' '[:lower:]')"
-  case "$s" in
-    *cdn-apple.com*|*mzstatic.com*|*gstatic.com*|*googleapis.com*|*google.com*|*microsoftonline.com*|*edge.microsoft*|*windows.net*|*office.com*|*microsoft.com*|*icloud.com*|*apple.com*|*cloudflare-dns.com*|*cloudflare.com*|*amazonaws.com*|*amazon.com*|*fbcdn.net*|*facebook.com*|*yimg.com*|*yahoo.com*|*bing.com*|*live.com*|*akamai*)
-      echo good; return ;;
-  esac
-  case "$s" in
-    *.ru|*.su|*.xn--p1ai|*mail.ru*|*yandex.*|*vk.com*|*ok.ru*|*sber*|*rt.ru*|*mts.ru*|*megafon*)
-      echo ru; return ;;
-  esac
-  # short / odd looking host
-  local host="${s%%/*}"
-  host="${host#*://}"
-  host="${host%%:*}"
-  if [[ ${#host} -le 8 || "$host" =~ ^[0-9.]+$ ]]; then
-    echo small; return
-  fi
-  echo unknown
-}
-
 _audit_openssl_dest() {
   # Check dest reachable via TLS1.3 + h2 from this server. Args: host [port=443]
   local host="$1" port="${2:-443}"
@@ -1628,7 +1742,7 @@ _audit_passive_reality_probe() {
     if [[ "$port" == "443" ]]; then
       _audit_ok "Порт 443 — хорошо маскируется под HTTPS"
     else
-      _audit_warn "Порт ${port} ≠ 443 — для REALITY лучше 443 (меньше палевности)"
+      _audit_info "Порт ${port} ≠ 443 — основной вход лучше на 443; запасной порт полезен там, где провайдер режет TLS-сессии на 443"
     fi
     out=""
     masked=""
@@ -1665,15 +1779,7 @@ _audit_passive_reality_probe() {
     if [[ -n "$masked" ]]; then
       _audit_info "Маскировочный сертификат/домен: ${masked}"
       [[ -n "$sans" ]] && _audit_info "SAN: ${sans}"
-      q="$(_audit_reality_dest_quality "$masked")"
-      _audit_is_own_site "$masked" && q="own"
-      case "$q" in
-        own)  _audit_ok "CN/SAN = ваш домен сайта-маскировки (${masked}) — self-steal" ;;
-        good) _audit_ok "CN/SAN похож на крупный зарубежный сайт — хорошо для REALITY" ;;
-        ru)   _audit_warn "CN/SAN российский (${masked}) — лучше gstatic/microsoft/apple" ;;
-        small) _audit_warn "CN/SAN мелкий/подозрительный (${masked})" ;;
-        *)    _audit_warn "CN/SAN «${masked}» — предпочтительны крупные зарубежные домены" ;;
-      esac
+      _audit_reality_sni_report "" "$masked"
       # dest reachability from this server
       local tls_res
       tls_res="$(_audit_openssl_dest "$masked" 443)"
@@ -1771,7 +1877,14 @@ for ib in inbounds:
   sni=""
   dest=""
   short_ids=[]
+  maxtd=""; lfu="no"; lfd="no"; xver=""
+  xs=ss.get("xhttpSettings") or ss.get("splithttpSettings") or {}
+  xpath=str(xs.get("path") or "") if isinstance(xs,dict) else ""
   if security=="reality" or rs:
+    maxtd=str(rs.get("maxTimeDiff") or rs.get("maxTimediff") or "")
+    lfu="yes" if rs.get("limitFallbackUpload") else "no"
+    lfd="yes" if rs.get("limitFallbackDownload") else "no"
+    xver=str(rs.get("xver") or "")
     sni=",".join(str(x) for x in (rs.get("serverNames") or rs.get("server_names") or [])[:6])
     dest=str(rs.get("dest") or rs.get("target") or "")
     short_ids=rs.get("shortIds") or rs.get("short_ids") or []
@@ -1784,6 +1897,8 @@ for ib in inbounds:
     flow or "-", sni or "-", dest or "-",
     "sid_empty" if sid_empty else "sid_ok",
     "reality" if (security=="reality" or rs) else "other",
+    str(len([x for x in short_ids if str(x)]) if isinstance(short_ids,list) else 0),
+    maxtd or "-", lfu, lfd, xver or "-", (xpath or "-").replace("|","/"),
   ]))
 ' 2>/dev/null || true)"
 
@@ -1802,11 +1917,15 @@ for ib in inbounds:
   fi
 
   local line _tag idx proto port security network flow sni dest sid_flag kind
-  local dest_host dest_port q tls_res
+  local sid_count maxtd lfu lfd xver xpath
+  local dest_host dest_port tls_res
   while IFS= read -r line; do
     case "$line" in IB\|*) ;; *) continue ;; esac
     ib_count=$((ib_count+1))
-    IFS="|" read -r _tag idx proto port security network flow sni dest sid_flag kind <<<"$line"
+    sid_count=0; maxtd="-"; lfu="no"; lfd="no"; xver="-"; xpath="-"
+    IFS="|" read -r _tag idx proto port security network flow sni dest sid_flag kind sid_count maxtd lfu lfd xver xpath <<<"$line"
+    [[ "$kind" == "reality" && -n "$port" ]] && AUDIT_REG_PORTS="${AUDIT_REG_PORTS:+${AUDIT_REG_PORTS},}${port}"
+    [[ -n "$port" && ",${AUDIT_IB_PORTS}," != *",${port},"* ]] && AUDIT_IB_PORTS="${AUDIT_IB_PORTS:+${AUDIT_IB_PORTS},}${port}"
     echo
     printf '%bInbound #%s (%s port %s):%b\n' "${C_BOLD}" "${idx}" "$proto" "${port:-?}" "${C_RESET}"
 
@@ -1814,9 +1933,11 @@ for ib in inbounds:
       if [[ "$port" == "443" ]]; then
         _audit_ok "Порт 443 — хорошо маскируется под HTTPS"
       else
-        _audit_warn "Порт ${port:-?} ≠ 443 — для REALITY лучше слушать 443 (меньше палевности)"
+        _audit_info "Порт ${port:-?} ≠ 443 — основной вход лучше на 443; запасной порт полезен там, где провайдер режет TLS-сессии на 443"
       fi
-      if [[ "$flow" == *xtls-rprx-vision* ]]; then
+      if [[ "$network" == "xhttp" || "$network" == "splithttp" || "$network" == "grpc" ]]; then
+        _audit_ok "${network}: flow не нужен (Vision только для raw/tcp)"
+      elif [[ "$flow" == *xtls-rprx-vision* ]]; then
         _audit_ok "flow=xtls-rprx-vision"
       else
         _audit_warn "flow «${flow}» — для VLESS+REALITY рекомендуют xtls-rprx-vision"
@@ -1826,15 +1947,8 @@ for ib in inbounds:
       else
         _audit_ok "shortIds заданы"
       fi
-      q="$(_audit_reality_dest_quality "${dest}|${sni}")"
-      _audit_is_own_site "${dest}|${sni}" && q="own"
-      case "$q" in
-        own)  _audit_ok "dest/serverNames → ваш сайт-маскировка (${dest:-$sni}) — self-steal, свой домен и сертификат" ;;
-        good) _audit_ok "dest/serverNames выглядят как крупный зарубежный сайт (${dest:-$sni}) — хорошо" ;;
-        ru)   _audit_warn "dest/SNI российский (${dest:-$sni}) — лучше gstatic/microsoft/apple/cloudflare" ;;
-        small) _audit_warn "dest/SNI мелкий/подозрительный (${dest:-$sni}) — возьмите крупный зарубежный домен" ;;
-        *)    _audit_warn "dest/SNI «${dest:-$sni}» — предпочтительны gstatic.com / www.microsoft.com / apple.com" ;;
-      esac
+      _audit_reality_sni_report "$dest" "$sni"
+      _audit_reality_extra_fields "$sid_count" "$maxtd" "$lfu" "$lfd" "$xver" "$network" "$xpath" "$dest"
       dest_host="${dest%%:*}"
       dest_port=443
       if [[ "$dest" == *:* ]]; then
@@ -2676,7 +2790,7 @@ except Exception: pass' "$pub_ip" 2>/dev/null || true)"
 
 run_node_audit() {
   step "Проверка на блокировку и палевность ноды (read-only)"
-  echo "Ничего не меняем: без правок firewall/sysctl/docker, без влияния на скорость клиентов."
+  echo "Ничего не меняем: без правок firewall/sysctl/docker, без влияния на скорость клиентов (пишем только реестр ${GS_REGISTRY_FILE})."
   menu_sep
 
   local pub_ip=""
@@ -2692,7 +2806,11 @@ run_node_audit() {
   fi
 
   AUDIT_PUB_IP="$pub_ip"
+  AUDIT_PUB_CC=""; AUDIT_REG_PORTS=""; AUDIT_IB_PORTS=""; AUDIT_REG_SNI=""; AUDIT_REG_DEST=""; AUDIT_SNI_BAD=0
+  AUDIT_SELFSTEAL_FIX_SHOWN=0; AUDIT_FP_ADVICE_SHOWN=0
   if [[ -n "$pub_ip" ]]; then
+    _audit_node_country "$pub_ip"
+    [[ -n "$AUDIT_PUB_CC" ]] && _audit_info "Страна IP ноды: ${AUDIT_PUB_CC}"
     _audit_reachability_from_russia "$pub_ip" "${ports[@]}"
   fi
 
@@ -2718,6 +2836,7 @@ run_node_audit() {
   _audit_site
   echo
   _audit_site_port443
+  _audit_v290_extras
   echo
   _audit_boot_order
 
@@ -2976,13 +3095,14 @@ interactive_menu() {
     printf '  %b8)%b 🛡️  Проверка на блокировку и палевность ноды\n' "${C_BOLD}" "${C_RESET}"
     printf '  %b9)%b 🕵️  Скрыть отпечатки сервера\n' "${C_BOLD}" "${C_RESET}"
     printf '  %b10)%b 🌐 Сайт-маскировка (поддомен + сертификат + сайт для REALITY на 127.0.0.1:9443, 12 шаблонов)\n' "${C_BOLD}" "${C_RESET}"
+    printf '  %b11)%b 🧭 Защита от обнаружения: SNI-соседи, новости сайта, «обычный сайт», xhttp/Hysteria2, тест 16 КБ, самопроверка, подписка, нагрузка, ловушка, канарейка, запасная нода\n' "${C_BOLD}" "${C_RESET}"
     menu_sep
     printf '  %b0)%b 🚪 Выход\n' "${C_BOLD}" "${C_RESET}"
     printf '%bCLI: gorecshit [--status|--update|--audit|--stealth|--site-domain D|--yes|--modules …]%b\n' "${C_GREY}" "${C_RESET}"
     if [[ -w /dev/tty ]]; then
-      printf '%bВыберите пункт [0-10]:%b ' "${C_BOLD}" "${C_RESET}" > /dev/tty
+      printf '%bВыберите пункт [0-11]:%b ' "${C_BOLD}" "${C_RESET}" > /dev/tty
     else
-      printf '%bВыберите пункт [0-10]:%b ' "${C_BOLD}" "${C_RESET}"
+      printf '%bВыберите пункт [0-11]:%b ' "${C_BOLD}" "${C_RESET}"
     fi
     read_user_input choice
     case "$choice" in
@@ -3035,6 +3155,9 @@ interactive_menu() {
         DO_SITE_ONLY=1
         _site_menu_choose_theme
         return 0
+        ;;
+      11)
+        anti_detect_menu
         ;;
       0|q|Q)
         exit 0
@@ -3645,6 +3768,16 @@ do_rollback() {
     err "Каталоги бэкапов не найдены"; exit 1
   fi
   log "Используем бэкап: $latest"
+  # v2.9.0: профиль «обычный сайт» и таймеры убираем всегда (RST-правило не должно пережить откат UFW)
+  if [[ "$DRY_RUN" -eq 0 ]]; then
+    _web_profile_strip 2>/dev/null || true
+    _gs_all_timers_off
+    if [[ -f "$SITE_NGINX_CONF" ]] && grep -q 'gs_trap' "$SITE_NGINX_CONF" 2>/dev/null; then
+      sed -i -E 's#^([[:space:]]*)access_log [^;]* gs_trap;#\1access_log off;#' "$SITE_NGINX_CONF"
+      rm -f "$GS_TRAP_FMT_CONF" /etc/logrotate.d/gorecshit-trap
+      nginx -t >/dev/null 2>&1 && systemctl reload nginx 2>/dev/null || true
+    fi
+  fi
   if [[ -x "$latest/rollback.sh" ]]; then
     if [[ "$DRY_RUN" -eq 1 ]]; then
       printf '%b[DRY]%b run %s\n' "${C_YEL}" "${C_RESET}" "$latest/rollback.sh"
@@ -5444,7 +5577,7 @@ RBEOF
 
 configure_fingerprint_hiding() {
   step "Скрытие отпечатков сервера (без потери скорости)"
-  echo "Не трогаем: IPv6, клиентские порты UFW, Docker compose, настройки панели, tcp_timestamps."
+  echo "Не трогаем: IPv6, клиентские порты UFW, Docker compose, настройки панели (tcp_timestamps — только вернуть как у Linux, по вопросу)."
   local -a done_msgs=()
 
   if [[ "$DRY_RUN" -eq 1 ]]; then
@@ -5606,6 +5739,17 @@ net.ipv4.icmp_ignore_bogus_error_responses = 1
   sysctl -p /etc/sysctl.d/99-gorecshit-fingerprint.conf >/dev/null 2>&1 || true
   ok "sysctl: ttl=64, ignore broadcasts, no send/accept redirects"
   done_msgs+=("sysctl fingerprint (TTL/ICMP redirects/broadcasts)")
+  # v2.9.0: tcp_timestamps=0 от старого --tcp-timestamps-off сам выделяет сервер — предлагаем вернуть как у Linux
+  if [[ -f /etc/sysctl.d/99-gorecshit-tcp-timestamps.conf ]] || [[ "$(sysctl -n net.ipv4.tcp_timestamps 2>/dev/null || echo 1)" == "0" ]]; then
+    warn "tcp_timestamps=0 — почти все Linux-серверы шлют timestamps; отключённые выделяют сервер в пассивном отпечатке (JA4T)"
+    if _fp_ask_yn "Вернуть tcp_timestamps=1 (как у обычного Linux; на скорость не влияет)?" 0; then
+      backup_file /etc/sysctl.d/99-gorecshit-tcp-timestamps.conf
+      rm -f /etc/sysctl.d/99-gorecshit-tcp-timestamps.conf
+      sysctl -w net.ipv4.tcp_timestamps=1 >/dev/null 2>&1 || true
+      ok "tcp_timestamps=1"
+      done_msgs+=("tcp_timestamps=1 (как у обычного Linux)")
+    fi
+  fi
 
   # ICMP timestamp (13/14) and address-mask (17/18) DROP — dedicated chain, does not touch echo policy beyond existing
   if command -v iptables >/dev/null 2>&1; then
@@ -7805,6 +7949,7 @@ ${all_posts}"
 _site_finish() {
   # robots, sitemap, правдоподобные даты файлов (n_posts/p_slug/p_epoch/now_e — из вызывающей функции)
   local out="$1" domain="$2" i u f fe
+  _site_write_cover "$out"   # v2.9.0: «тяжёлая» обложка > 64 КБ (обычный ресурс сайта; нужен тесту 16 КБ)
   printf 'User-agent: *\nAllow: /\n\nSitemap: https://%s/sitemap.xml\n' "$domain" >"$out/robots.txt"
   {
     echo '<?xml version="1.0" encoding="UTF-8"?>'
@@ -8164,7 +8309,7 @@ _site_load_state() {
   while IFS='=' read -r k v; do
     v="${v%\"}"; v="${v#\"}"
     case "$k" in
-      SITE_DOMAIN) [[ -n "$SITE_DOMAIN" ]] || SITE_DOMAIN="$v" ;;
+      SITE_DOMAIN) SITE_STATE_DOMAIN="$v"; [[ -n "$SITE_DOMAIN" ]] || SITE_DOMAIN="$v" ;;
       SITE_EMAIL) [[ -n "$SITE_EMAIL" ]] || SITE_EMAIL="$v" ;;
       SITE_THEME) SITE_PREV_THEME="$v"; [[ -n "$SITE_THEME_SET" || "$SITE_REGEN" -eq 1 ]] || SITE_THEME="$v" ;;
       SITE_MODE_ACTIVE) SITE_MODE_ACTIVE="$v" ;;
@@ -8176,6 +8321,9 @@ _site_load_state() {
       SITE_CLOSE80) [[ "$SITE_CLOSE80" -eq 1 ]] || SITE_CLOSE80="$v" ;;
       SITE_BRAND) SITE_BRAND="$v" ;;
       SITE_CITY) SITE_CITY="$v" ;;
+      SITE_EPOCH) SITE_EPOCH="$v" ;;
+      SITE_TRAP) SITE_TRAP="$v" ;;
+      SITE_HTTP_PAGE) [[ -n "$SITE_HTTP_PAGE_SET" ]] || SITE_HTTP_PAGE="$v" ;;
     esac
   done <"$SITE_STATE_FILE"
   return 0
@@ -8303,6 +8451,15 @@ _site_check_dns() {
   ok "DNS: ${d} → ${pub4}${aaaa:+ / ${aaaa//$'\n'/ }}"
 }
 
+_site_access_log_line() {
+  # access_log off по умолчанию; с --probe-alert — лог ловушки (формат в conf.d, иначе nginx -t упадёт)
+  if [[ "${SITE_TRAP:-0}" -eq 1 && -f "${GS_TRAP_FMT_CONF:-/nonexistent}" ]]; then
+    echo "access_log ${GS_TRAP_LOG} gs_trap;"
+  else
+    echo "access_log off;"
+  fi
+}
+
 _site_write_nginx_conf() {
   # _site_write_nginx_conf PHASE(acme|full)
   local phase="$1" d="$SITE_DOMAIN" v6=0 dflt=" default_server" h2listen="" h2line="" pp=""
@@ -8318,14 +8475,26 @@ _site_write_nginx_conf() {
     [[ "$v6" -eq 1 ]] && echo "    listen [::]:80${dflt};"
     if [[ -n "$dflt" ]]; then echo "    server_name ${d} _;"; else echo "    server_name ${d};"; fi
     echo "    server_tokens off;"
-    echo "    access_log off;"
+    echo "    $(_site_access_log_line)"
     echo "    location ^~ /.well-known/acme-challenge/ {"
     echo "        root ${SITE_ACME_ROOT};"
     echo "        default_type text/plain;"
     echo "    }"
-    echo "    location / {"
-    echo "        return 301 https://${d}\$request_uri;"
-    echo "    }"
+    if [[ "$phase" == "full" && "${SITE_HTTP_PAGE:-0}" -eq 1 ]]; then
+      # v2.9.0 --site-http-page: на :80 тот же сайт (как у части обычных сайтов), без редиректа
+      echo "    root ${SITE_ROOT};"
+      echo "    index index.html;"
+      echo "    charset utf-8;"
+      echo "    error_page 404 /404.html;"
+      echo "    location = /404.html { internal; }"
+      echo "    location / {"
+      echo "        try_files \$uri \$uri/ =404;"
+      echo "    }"
+    else
+      echo "    location / {"
+      echo "        return 301 https://${d}\$request_uri;"
+      echo "    }"
+    fi
     echo "}"
     if [[ "$phase" == "full" ]]; then
       echo
@@ -8350,9 +8519,15 @@ _site_write_nginx_conf() {
       echo "    root ${SITE_ROOT};"
       echo "    index index.html;"
       echo "    charset utf-8;"
-      echo "    access_log off;"
+      echo "    $(_site_access_log_line)"
       echo "    gzip on;"
-      echo "    gzip_types text/css image/svg+xml application/xml text/plain;"
+      echo "    gzip_vary on;"
+      echo "    gzip_comp_level 5;"
+      echo "    gzip_min_length 512;"
+      echo "    gzip_types text/css image/svg+xml application/xml text/plain application/javascript application/json image/x-icon;"
+      echo "    etag on;"
+      echo "    # HTTP без TLS на этот порт (зонд «HTTP на 443») → обычный редирект, как у живого сайта"
+      echo "    error_page 497 =301 https://${d}\$request_uri;"
       echo "    add_header Strict-Transport-Security \"max-age=31536000\" always;"
       echo "    add_header X-Content-Type-Options \"nosniff\" always;"
       echo "    add_header Referrer-Policy \"strict-origin-when-cross-origin\" always;"
@@ -8361,9 +8536,14 @@ _site_write_nginx_conf() {
       echo "    location = /404.html { internal; }"
       echo "    location / {"
       echo "        try_files \$uri \$uri/ =404;"
+      echo "        expires 1h;"
       echo "    }"
       echo "    location /assets/ {"
       echo "        expires 30d;"
+      echo "    }"
+      echo "    location = /favicon.ico {"
+      echo "        expires 7d;"
+      echo "        log_not_found off;"
       echo "    }"
       echo "}"
     fi
@@ -8490,6 +8670,11 @@ _site_confirm_setup() {
     prompt_user "Домен ${SITE_DOMAIN}, режим ${SITE_MODE_ACTIVE}, сайт на ${SITE_LISTEN}:${SITE_PORT}${pub}. [Y] продолжить / [n] изменить домен / [0] отмена: " ans
     ans="$(tr -d ' \r' <<<"$ans")"
     if [[ -z "$ans" || "$ans" =~ ^[YyДд]$ || "$ans" =~ ^([Yy][Ee][Ss]|[Дд][Аа])$ ]]; then
+      if _site_domain_blocked; then
+        _site_domain_block_msg
+        warn "С таким доменом не продолжаю: n — другой домен, 0 — отмена (или флаг --site-allow-vpn-word)"
+        continue
+      fi
       return 0
     elif [[ "$ans" == "0" ]]; then
       warn "Сайт-маскировка отменена"
@@ -8520,6 +8705,18 @@ configure_site() {
     err "Некорректный домен: ${SITE_DOMAIN} (нужно вида node.example.ru; кириллицу — в punycode xn--…)"
     return 1
   fi
+  # v2.9.0: vpn/proxy/… в домене — блок (обход: --site-allow-vpn-word)
+  while _site_domain_blocked; do
+    _site_domain_block_msg
+    if [[ "${CLI_ASSUME_YES:-0}" -eq 0 ]] && _tty_usable && [[ "${DRY_RUN:-0}" -eq 0 ]]; then
+      if ! _site_change_domain_interactive; then
+        warn "Сайт-маскировка отменена: нужен нейтральный домен"
+        return 1
+      fi
+    else
+      return 1
+    fi
+  done
   _site_warn_domain_words
   [[ -z "$SITE_THEME" || "$SITE_THEME" == "auto" ]] && SITE_THEME="random"
   if [[ " random ${SITE_THEMES} " != *" ${SITE_THEME} "* ]]; then
@@ -8613,6 +8810,10 @@ configure_site() {
   if ! _site_confirm_setup; then
     return 0
   fi
+  if _site_domain_blocked; then
+    _site_domain_block_msg
+    return 1
+  fi
 
   if [[ "$DRY_RUN" -eq 1 ]]; then
     printf '%b[DRY]%b DNS %s → IP ноды; apt nginx certbot; сайт (тема %s) → /var/www/%s; %s (80 ACME/301, %s:%s ssl h2%s%s); certbot --webroot; UFW 80%s; state %s\n' \
@@ -8695,6 +8896,8 @@ configure_site() {
 
   # --- сайт ---
   [[ -n "$SITE_SEED" ]] || SITE_SEED="$(_site_random_seed)"
+  # якорь времени для новостей (--site-refresh): новый сайт/--site-regen — сейчас, иначе прежний
+  if [[ "$SITE_REGEN" -eq 1 || ! "${SITE_EPOCH:-}" =~ ^[0-9]+$ ]]; then SITE_EPOCH="$(date +%s)"; fi
   local newroot="${SITE_ROOT}.new.$$"
   site_generate "$newroot" "$SITE_DOMAIN" "$SITE_THEME" "$SITE_SEED"
   if site_forbidden_scan -r "$newroot" >/dev/null; then
@@ -8825,6 +9028,9 @@ HOOK
     echo "SITE_BRAND=\"${SITE_G_BRAND}\""
     echo "SITE_CITY=\"${SITE_G_CITY}\""
     echo "SITE_CLOSE80=${SITE_CLOSE80}"
+    echo "SITE_HTTP_PAGE=${SITE_HTTP_PAGE}"
+    echo "SITE_EPOCH=${SITE_EPOCH}"
+    echo "SITE_TRAP=${SITE_TRAP:-0}"
     echo "SITE_VERSION=${VERSION}"
   } >"$SITE_STATE_FILE"
 
@@ -9158,6 +9364,1908 @@ ufw_remove_public_node_port() {
   ok "Удалены публичные ALLOW для NODE_PORT ${np} (${#del[@]} шт.) — остался доступ только с панели ${PANEL_IP}"
 }
 
+# ======================================================================================
+# v2.9.0 — защита от обнаружения ноды: аудит SNI/Reality, TSPU-зонды, отпечатки, CDN-цепочка,
+# --find-sni, обновление сайта, профиль «обычный сайт», помощники транспортов, самопроверка.
+# Всё, что меняет поведение живой ноды, — только по флагу/пункту меню (opt-in).
+# ======================================================================================
+
+# Крупные зарубежные бренды: их SNI на IP хостера = расхождение «имя ≠ сеть» (ТСПУ с 02.2026)
+GS_BRAND_SNI_RE='(^|\.)(google|gstatic|googleapis|googlevideo|googleusercontent|gvt1|youtube|ytimg|microsoft|microsoftonline|msftconnecttest|windows|windowsupdate|office|office365|live|bing|msn|azure|azureedge|apple|icloud|mzstatic|cdn-apple|itunes|amazon|amazonaws|cloudfront|cloudflare|cloudflare-dns|facebook|fbcdn|instagram|whatsapp|meta|yahoo|yimg|akamai|akamaized|akamaihd|github|githubusercontent|discord|discordapp|telegram|samsung|nvidia|intel|adobe|oracle|speedtest|tesla|spotify|netflix|twitch|zoom|dropbox|mozilla|firefox|wikipedia|wikimedia|cisco|ibm|hp|dell|lenovo|asus|xiaomi|huawei|tiktok|tiktokcdn|bytedance|steampowered|steamcommunity|epicgames|playstation|xbox|nintendo|booking|airbnb|paypal|visa|mastercard|vercel|fastly|jsdelivr|unpkg|digicert|letsencrypt|sectigo)\.[a-z.]+$'
+# «Белые» российские домены: работают как SNI только на РФ-входе в разрешённой сети
+GS_RU_WHITE_SNI_RE='(^|\.)(x5\.ru|max\.ru|vk\.com|vk\.ru|vkvideo\.ru|vk-portal\.net|userapi\.com|mail\.ru|ok\.ru|yandex\.[a-z]+|ya\.ru|yastatic\.net|yandex\.net|dzen\.ru|kinopoisk\.ru|gosuslugi\.ru|sberbank\.ru|sber\.ru|sberdevices\.ru|ozon\.ru|ozone\.ru|wildberries\.ru|wb\.ru|wbstatic\.net|avito\.ru|avito\.st|2gis\.ru|2gis\.com|mts\.ru|megafon\.ru|beeline\.ru|tele2\.ru|t2\.ru|rt\.ru|rostelecom\.ru|rutube\.ru|tbank\.ru|tinkoff\.ru|alfabank\.ru|vtb\.ru|mos\.ru|nalog\.ru|hh\.ru|kaspersky\.ru|1c\.ru)$'
+GS_SUSPECT_PATH_RE='vpn|vless|vmess|xray|v2ray|reality|xhttp|proxy|tunnel|trojan|remna|marzban|hysteria|example|gorec|obhod'
+GS_STATE_DIR="/var/lib/gorecshit"
+GS_REGISTRY_FILE="/var/lib/gorecshit/node.env"
+GS_SELFCHECK_ENV="/etc/gorecshit/selfcheck.env"
+AUDIT_PUB_CC=""
+AUDIT_REG_SNI=""
+AUDIT_REG_DEST=""
+AUDIT_REG_PORTS=""
+AUDIT_IB_PORTS=""
+AUDIT_FP_ADVICE_SHOWN=0
+AUDIT_SELFSTEAL_FIX_SHOWN=0
+AUDIT_SNI_BAD=0
+
+_gs_host_of() {
+  # "https://Host:443/path" → host (lowercase, без порта)
+  local s="${1,,}"
+  s="${s#*://}"; s="${s%%/*}"
+  if [[ "$s" == \[*\]* ]]; then s="${s#[}"; s="${s%%]*}"; else s="${s%%:*}"; fi
+  printf '%s' "$s"
+}
+
+_gs_is_private_ip() {
+  local ip="$1"
+  [[ "$ip" =~ ^(127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|169\.254\.|0\.0\.0\.0$) ]] && return 0
+  [[ "$ip" == "::1" || "$ip" == "localhost" ]] && return 0
+  return 1
+}
+
+_gs_same24() {
+  # _gs_same24 IP1 IP2 → rc 0, если в одной /24
+  [[ -n "$1" && -n "$2" ]] || return 1
+  [[ "${1%.*}" == "${2%.*}" ]]
+}
+
+_audit_node_country() {
+  # AUDIT_PUB_CC — страна IP ноды (best-effort, без ключей)
+  local ip="${1:-${AUDIT_PUB_IP:-}}" cc=""
+  [[ -n "$ip" ]] || return 0
+  cc="$(curl -fsS --connect-timeout 4 --max-time 6 -A 'gorecshit-audit' "https://ipinfo.io/${ip}/country" 2>/dev/null | tr -dc 'A-Za-z' | head -c 2 || true)"
+  if [[ ! "$cc" =~ ^[A-Za-z]{2}$ ]]; then
+    cc="$(curl -fsS --connect-timeout 4 --max-time 6 "http://ip-api.com/line/${ip}?fields=countryCode" 2>/dev/null | tr -dc 'A-Za-z' | head -c 2 || true)"
+  fi
+  [[ "$cc" =~ ^[A-Za-z]{2}$ ]] && AUDIT_PUB_CC="${cc^^}"
+  return 0
+}
+
+_audit_sni_classify() {
+  # _audit_sni_classify HOST → own|local|ip|brand|ruwhite|words|match|near|foreign|nodns
+  local h
+  case "$1" in /*|@*|unix:*) echo local; return 0 ;; esac
+  h="$(_gs_host_of "$1")"
+  [[ -n "$h" && "$h" != "-" ]] || { echo nodns; return 0; }
+  if [[ "$h" == "localhost" || "$h" =~ ^[0-9.]+$ || "$h" == *:* || "$h" == /* || "$h" == @* ]]; then
+    if [[ "$h" == "localhost" || "$h" == /* || "$h" == @* ]] || _gs_is_private_ip "$h"; then echo local; else echo ip; fi
+    return 0
+  fi
+  if _audit_is_own_site "$h"; then echo own; return 0; fi
+  if LC_ALL=C grep -qiE "$GS_BRAND_SNI_RE" <<<"$h"; then echo brand; return 0; fi
+  if LC_ALL=C grep -qiE "$GS_RU_WHITE_SNI_RE" <<<"$h"; then echo ruwhite; return 0; fi
+  if LC_ALL=C grep -qiE "${SITE_DOMAIN_FORBIDDEN_RE}" <<<"$h"; then echo words; return 0; fi
+  local a pub="${AUDIT_PUB_IP:-}" ip near=0
+  a="$(_site_resolve A "$h" 2>/dev/null | paste -sd' ' - || true)"
+  [[ -n "$a" ]] || { echo nodns; return 0; }
+  if [[ -n "$pub" && " $a " == *" $pub "* ]]; then echo match; return 0; fi
+  for ip in $a; do _gs_same24 "$ip" "$pub" && near=1; done
+  if [[ "$near" -eq 1 ]]; then echo near; else echo foreign; fi
+}
+
+_audit_print_selfsteal_fix() {
+  [[ "$AUDIT_SELFSTEAL_FIX_SHOWN" -eq 0 ]] || return 0
+  AUDIT_SELFSTEAL_FIX_SHOWN=1
+  local d="" l="127.0.0.1" p="9443"
+  if [[ -f "$SITE_STATE_FILE" ]]; then
+    d="$(sed -n 's/^SITE_DOMAIN=//p' "$SITE_STATE_FILE" | head -1)"
+    l="$(sed -n 's/^SITE_LISTEN=//p' "$SITE_STATE_FILE" | head -1)"; l="${l:-127.0.0.1}"
+    p="$(sed -n 's/^SITE_PORT=//p' "$SITE_STATE_FILE" | head -1)"; p="${p:-9443}"
+  fi
+  echo
+  printf '  %b🔧 Как исправить (self-steal на свой домен):%b\n' "${C_BOLD}" "${C_RESET}"
+  if [[ -z "$d" ]]; then
+    echo "     1) Купите нейтральный домен (без vpn/proxy в имени), A-запись поддомена → IP ноды, «DNS only»."
+    echo "     2) На ноде: sudo gorecshit --site-domain www.<ваш-домен>   (меню → 10)"
+    echo "     3) В панели (профиль ноды → REALITY): \"target\": \"${l}:${p}\", \"serverNames\": [\"www.<ваш-домен>\"]"
+  else
+    echo "     Сайт уже есть: ${d}. В панели (профиль ноды → REALITY):"
+    echo "       \"target\": \"${l}:${p}\",  \"serverNames\": [\"${d}\"],  Hosts → SNI = ${d}"
+  fi
+  echo "     privateKey/shortIds не меняются. Нет своего домена — сосед по /24: sudo gorecshit --find-sni"
+}
+
+_audit_reality_sni_report() {
+  # _audit_reality_sni_report DEST SNI_CSV — вердикт по target/serverNames (v2.9.0)
+  local dest="$1" sni_csv="$2" dk sk s n=0 any_bad=0 any_good=0 a
+  [[ "$dest" == "-" ]] && dest=""
+  [[ "$sni_csv" == "-" ]] && sni_csv=""
+  [[ -n "$dest" && ";${AUDIT_REG_DEST};" != *";${dest};"* ]] && AUDIT_REG_DEST="${AUDIT_REG_DEST:+${AUDIT_REG_DEST};}${dest}"
+  [[ -n "$sni_csv" && ";${AUDIT_REG_SNI};" != *";${sni_csv};"* ]] && AUDIT_REG_SNI="${AUDIT_REG_SNI:+${AUDIT_REG_SNI};}${sni_csv}"
+  if [[ -n "$dest" ]]; then
+    dk="$(_audit_sni_classify "$dest")"
+    case "$dk" in
+      local|own) _audit_ok "target ${dest} — локальный сайт (self-steal): зонд без ключа видит сайт этого же сервера" ;;
+      match) _audit_ok "target ${dest} указывает на этот же IP" ;;
+      brand) _audit_err "target ${dest} — чужой крупный сайт. Зонд ТСПУ получит сертификат $(_gs_host_of "$dest") с IP хостера — это и есть признак ноды"; any_bad=1 ;;
+      ruwhite)
+        if [[ "${AUDIT_PUB_CC:-}" == "RU" ]]; then
+          _audit_info "target ${dest} — российский сервис на российском IP (схема входа для белых списков)"
+        else
+          _audit_warn "target ${dest} — российский сервис: на зарубежном IP это расхождение «имя ≠ сеть»"; any_bad=1
+        fi ;;
+      near) _audit_ok "target ${dest} — сосед по /24 (тот же ДЦ)" ;;
+      ip) _audit_warn "target ${dest} — внешний IP: убедитесь, что это ваш сайт" ;;
+      nodns) _audit_warn "target ${dest} не резолвится" ;;
+      *) _audit_warn "target ${dest} — чужой сайт в другой сети (расхождение имени и IP ноды)"; any_bad=1 ;;
+    esac
+  fi
+  local -a sarr=()
+  IFS=',' read -r -a sarr <<<"$sni_csv"
+  for s in "${sarr[@]}"; do
+    s="$(_gs_host_of "$s")"
+    [[ -n "$s" ]] || continue
+    n=$((n + 1))
+    [[ "$n" -le 6 ]] || break
+    sk="$(_audit_sni_classify "$s")"
+    case "$sk" in
+      own) _audit_ok "SNI ${s} — ваш сайт-маскировка на этом IP (self-steal): имя, DNS и сертификат совпадают"; any_good=1 ;;
+      match) _audit_ok "SNI ${s} → этот IP (свой домен)"; any_good=1 ;;
+      near) _audit_ok "SNI ${s} — сосед по /24 (тот же ДЦ/ASN) — допустимо, свой домен надёжнее"; any_good=1 ;;
+      brand)
+        _audit_err "SNI ${s} — чужой крупный бренд на IP хостера. С 02.2026 ТСПУ сверяют SNI с сетью сервера и блокируют IP, затем подсеть"
+        any_bad=1 ;;
+      ruwhite)
+        if [[ "${AUDIT_PUB_CC:-}" == "RU" ]]; then
+          _audit_info "SNI ${s} — «белый» российский домен на российском IP: схема входа для белых списков; живёт, пока IP в разрешённой сети"
+        else
+          _audit_err "SNI ${s} — российский сервис на зарубежном IP (${AUDIT_PUB_CC:-?}). Такой SNI имеет смысл только на РФ-входе (relay в разрешённой сети), здесь это расхождение"
+          any_bad=1
+        fi ;;
+      words) _audit_err "SNI ${s} содержит vpn/proxy/… — DPI видит имя открытым текстом"; any_bad=1 ;;
+      nodns) _audit_warn "SNI ${s} не резолвится в DNS — DPI видит имя, которого нет"; any_bad=1 ;;
+      local|ip) _audit_warn "SNI ${s} — IP/локальное имя вместо домена" ; any_bad=1 ;;
+      *)
+        a="$(_site_resolve A "$s" 2>/dev/null | head -2 | paste -sd' ' - || true)"
+        _audit_warn "SNI ${s} → ${a:-?}, а нода ${AUDIT_PUB_IP:-?}: чужой сайт в другой сети — расхождение «имя ≠ IP»"
+        any_bad=1 ;;
+    esac
+  done
+  if [[ "$n" -gt 1 ]]; then
+    _audit_info "В serverNames ${n} имён — на время перехода нормально, потом оставьте одно своё"
+  fi
+  if [[ "$any_bad" -eq 1 ]]; then
+    AUDIT_SNI_BAD=1
+    _audit_print_selfsteal_fix
+  elif [[ "$any_good" -eq 1 ]]; then
+    :
+  fi
+  return 0
+}
+
+_audit_reality_extra_fields() {
+  # _audit_reality_extra_fields SID_COUNT MAXTD LFU LFD XVER NET PATH DEST
+  local sidc="$1" maxtd="$2" lfu="$3" lfd="$4" xver="$5" net="$6" path="$7" dest="$8" dk=""
+  [[ "$sidc" =~ ^[0-9]+$ ]] || sidc=0
+  if [[ "$sidc" -eq 1 ]]; then
+    _audit_info "shortIds: 1 — можно 3–5 разных (у разных хостов) — сложнее перебирать"
+  elif [[ "$sidc" -gt 1 ]]; then
+    _audit_ok "shortIds: ${sidc}"
+  fi
+  if [[ -z "$maxtd" || "$maxtd" == "0" || "$maxtd" == "-" ]]; then
+    _audit_info "maxTimeDiff не задан (0) — старый перехваченный ClientHello не отсекается по времени; можно 60000–90000 (мс) в профиле"
+  else
+    _audit_ok "maxTimeDiff=${maxtd}"
+  fi
+  [[ -n "$dest" && "$dest" != "-" ]] && dk="$(_audit_sni_classify "$dest")"
+  if [[ "$lfu" == "yes" || "$lfd" == "yes" ]]; then
+    _audit_ok "limitFallbackUpload/Download заданы — нода не служит бесплатным проксированием к target"
+  elif [[ -n "$dk" && "$dk" != "local" && "$dk" != "own" ]]; then
+    _audit_warn "Нет limitFallbackUpload/Download при внешнем target — сканеры могут гонять трафик к ${dest} через ноду (порт-форвард, жалобы). С self-steal не нужно"
+  fi
+  if [[ "$xver" =~ ^[12]$ ]]; then
+    _audit_info "xver=${xver} — target должен ждать PROXY protocol (gorecshit --site-proxy-protocol)"
+  fi
+  if [[ "$net" == "xhttp" || "$net" == "splithttp" ]]; then
+    if [[ -n "$path" && "$path" != "-" ]] && LC_ALL=C grep -qiE "$GS_SUSPECT_PATH_RE" <<<"$path"; then
+      _audit_warn "xhttp path «${path}» содержит говорящие слова — переименуйте в нейтральный (например /api/v2/$(od -An -N3 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')) и в inbound, и в Hosts"
+    elif [[ -n "$path" && "$path" != "-" ]]; then
+      _audit_ok "xhttp path «${path}» нейтральный"
+    fi
+  fi
+  return 0
+}
+
+_audit_client_fp_advice() {
+  [[ "$AUDIT_FP_ADVICE_SHOWN" -eq 0 ]] || return 0
+  AUDIT_FP_ADVICE_SHOWN=1
+  echo
+  printf '  %b👤 Клиентская часть (панель → Hosts; сервер это не видит):%b\n' "${C_BOLD}" "${C_RESET}"
+  echo "     • fingerprint: chrome или firefox (не random/randomized/ios/360/qq — редкие отпечатки выделяются)"
+  echo "     • SNI = домен из serverNames этой ноды; spiderX — обычный путь сайта (например /blog/)"
+  echo "     • Если у провайдера рвёт Vision на 443 (политика TLS-сессий): запасной хост без flow + mux,"
+  echo "       или xhttp (sudo gorecshit --helper-xhttp), или Hysteria2 по UDP (sudo gorecshit --helper-hy2)"
+  echo "     • Белые списки/блок IP сервер не обойдёт: нужен РФ-вход (relay) или CDN"
+}
+
+_audit_cert_names_report() {
+  # _audit_cert_names_report PEMFILE LABEL — сколько имён в сертификате
+  local f="$1" label="$2" sans n
+  [[ -s "$f" ]] || return 0
+  sans="$(openssl x509 -noout -ext subjectAltName -in "$f" 2>/dev/null | grep -oE 'DNS:[^, ]+' | sed 's/DNS://' | paste -sd' ' - || true)"
+  [[ -n "$sans" ]] || sans="$(openssl x509 -noout -text -in "$f" 2>/dev/null | grep -oE 'DNS:[^, ]+' | sed 's/DNS://' | paste -sd' ' - || true)"
+  n="$(wc -w <<<"$sans" | tr -d ' ')"
+  if [[ "${n:-0}" -le 2 ]]; then
+    _audit_ok "${label}: в сертификате ${n} имя(ён): ${sans}"
+  else
+    _audit_warn "${label}: в сертификате ${n} имён (${sans}) — лишние/старые имена выдают историю сервера; выпустите сертификат только на текущее имя"
+  fi
+  if LC_ALL=C grep -qiE "$SITE_DOMAIN_FORBIDDEN_RE" <<<"$sans"; then
+    _audit_err "${label}: в сертификате есть имена со словами vpn/proxy/… — они видны любому зонду и в CT-логах (crt.sh)"
+  fi
+}
+
+_audit_tspu_probe() {
+  # Набор зондов «как ТСПУ» на публичный IP:443 — ответ должен быть ВАШИМ сайтом во всех случаях
+  step "Зонды «как ТСПУ» на ${AUDIT_PUB_IP:-?}:443 (read-only)"
+  local pub="${AUDIT_PUB_IP:-}"
+  SITE_DOMAIN=""
+  _site_load_state >/dev/null 2>&1 || true
+  local d="${SITE_DOMAIN:-}" live=""
+  if [[ -z "$pub" ]] || ! command -v openssl >/dev/null 2>&1; then
+    _audit_info "Нет публичного IP/openssl — пропуск"
+    return 0
+  fi
+  if ! ss -Hltn '( sport = :443 )' 2>/dev/null | grep -q .; then
+    _audit_info "На 443 никто не слушает — пропуск"
+    return 0
+  fi
+  [[ -n "$d" ]] && live="/etc/letsencrypt/live/${d}/fullchain.pem"
+  local ref="" ref_label=""
+  if [[ -n "$live" && -s "$live" ]]; then
+    ref="$(openssl x509 -noout -fingerprint -sha256 -in "$live" 2>/dev/null | cut -d= -f2 | tr -d ':' | cut -c1-16 || true)"
+    ref_label="сертификат вашего сайта ${d}"
+    _audit_cert_names_report "$live" "Сайт ${d}"
+  elif [[ -n "$d" ]]; then
+    _audit_info "Сертификат сайта ${d} не найден — сравниваем зонды между собой (эталон: первый ответ)"
+  else
+    _audit_info "Сайта-маскировки нет — сравниваем зонды между собой (эталон: первый ответ)"
+  fi
+  local rnd
+  rnd="www.$(od -An -N5 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n').com"
+  local -a labels=() res=()
+  local r
+  if [[ -n "$d" ]]; then labels+=("SNI = ${d}"); res+=("$(_audit_tls_fp "$pub" 443 "$d")"); fi
+  labels+=("без SNI"); res+=("$(_audit_tls_fp "$pub" 443 "")")
+  labels+=("случайный SNI ${rnd}"); res+=("$(_audit_tls_fp "$pub" 443 "$rnd")")
+  labels+=("чужой SNI www.google.com"); res+=("$(_audit_tls_fp "$pub" 443 "www.google.com")")
+  labels+=("только TLS 1.2"); res+=("$(_audit_tls_fp "$pub" 443 "${d:-$rnd}" -tls1_2)")
+  local i fp first="" same=0 diff=0 inconcl=0
+  for i in "${!labels[@]}"; do
+    r="${res[i]}"
+    if [[ "$r" == OK\|* ]]; then
+      fp="$(cut -d'|' -f2 <<<"$r")"
+      [[ -z "$first" ]] && first="$fp"
+      local want_fp="${ref:-$first}"
+      if [[ "$fp" == "$want_fp" ]]; then
+        same=$((same + 1))
+        _audit_ok "${labels[i]}: тот же сертификат (${fp}) · ALPN $(cut -d'|' -f5 <<<"$r") · $(cut -d'|' -f6 <<<"$r")"
+      else
+        diff=$((diff + 1))
+        _audit_warn "${labels[i]}: ДРУГОЙ сертификат (${fp}, $(cut -d'|' -f3 <<<"$r" | cut -c1-60)) — зонд видит не ${ref_label:-тот же сайт}"
+      fi
+    else
+      case "${r#ERR|}" in
+        timeout) inconcl=$((inconcl + 1)); _audit_info "${labels[i]}: таймаут (hairpin на свой IP у части хостеров не работает — не вывод)" ;;
+        *) diff=$((diff + 1)); _audit_warn "${labels[i]}: ошибка «${r#ERR|}» — у обычного сайта handshake проходит" ;;
+      esac
+    fi
+  done
+  # HTTP без TLS на 443
+  local h
+  h="$(_audit_http_status "http://${pub}:443/")"
+  case "$h" in
+    ERR\ timeout) _audit_info "HTTP без TLS на :443 — таймаут (не вывод)" ;;
+    ERR*) _audit_warn "HTTP без TLS на :443 → ${h} — nginx на этот случай отвечает 400/301; обрыв выделяется" ;;
+    *) _audit_ok "HTTP без TLS на :443 → ${h} (как у обычного nginx)" ;;
+  esac
+  # >16 КБ через тот же путь (реальный размер ответа)
+  if [[ -n "$d" ]]; then
+    local big="" sz got
+    big="$(_gs_site_big_asset 2>/dev/null || true)"
+    if [[ -n "$big" ]]; then
+      sz="$(stat -c %s "${SITE_ROOT}${big}" 2>/dev/null || echo 0)"
+      got="$(curl -sk --compressed --connect-timeout 5 --max-time 15 --resolve "${d}:443:${pub}" -o /dev/null -w '%{size_download}' "https://${d}${big}" 2>/dev/null || true)"
+      if [[ "${got:-0}" -gt 16384 ]]; then
+        _audit_ok "Ответ > 16 КБ (${big}, ${got} байт) отдаётся через 443 целиком (с самой ноды; из РФ — gorecshit --dpi-check)"
+      else
+        _audit_info "Большой файл ${big} (${sz} байт) через 443 с ноды: получено ${got:-0} байт (hairpin/таймаут — не вывод)"
+      fi
+    else
+      _audit_info "На сайте нет файла > 64 КБ (нужен для теста заморозки 16 КБ) — обновите сайт: sudo gorecshit --site-refresh"
+    fi
+  fi
+  if [[ "$diff" -eq 0 && "$same" -gt 0 ]]; then
+    _audit_ok "Итог: ${same} зонд(ов) получили один и тот же ответ — по активному зондированию нода неотличима от сайта"
+  elif [[ "$diff" -gt 0 ]]; then
+    _audit_warn "Итог: ${diff} зонд(ов) увидели другое — это признак для ТСПУ. Self-steal (меню 10) + target на свой сайт"
+  fi
+  return 0
+}
+
+_audit_fp_deviation() {
+  step "Отпечаток TCP/IP (отклонения от обычного Linux-сервера)"
+  local v
+  v="$(sysctl -n net.ipv4.ip_default_ttl 2>/dev/null || echo 64)"
+  if [[ "$v" == "64" ]]; then _audit_ok "TTL=64 (обычный Linux)"; else _audit_warn "TTL=${v} — у Linux 64; нестандартный TTL выделяет сервер (sysctl net.ipv4.ip_default_ttl=64)"; fi
+  v="$(sysctl -n net.ipv4.tcp_timestamps 2>/dev/null || echo 1)"
+  if [[ "$v" == "0" ]]; then
+    _audit_warn "tcp_timestamps=0 — почти все Linux-серверы шлют timestamps; отключение само по себе выделяет (JA4T)"
+    if [[ -f /etc/sysctl.d/99-gorecshit-tcp-timestamps.conf ]]; then
+      _audit_info "Это поставил старый флаг --tcp-timestamps-off. Вернуть: sudo gorecshit --stealth (меню 9 предложит)"
+    fi
+  else
+    _audit_ok "tcp_timestamps=${v}"
+  fi
+  v="$(sysctl -n net.ipv4.tcp_sack 2>/dev/null || echo 1)"
+  [[ "$v" == "1" ]] && _audit_ok "tcp_sack=1" || _audit_warn "tcp_sack=${v} — нестандартно (верните 1)"
+  v="$(sysctl -n net.ipv4.tcp_window_scaling 2>/dev/null || echo 1)"
+  [[ "$v" == "1" ]] && _audit_ok "tcp_window_scaling=1" || _audit_warn "tcp_window_scaling=${v} — нестандартно (верните 1)"
+  v="$(sysctl -n net.ipv4.tcp_ecn 2>/dev/null || echo 2)"
+  [[ "$v" == "2" || "$v" == "0" ]] && _audit_ok "tcp_ecn=${v}" || _audit_info "tcp_ecn=${v} — у большинства серверов 2"
+  if iptables -t mangle -S 2>/dev/null | grep -q 'TCPMSS'; then
+    _audit_info "Есть правила TCPMSS — MSS отличается от обычного (меняйте только при проблемах с MTU)"
+  fi
+  return 0
+}
+
+_audit_antiprobe_vs_probes() {
+  local f=/usr/local/sbin/gorecshit-anti-probe.sh lim
+  [[ -f "$f" ]] || return 0
+  lim="$(grep -oE 'hashlimit-above [0-9]+/min' "$f" 2>/dev/null | head -1 | grep -oE '[0-9]+' || true)"
+  if [[ -n "$lim" && "$lim" -lt 60 ]]; then
+    _audit_warn "Anti-probe режет новые подключения уже после ${lim}/мин — одиночный зонд может получить DROP вместо сайта (это признак). Обновите: меню 1"
+  elif [[ -n "$lim" ]]; then
+    _audit_ok "Anti-probe: лимит ${lim} новых/мин с IP — одиночные зонды получают сайт, а не DROP"
+  fi
+  return 0
+}
+
+_audit_public_words() {
+  # говорящие пути/имена в публичных веб-конфигах хоста (не в нашем сайте)
+  local f hits
+  for f in /etc/nginx/conf.d/*.conf /etc/nginx/sites-enabled/* /etc/caddy/Caddyfile; do
+    [[ -f "$f" ]] || continue
+    [[ "$f" == "$SITE_NGINX_CONF" ]] && continue
+    hits="$(grep -hoE '^[[:space:]]*(location|handle|handle_path|reverse_proxy|route)[[:space:]]+[^{]*' "$f" 2>/dev/null | LC_ALL=C grep -iE "$GS_SUSPECT_PATH_RE" | sed -E 's/^[[:space:]]+//' | head -3 | paste -sd';' - || true)"
+    [[ -n "$hits" ]] && _audit_warn "${f}: говорящие пути «${hits}» — видны через CDN/зонды; переименуйте (и в Hosts панели)"
+  done
+  return 0
+}
+
+_audit_cdn_chain() {
+  # nginx в Docker (remnawave-nginx и подобные): имена/сертификат/пути/«/» — read-only
+  command -v docker >/dev/null 2>&1 || return 0
+  local -a cs=()
+  mapfile -t cs < <(docker ps --format '{{.Names}} {{.Image}}' 2>/dev/null | awk 'tolower($2) ~ /nginx|caddy|angie|openresty/ {print $1}' || true)
+  [[ ${#cs[@]} -gt 0 ]] || return 0
+  step "Веб-сервер в Docker (CDN/xhttp-цепочка): имена, сертификат, пути"
+  local c conf names certs paths n ip a pub="${AUDIT_PUB_IP:-}" tmp
+  tmp="$(mktemp)"
+  for c in "${cs[@]}"; do
+    conf="$(timeout 10 docker exec "$c" nginx -T 2>/dev/null || true)"
+    if [[ -z "$conf" ]]; then
+      _audit_info "${c}: nginx -T недоступен (не nginx или нет прав) — пропуск"
+      continue
+    fi
+    names="$(grep -E '^[[:space:]]*server_name[[:space:]]' <<<"$conf" | sed -E 's/^[[:space:]]*server_name[[:space:]]+//; s/;.*//' | tr ' ' '\n' | grep -vE '^(_|localhost|)$' | sort -u | paste -sd' ' - || true)"
+    certs="$(grep -E '^[[:space:]]*ssl_certificate[[:space:]]' <<<"$conf" | awk '{print $2}' | tr -d ';' | sort -u || true)"
+    paths="$(grep -E '^[[:space:]]*location[[:space:]]' <<<"$conf" | sed -E 's/^[[:space:]]*location[[:space:]]+//; s/[[:space:]]*\{.*//' | sort -u | paste -sd' ' - || true)"
+    _audit_info "${c}: server_name: ${names:-—}"
+    for n in $names; do
+      [[ "$n" == \** ]] && continue
+      a="$(_site_resolve A "$n" 2>/dev/null | paste -sd' ' - || true)"
+      if [[ -z "$a" ]]; then
+        _audit_err "${c}: ${n} нет в DNS — если это origin для CDN, CDN не достучится; Let's Encrypt не продлит сертификат"
+      elif [[ -n "$pub" && " $a " == *" $pub "* ]]; then
+        _audit_ok "${c}: ${n} → ${pub}"
+      else
+        for ip in $a; do _site_ip_is_cloudflare "$ip" && a="${a} (Cloudflare)"; done
+        _audit_warn "${c}: ${n} → ${a} (не этот IP ${pub:-?})"
+      fi
+      LC_ALL=C grep -qiE "$SITE_DOMAIN_FORBIDDEN_RE" <<<"$n" && _audit_warn "${c}: имя ${n} содержит vpn/proxy/… — видно в SNI и в CT-логах"
+    done
+    local cf
+    for cf in $certs; do
+      if timeout 6 docker exec "$c" cat "$cf" >"$tmp" 2>/dev/null && [[ -s "$tmp" ]]; then
+        local end
+        end="$(openssl x509 -enddate -noout -in "$tmp" 2>/dev/null | cut -d= -f2 || true)"
+        if [[ -z "$end" ]]; then
+          _audit_info "${c}: ${cf} не читается как PEM-сертификат — пропуск"
+          continue
+        fi
+        if ! openssl x509 -checkend $(( 14 * 86400 )) -noout -in "$tmp" >/dev/null 2>&1; then
+          _audit_err "${c}: сертификат ${cf} истекает/истёк (${end})"
+        else
+          _audit_ok "${c}: сертификат ${cf} до ${end}"
+        fi
+        _audit_cert_names_report "$tmp" "${c}"
+        local nn sans
+        sans="$(openssl x509 -noout -text -in "$tmp" 2>/dev/null | grep -oE 'DNS:[^, ]+' | sed 's/DNS://' | paste -sd' ' - || true)"
+        for nn in $names; do
+          [[ " $sans " == *" $nn "* || " $sans " == *" *.${nn#*.} "* ]] || _audit_warn "${c}: имя ${nn} есть в server_name, но не в сертификате ${cf} — CDN/клиент получат ошибку сертификата"
+        done
+      fi
+    done
+    if [[ -n "$paths" ]]; then
+      local p bad=""
+      for p in $paths; do
+        LC_ALL=C grep -qiE "$GS_SUSPECT_PATH_RE" <<<"$p" && bad="${bad} ${p}"
+      done
+      if [[ -n "$bad" ]]; then
+        _audit_warn "${c}: говорящие пути:${bad} — переименуйте в нейтральные (например /api/v2/<random>) в nginx, inbound и Hosts"
+      else
+        _audit_ok "${c}: пути нейтральные (${paths})"
+      fi
+    fi
+    # что видно на «/» по первому имени
+    local first="${names%% *}" code
+    if [[ -n "$first" ]]; then
+      code="$(curl -sk -o /dev/null -w '%{http_code} %{size_download}' --connect-timeout 4 --max-time 8 --resolve "${first}:443:127.0.0.1" "https://${first}/" 2>/dev/null || true)"
+      case "$code" in
+        200\ *) _audit_ok "${c}: https://${first}/ → ${code% *} (${code#* } байт) — на «/» есть страница" ;;
+        "") _audit_info "${c}: https://${first}/ локально не ответил" ;;
+        *) _audit_warn "${c}: https://${first}/ → ${code% *} — на «/» нет сайта (пустой 404 у «сайта» подозрителен); положите статический сайт в root" ;;
+      esac
+    fi
+  done
+  rm -f "$tmp"
+  return 0
+}
+
+_audit_volume() {
+  step "Объём трафика и подключения на IP"
+  local iface rx tx up days gbd n443 nips
+  iface="$(ip -o route show default 2>/dev/null | awk '{print $5; exit}' || true)"
+  [[ -n "$iface" ]] || { _audit_info "Нет default route — пропуск"; return 0; }
+  rx="$(cat "/sys/class/net/${iface}/statistics/rx_bytes" 2>/dev/null || echo 0)"
+  tx="$(cat "/sys/class/net/${iface}/statistics/tx_bytes" 2>/dev/null || echo 0)"
+  up="$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0)"
+  if [[ "${up:-0}" -gt 3600 ]]; then
+    days=$(( up / 86400 )); [[ "$days" -ge 1 ]] || days=1
+    gbd=$(( (rx + tx) / 1048576 * 86400 / up / 1024 ))
+    _audit_info "${iface}: ~${gbd} ГБ/сутки (rx+tx с загрузки, аптайм ${days} дн.)"
+    if [[ "$gbd" -gt 1500 ]]; then
+      _audit_warn "Очень много трафика для «сайта» на одном IP (${gbd} ГБ/сут) — разнесите пользователей по нодам/IP"
+    fi
+  fi
+  n443="$(ss -Htn state established '( sport = :443 )' 2>/dev/null | wc -l | tr -d ' ' || echo 0)"
+  nips="$(ss -Htn state established '( sport = :443 )' 2>/dev/null | awk '{print $4}' | sed -E 's/:[0-9]+$//; s/^\[//; s/\]$//; s/^::ffff://' | sort -u | wc -l | tr -d ' ' || echo 0)"
+  _audit_info "Сейчас на :443 ${n443} соединений с ${nips} IP"
+  if [[ "${nips:-0}" -gt 0 && $(( n443 / nips )) -gt 40 ]]; then
+    _audit_info "В среднем >40 TLS-сессий на клиента — много параллельных сессий к одному SNI нетипично для браузера (mux в клиенте снижает число)"
+  fi
+  return 0
+}
+
+_audit_conn_load() {
+  # нагрузка на IP ноды: established-соединения и уникальные клиентские IP на портах Xray (read-only, ss)
+  # пороги: --conn-warn IPS[:CONNS] или GORECSHIT_CONN_WARN (по умолчанию 150 IP / 3000 соединений)
+  step "Нагрузка на IP ноды: пользователи и соединения"
+  local ib_ports="${AUDIT_IB_PORTS:-}" expr="" p rows nconn nips top tip tcnt warn_ips warn_conns
+  if [[ -z "${CONN_WARN_SET:-}" && "${GORECSHIT_CONN_WARN:-}" =~ ^[0-9]+(:[0-9]+)?$ ]]; then
+    CONN_WARN_IPS="${GORECSHIT_CONN_WARN%%:*}"
+    [[ "$GORECSHIT_CONN_WARN" == *:* ]] && CONN_WARN_CONNS="${GORECSHIT_CONN_WARN##*:}"
+  fi
+  warn_ips="${CONN_WARN_IPS:-150}"; warn_conns="${CONN_WARN_CONNS:-3000}"
+  [[ -n "$ib_ports" ]] || ib_ports="443"
+  command -v ss >/dev/null 2>&1 || { _audit_info "ss не найден — пропуск"; return 0; }
+  for p in ${ib_ports//,/ }; do
+    [[ "$p" =~ ^[0-9]+$ ]] || continue
+    expr="${expr:+${expr} or }sport = :${p}"
+  done
+  [[ -n "$expr" ]] || return 0
+  rows="$(ss -Htn state established "( ${expr} )" 2>/dev/null | awk '{print $4}' \
+          | sed -E 's/:[0-9]+$//; s/^\[//; s/\]$//; s/^::ffff://' || true)"
+  if [[ -z "$rows" ]]; then
+    _audit_info "Порты ${ib_ports}: сейчас нет установленных соединений"
+    return 0
+  fi
+  nconn="$(grep -c . <<<"$rows" || true)"
+  nips="$(sort -u <<<"$rows" | grep -c . || true)"
+  _audit_info "Порты ${ib_ports}: ${nconn} соединений с ${nips} уникальных IP (пороги: ${warn_ips} IP / ${warn_conns} соединений)"
+  if [[ "${nips:-0}" -gt "$warn_ips" || "${nconn:-0}" -gt "$warn_conns" ]]; then
+    _audit_warn "На одном IP слишком много пользователей/соединений для «обычного сайта» — такой IP заметен по статистике (много абонентов → один хостерский IP, долгие сессии). Поднять порог: --conn-warn IPS[:CONNS]"
+    echo "     Как разгрузить: вторая нода/IP у другого хостера и часть пользователей туда (отдельный Internal Squad в панели);"
+    echo "     лимит устройств (HWID) на пользователя; mux в клиентах (меньше параллельных сессий); РФ-вход (relay) перед нодой;"
+    echo "     ориентир — до 100–150 активных пользователей на один IP"
+  else
+    _audit_ok "Нагрузка на IP в пределах порога"
+  fi
+  top="$(sort <<<"$rows" | uniq -c | sort -rn | head -3 || true)"
+  read -r tcnt tip <<<"$(head -1 <<<"$top")"
+  if [[ "${tcnt:-0}" -gt 200 ]]; then
+    _audit_warn "Один клиентский IP держит ${tcnt} соединений — похоже на раздачу ключа (NAT/общий доступ) или клиент без mux; IP не печатаю"
+  fi
+  if _gs_is_private_ip "${tip:-}"; then
+    _audit_info "Самые активные адреса — приватные (relay/балансировщик/CDN перед нодой): число «пользователей» занижено"
+  fi
+  return 0
+}
+
+_sub_extract_hosts() {
+  # stdin — тело подписки; stdout — «host|sni|scheme» по одной ссылке (base64/plain links, Clash YAML, sing-box/xray JSON)
+  local py=""
+  IFS= read -r -d '' py <<'PY' || true
+import sys, base64, re, json, urllib.parse
+raw = sys.stdin.buffer.read().decode('utf-8', 'replace').strip()
+def b64(s):
+    s = re.sub(r'\s+', '', s)
+    s += '=' * (-len(s) % 4)
+    for f in (base64.b64decode, base64.urlsafe_b64decode):
+        try:
+            return f(s).decode('utf-8', 'replace')
+        except Exception:
+            pass
+    return None
+text = raw
+if '://' not in raw and not raw.lstrip().startswith(('{', '[', 'proxies', 'port', 'mixed-port')):
+    d = b64(raw)
+    if d:
+        text = d
+out = set()
+for line in text.splitlines():
+    line = line.strip()
+    m = re.match(r'^([a-z0-9]+)://(.+)$', line, re.I)
+    if not m:
+        continue
+    sch, rest = m.group(1).lower(), m.group(2)
+    host = sni = ''
+    if sch == 'vmess':
+        d = b64(rest.split('#')[0])
+        try:
+            j = json.loads(d or '')
+            host = str(j.get('add', '')); sni = str(j.get('sni') or j.get('host') or '')
+        except Exception:
+            continue
+    else:
+        if sch == 'ss' and '@' not in rest.split('#')[0]:
+            d = b64(rest.split('#')[0])
+            if d and '@' in d:
+                rest = d
+        try:
+            u = urllib.parse.urlsplit(sch + '://' + rest)
+            host = u.hostname or ''
+            q = urllib.parse.parse_qs(u.query)
+            sni = (q.get('sni') or q.get('peer') or q.get('host') or [''])[0]
+        except Exception:
+            continue
+    if host:
+        out.add('%s|%s|%s' % (host, sni, sch))
+if not out:
+    for k in re.findall(r'(?:"server"|"address"|\bserver)\s*:\s*"?([A-Za-z0-9.:\[\]-]+)"?', text):
+        out.add('%s||cfg' % k.strip('[]'))
+for o in sorted(out):
+    print(o)
+PY
+  python3 -c "$py" 2>/dev/null
+}
+
+run_sub_check() {
+  # --sub-check URL (или GORECSHIT_SUB_URL): не светится ли «голый» IP ноды в ссылках подписки (read-only)
+  local url="${SUB_CHECK_URL:-${GORECSHIT_SUB_URL:-}}" body hosts h sni sch pub4 pub6 bad=0 rawip=0 n=0 cls
+  step "Подписка: не светится ли IP ноды вместо домена"
+  if [[ -z "$url" ]]; then
+    _audit_info "Ссылка подписки не задана (--sub-check URL или GORECSHIT_SUB_URL) — пропуск"
+    return 0
+  fi
+  [[ "$url" =~ ^https?:// ]] || { _audit_err "Нужна ссылка вида https://…"; return 1; }
+  command -v python3 >/dev/null 2>&1 || { _audit_warn "python3 не найден — разбор подписки невозможен"; return 0; }
+  # URL с токеном подписки не кладём в argv (ps) и не печатаем — только хост
+  body="$(printf 'url = "%s"\n' "$url" | curl -sS -L --max-time 20 -A 'v2rayN/7.0' -K - 2>/dev/null || true)"
+  if [[ -z "$body" ]]; then
+    _audit_warn "Подписка не скачалась (хост $(sed -E 's#^https?://([^/@]*@)?([^/:?]+).*#\2#' <<<"$url"))"
+    return 0
+  fi
+  hosts="$(_sub_extract_hosts <<<"$body" || true)"
+  if [[ -z "$hosts" ]]; then
+    _audit_warn "В ответе нет ссылок (vless/vmess/trojan/ss/hy2) — проверьте, что это ссылка подписки"
+    return 0
+  fi
+  pub4="$(_audit_detect_public_ipv4 2>/dev/null || true)"
+  pub6="$(_audit_detect_public_ipv6 2>/dev/null || true)"
+  while IFS='|' read -r h sni sch; do
+    [[ -n "$h" ]] || continue
+    n=$((n+1))
+    if [[ -n "$pub4" && "$h" == "$pub4" ]] || [[ -n "$pub6" && "${h,,}" == "${pub6,,}" ]]; then
+      bad=$((bad+1))
+      _audit_err "${sch}: адрес сервера — «голый» IP ЭТОЙ ноды (${h}). IP из подписки уходит в базы и блок-листы целиком; ставьте домен/поддомен ноды"
+    elif [[ "$h" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ || "$h" == *:*:* ]]; then
+      rawip=$((rawip+1))
+      _audit_warn "${sch}: адрес сервера — IP ${h} (другая нода?) — лучше домен"
+    fi
+    if [[ -n "$sni" ]]; then
+      cls="$(_audit_sni_classify "$sni" "" 2>/dev/null || true)"
+      case "$cls" in
+        brand) _audit_warn "${sch} ${h}: SNI ${sni} — чужой крупный бренд (SNI ≠ сеть хостера)" ;;
+        words) _audit_warn "${sch} ${h}: SNI ${sni} содержит vpn/proxy-слово" ;;
+      esac
+    fi
+  done <<<"$hosts"
+  if [[ "$bad" -eq 0 && "$rawip" -eq 0 ]]; then
+    _audit_ok "Подписка: ссылок ${n}, IP этой ноды не светится (везде домены)"
+  else
+    _audit_info "Подписка: ссылок ${n}, с IP этой ноды: ${bad}, с другими IP: ${rawip}"
+  fi
+  [[ "$bad" -eq 0 ]]
+}
+
+_audit_nodeport_scope() {
+  local np line
+  np="$(_audit_node_port)"
+  line="$(ss -Hltn "( sport = :${np} )" 2>/dev/null | awk '{print $4}' | head -1 || true)"
+  [[ -n "$line" ]] || return 0
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qiE 'Status:\s*active'; then
+    if ufw status 2>/dev/null | grep -E "^${np}(/tcp)?[[:space:]]" | grep -qiE 'Anywhere'; then
+      _audit_err "Порт ноды ${np} открыт в UFW для всех (Anywhere) — должен быть только с IP панели (меню 1)"
+    else
+      _audit_ok "Порт ноды ${np} (слушает ${line}) в UFW не открыт для всех"
+    fi
+  fi
+  return 0
+}
+
+_gs_registry_write() {
+  # /var/lib/gorecshit/node.env — реестр «нода → домен → SNI → target» (только файл, без сети)
+  [[ "$(id -u)" -eq 0 && "${DRY_RUN:-0}" -eq 0 ]] || return 0
+  mkdir -p "$GS_STATE_DIR" 2>/dev/null || return 0
+  local sd=""
+  [[ -f "$SITE_STATE_FILE" ]] && sd="$(sed -n 's/^SITE_DOMAIN=//p' "$SITE_STATE_FILE" | head -1)"
+  {
+    echo "# Managed by ${SCRIPT_NAME} ${VERSION} — реестр ноды (перезаписывается при --audit/--selfcheck)"
+    echo "UPDATED=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "GORECSHIT_VERSION=${VERSION}"
+    echo "PUBLIC_IP=${AUDIT_PUB_IP:-}"
+    echo "COUNTRY=${AUDIT_PUB_CC:-}"
+    echo "HOSTNAME=$(hostname 2>/dev/null || true)"
+    echo "SITE_DOMAIN=${sd}"
+    echo "REALITY_SNI=${AUDIT_REG_SNI:-}"
+    echo "REALITY_TARGET=${AUDIT_REG_DEST:-}"
+    echo "CLIENT_PORTS=${AUDIT_REG_PORTS:-}"
+    echo "SNI_PROBLEM=${AUDIT_SNI_BAD:-0}"
+  } >"${GS_REGISTRY_FILE}.tmp" 2>/dev/null && mv -f "${GS_REGISTRY_FILE}.tmp" "$GS_REGISTRY_FILE" 2>/dev/null || true
+  chmod 600 "$GS_REGISTRY_FILE" 2>/dev/null || true
+  return 0
+}
+
+_audit_v290_extras() {
+  echo
+  _audit_tspu_probe
+  echo
+  _audit_fp_deviation
+  _audit_antiprobe_vs_probes
+  _audit_nodeport_scope
+  _audit_public_words
+  echo
+  _audit_cdn_chain
+  echo
+  _audit_volume
+  _audit_conn_load
+  if [[ -n "${SUB_CHECK_URL:-${GORECSHIT_SUB_URL:-}}" ]]; then echo; run_sub_check || true; fi
+  _audit_client_fp_advice
+  _gs_registry_write
+  return 0
+}
+
+# ---------- v2.9.0: сайт — большой файл, новости по таймеру, нейтральные имена ----------
+
+_gs_site_big_asset() {
+  # путь (от корня сайта) файла > 64 КБ — для теста заморозки 16 КБ; пусто — нет
+  local root="${SITE_ROOT:-}" f
+  [[ -n "$root" && -d "$root" ]] || return 1
+  if [[ -s "${root}/assets/img/cover.svg" ]]; then echo "/assets/img/cover.svg"; return 0; fi
+  f="$(find "$root" -type f -size +64k -printf '%P\n' 2>/dev/null | head -1 || true)"
+  [[ -n "$f" ]] || return 1
+  echo "/${f}"
+}
+
+_site_write_cover() {
+  # _site_write_cover OUT — детерминированная SVG-иллюстрация 120–260 КБ (реальный «тяжёлый» ресурс сайта)
+  local out="$1" seed="${SITE_RNG:-1}" accent="${2:-#3456a3}"
+  mkdir -p "$out/assets/img"
+  awk -v seed="$seed" -v accent="$accent" 'BEGIN{
+    srand(seed % 2147483647);
+    n = 1400 + int(rand()*1200);
+    printf "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 1200 520\" width=\"1200\" height=\"520\">\n";
+    printf "<rect width=\"1200\" height=\"520\" fill=\"#f4f2ee\"/>\n<g fill-opacity=\".55\">\n";
+    for (i=0;i<n;i++){
+      x=rand()*1200; y=rand()*520; r=2+rand()*26;
+      c=sprintf("#%02x%02x%02x", 60+int(rand()*170), 60+int(rand()*170), 60+int(rand()*170));
+      if (rand()<0.5) printf "<circle cx=\"%.2f\" cy=\"%.2f\" r=\"%.2f\" fill=\"%s\"/>\n", x, y, r, c;
+      else printf "<path d=\"M%.2f %.2fq%.2f %.2f %.2f %.2ft%.2f %.2fz\" fill=\"%s\"/>\n", x, y, rand()*60-30, rand()*60-30, rand()*80-40, rand()*80-40, rand()*70-35, rand()*70-35, c;
+    }
+    printf "</g>\n<rect x=\"0\" y=\"440\" width=\"1200\" height=\"80\" fill=\"%s\" fill-opacity=\".85\"/>\n</svg>\n", accent;
+  }' >"$out/assets/img/cover.svg"
+  # ссылка с главной (как обычная обложка), один раз
+  if [[ -f "$out/index.html" ]] && ! grep -q '/assets/img/cover.svg' "$out/index.html"; then
+    awk 'BEGIN{done=0} { if (!done && index($0,"</main>")>0) { sub("</main>", "<figure class=\"cover\"><img src=\"/assets/img/cover.svg\" alt=\"\" loading=\"lazy\" width=\"1200\" height=\"520\" style=\"width:100%;height:auto;display:block;margin:24px 0\"></figure></main>"); done=1 } print }' \
+      "$out/index.html" >"$out/index.html.tmp" && mv -f "$out/index.html.tmp" "$out/index.html"
+  fi
+  return 0
+}
+
+_site_suggest_domains() {
+  # 6 нейтральных примеров имён (без vpn/proxy) — для подсказки
+  local -a w=(atelier masterskaya lavka studio-dom foto-ugol kofeinya pekarnya-na-uglu velomaster buhgalter-plus cvetochnaya mebel-ruchnoi tur-zametki perevod-tochno arhbyuro yazyk-klub sad-i-dom remont-ruk knizhnaya-polka)
+  local -a z=(ru su com net online site store pro)
+  local i a b n
+  for i in 1 2 3 4 5 6; do
+    a="${w[RANDOM % ${#w[@]}]}"; b="${z[RANDOM % ${#z[@]}]}"; n=$(( RANDOM % 90 + 10 ))
+    if (( RANDOM % 2 )); then printf '  www.%s.%s\n' "$a" "$b"; else printf '  www.%s%s.%s\n' "$a" "$n" "$b"; fi
+  done
+}
+
+_site_domain_blocked() {
+  # rc 0 — домен с vpn/proxy/… и без --site-allow-vpn-word
+  [[ "${SITE_ALLOW_VPN_WORD:-0}" -eq 1 ]] && return 1
+  # уже установленный сайт не ломаем (только предупреждение) — блок для новых доменов
+  [[ -n "${SITE_STATE_DOMAIN:-}" && "${SITE_STATE_DOMAIN,,}" == "${SITE_DOMAIN,,}" ]] && return 1
+  LC_ALL=C grep -qiE "$SITE_DOMAIN_FORBIDDEN_RE" <<<"${SITE_DOMAIN:-}"
+}
+
+_site_domain_block_msg() {
+  local w
+  w="$(LC_ALL=C grep -oiE "$SITE_DOMAIN_FORBIDDEN_RE" <<<"$SITE_DOMAIN" | head -1 || true)"
+  err "Домен ${SITE_DOMAIN} содержит «${w}». SNI и имя в сертификате DPI видит открытым текстом, а сертификат попадает в публичные CT-логи — такое имя само выдаёт ноду."
+  local base
+  base="$(awk -F. '{ if (NF >= 2) print $(NF-1) "." $NF; else print $0 }' <<<"$SITE_DOMAIN")"
+  if LC_ALL=C grep -qiE "$SITE_DOMAIN_FORBIDDEN_RE" <<<"$base"; then
+    echo "  Поддомен не поможет: слово сидит в базовом домене ${base}. Нужен отдельный нейтральный домен, например:"
+    _site_suggest_domains
+  else
+    echo "  Слово только в поддомене — достаточно нейтрального поддомена того же домена: shop.${base}, info.${base}, www.${base}"
+  fi
+  echo "  Осознанно оставить имя: добавьте флаг --site-allow-vpn-word"
+}
+
+_site_news_templates() {
+  # строки «slug|title|lead|p1|p2» для новостей (общие для любого малого бизнеса); %S — услуга, %M — месяц
+  cat <<'NT'
+grafik-%Y-%m|График работы на %M|Рассказываем, как работаем в %M, чтобы вы могли заранее спланировать визит.|В %M работаем в обычном режиме, кроме праздничных дней — их отметили в разделе «Контакты».|Если удобнее другое время, напишите нам: постараемся подобрать окно вне графика.
+okna-%Y-%m|Свободные окна на %M|Открыли запись на %M — пока есть свободные даты.|Записаться можно по телефону или почте, указанным в контактах. Подтверждаем в течение рабочего дня.|Если планируете крупный заказ, лучше написать заранее — так мы спокойно всё подготовим.
+usluga-%Y-%m|%S: что нового|Немного обновили формат услуги «%S» по отзывам клиентов.|Сделали процесс короче и понятнее: меньше согласований, больше времени на сам результат.|Цены остались прежними, подробности — в разделе с услугами.
+itogi-%Y-%m|Итоги месяца: %M|Короткий отчёт о том, что успели сделать за %M.|Закрыли все заказы в срок, обновили часть оборудования и немного навели порядок на сайте.|Спасибо всем, кто доверяет нам свои задачи — это лучшая мотивация.
+sovet-%Y-%m|Совет месяца|Небольшая подсказка, которая экономит время и нервы.|Перед обращением соберите все исходные данные в одном месте — так мы быстрее поймём задачу и точнее назовём сроки.|Не стесняйтесь задавать вопросы: лучше уточнить заранее, чем переделывать потом.
+NT
+}
+
+_site_awk_page() {
+  # _site_awk_page TEMPLATE404 OUT TITLE DESC BODYFILE — страница по каркасу 404.html (шапка/подвал сайта)
+  local tpl="$1" out="$2" title="$3" desc="$4" body="$5"
+  awk -v t="$title" -v d="$desc" -v bf="$body" '
+    function repl(s, a, b,   i, r) { r=""; while ((i=index(s,a))>0) { r=r substr(s,1,i-1) b; s=substr(s,i+length(a)) } return r s }
+    BEGIN { skip=0 }
+    /<article/ && !done { while ((getline l < bf) > 0) print l; close(bf); skip=1; done=1; next }
+    skip { if (index($0,"</article>")>0) skip=0; next }
+    { $0=repl($0, "content=\"Страница не найдена.\"", "content=\"" d "\""); $0=repl($0, "Страница не найдена", t); print }
+  ' "$tpl" >"$out"
+}
+
+site_refresh_content() {
+  # Новости на сайте по мере течения времени (детерминированно: тот же день → тот же сайт). Без nginx/сети.
+  step "Обновление контента сайта-маскировки"
+  SITE_DOMAIN=""
+  if ! _site_load_state || [[ -z "$SITE_DOMAIN" ]]; then
+    warn "Сайт-маскировка не установлена (меню 10) — обновлять нечего"
+    return 0
+  fi
+  local root="${SITE_ROOT:-/var/www/${SITE_DOMAIN}}"
+  if [[ ! -f "${root}/404.html" ]]; then
+    warn "Нет ${root}/404.html — пересоздайте сайт: sudo gorecshit --site-domain ${SITE_DOMAIN}"
+    return 1
+  fi
+  local anchor="${SITE_EPOCH:-}"
+  if [[ ! "$anchor" =~ ^[0-9]+$ ]]; then
+    anchor="$(stat -c %Y "$SITE_STATE_FILE" 2>/dev/null || date +%s)"
+  fi
+  local nd="${SITE_NEWS_DAYS:-9}"
+  [[ "$nd" =~ ^[0-9]+$ && "$nd" -ge 1 && "$nd" -le 60 ]] || nd=9
+  local now period=$(( nd * 86400 )) k kstart
+  now="$(date +%s)"
+  k=$(( (now - anchor) / period ))
+  [[ "$k" -ge 0 ]] || k=0
+  # на сайте — последние 24 новости (старые уходят, как в обычном архиве)
+  kstart=$(( k - 23 )); [[ "$kstart" -ge 1 ]] || kstart=1
+  _site_theme_data "${SITE_THEME:-it}" 2>/dev/null || true
+  local -a tpls=() serv=()
+  mapfile -t tpls < <(_site_news_templates)
+  local sv; for sv in "${SITE_T_SERV[@]}"; do serv+=("${sv%%|*}"); done
+  [[ ${#serv[@]} -gt 0 ]] || serv=("Консультация")
+  local -a months=(январе феврале марте апреле мае июне июле августе сентябре октябре ноябре декабре)
+  local -a months_n=(январь февраль март апрель май июнь июль август сентябрь октябрь ноябрь декабрь)
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    printf '%b[DRY]%b %s: новостей к сегодняшнему дню: %s (шаг %s дн. от %s)\n' "${C_YEL}" "${C_RESET}" "$root" "$(( k - kstart + 1 ))" "$nd" "$(date -d "@$anchor" +%F)"
+    return 0
+  fi
+  local tmp i e slug title lead p1 p2 tp mi s y m news_ul="" ti prev_ti=-1
+  local -a n_slug=() n_epoch=() n_title=() n_lead=()
+  tmp="$(mktemp -d)"
+  mkdir -p "${tmp}/news"
+  _site_seed_from "${SITE_DOMAIN}|news|${SITE_SEED:-}"
+  for (( i=1; i<kstart; i++ )); do _site_next; _site_next; done
+  for (( i=kstart; i<=k; i++ )); do
+    _site_next
+    e=$(( anchor + i * period - (SITE_RNG % (period < 100000 ? period / 2 : 50000)) ))
+    [[ "$e" -le "$now" ]] || continue
+    ti=$(( (SITE_RNG / 13) % ${#tpls[@]} ))
+    [[ "$ti" -eq "$prev_ti" ]] && ti=$(( (ti + 1) % ${#tpls[@]} ))
+    prev_ti="$ti"
+    tp="${tpls[ti]}"
+    _site_next
+    s="${serv[(SITE_RNG / 7) % ${#serv[@]}]}"
+    mi=$(( $(date -d "@$e" +%-m) - 1 )); y="$(date -d "@$e" +%Y)"; m="$(date -d "@$e" +%m)"
+    IFS='|' read -r slug title lead p1 p2 <<<"$tp"
+    slug="${slug//%Y/$y}"; slug="${slug//%m/$m}-${i}"
+    title="${title//%M/${months_n[mi]}}"; title="${title//%S/$s}"
+    lead="${lead//%M/${months[mi]}}"; lead="${lead//%S/$s}"
+    p1="${p1//%M/${months[mi]}}"; p1="${p1//%S/$s}"
+    p2="${p2//%M/${months[mi]}}"; p2="${p2//%S/$s}"
+    title="$(_site_html_esc "$title")"; lead="$(_site_html_esc "$lead")"
+    mkdir -p "${tmp}/news/${slug}"
+    {
+      echo "<article class=\"post\">"
+      echo "<p class=\"post-meta\"><a href=\"/news/\">Новости</a> · $(_site_ru_date "$e")</p>"
+      echo "<h1>${title}</h1>"
+      echo "<p class=\"lead\"><strong>${lead}</strong></p>"
+      echo "<p>$(_site_html_esc "$p1")</p>"
+      echo "<p>$(_site_html_esc "$p2")</p>"
+      echo "<p><a href=\"/news/\">← Все новости</a></p>"
+      echo "</article>"
+    } >"${tmp}/body"
+    _site_awk_page "${root}/404.html" "${tmp}/news/${slug}/index.html" "$title" "$lead" "${tmp}/body"
+    touch -d "@$e" "${tmp}/news/${slug}/index.html" 2>/dev/null || true
+    n_slug=("$slug" "${n_slug[@]}"); n_epoch=("$e" "${n_epoch[@]}"); n_title=("$title" "${n_title[@]}"); n_lead=("$lead" "${n_lead[@]}")
+    news_ul="<li><a href=\"/news/${slug}/\">${title}</a> <span class=\"post-meta\">· $(_site_ru_date "$e")</span></li>"$'\n'"${news_ul}"
+  done
+  if [[ ${#n_slug[@]} -gt 0 ]]; then
+    printf '<article class="page">\n<h1>Новости</h1>\n<ul class="news">\n%s</ul>\n<p class="post-meta"><a href="/rss.xml">RSS</a></p>\n</article>\n' "$news_ul" >"${tmp}/body"
+    _site_awk_page "${root}/404.html" "${tmp}/news/index.html" "Новости" "Новости и объявления" "${tmp}/body"
+    touch -d "@${n_epoch[0]}" "${tmp}/news/index.html" 2>/dev/null || true
+  fi
+  rm -f "${tmp}/body"
+  if [[ ${#n_slug[@]} -gt 0 ]] && site_forbidden_scan -r "${tmp}/news" >/dev/null 2>&1; then
+    err "В новостях нашлось запрещённое слово — не публикую"; rm -rf "$tmp"; return 1
+  fi
+  # публикация: news/ целиком + sitemap
+  rm -rf "${root}/news.new"
+  if [[ ${#n_slug[@]} -gt 0 ]]; then
+    mv "${tmp}/news" "${root}/news.new"
+    rm -rf "${root}/news"; mv "${root}/news.new" "${root}/news"
+  else
+    rm -rf "${root}/news"
+  fi
+  if [[ -f "${root}/sitemap.xml" ]]; then
+    { grep -v '/news/' "${root}/sitemap.xml" | grep -v '</urlset>' || true
+      if [[ ${#n_slug[@]} -gt 0 ]]; then
+        printf '  <url><loc>https://%s/news/</loc><lastmod>%s</lastmod></url>\n' "$SITE_DOMAIN" "$(date -d "@${n_epoch[0]}" +%Y-%m-%d)"
+        for i in "${!n_slug[@]}"; do
+          printf '  <url><loc>https://%s/news/%s/</loc><lastmod>%s</lastmod></url>\n' "$SITE_DOMAIN" "${n_slug[i]}" "$(date -d "@${n_epoch[i]}" +%Y-%m-%d)"
+        done
+      fi
+      echo '</urlset>'
+    } >"${root}/sitemap.xml.tmp" && mv -f "${root}/sitemap.xml.tmp" "${root}/sitemap.xml"
+    [[ ${#n_slug[@]} -gt 0 ]] && touch -d "@${n_epoch[0]}" "${root}/sitemap.xml" 2>/dev/null || true
+  fi
+  # RSS (v2.9.0 --site-alive): последние новости, даты публикации как у страниц
+  if [[ ${#n_slug[@]} -gt 0 ]]; then
+    local brand="${SITE_BRAND:-$SITE_DOMAIN}"
+    {
+      echo '<?xml version="1.0" encoding="UTF-8"?>'
+      echo '<rss version="2.0"><channel>'
+      printf '<title>%s — новости</title><link>https://%s/news/</link><description>Новости и объявления</description><language>ru</language>\n' "$(_site_html_esc "$brand")" "$SITE_DOMAIN"
+      printf '<lastBuildDate>%s</lastBuildDate>\n' "$(LC_ALL=C date -u -d "@${n_epoch[0]}" '+%a, %d %b %Y %H:%M:%S GMT')"
+      for i in "${!n_slug[@]}"; do
+        [[ "$i" -lt 15 ]] || break
+        printf '<item><title>%s</title><link>https://%s/news/%s/</link><guid>https://%s/news/%s/</guid><pubDate>%s</pubDate><description>%s</description></item>\n' \
+          "${n_title[i]}" "$SITE_DOMAIN" "${n_slug[i]}" "$SITE_DOMAIN" "${n_slug[i]}" \
+          "$(LC_ALL=C date -u -d "@${n_epoch[i]}" '+%a, %d %b %Y %H:%M:%S GMT')" "${n_lead[i]}"
+      done
+      echo '</channel></rss>'
+    } >"${root}/rss.xml.tmp" && mv -f "${root}/rss.xml.tmp" "${root}/rss.xml"
+    touch -d "@${n_epoch[0]}" "${root}/rss.xml" 2>/dev/null || true
+  else
+    rm -f "${root}/rss.xml"
+  fi
+  # тяжёлый ресурс для теста 16 КБ (старые сайты без него)
+  if [[ ! -s "${root}/assets/img/cover.svg" ]]; then
+    _site_seed_from "${SITE_DOMAIN}|cover|${SITE_SEED:-}"
+    _site_write_cover "$root"
+    touch -d "@${anchor}" "${root}/assets/img/cover.svg" 2>/dev/null || true
+    [[ -f "${root}/index.html" ]] && touch -d "@${anchor}" "${root}/index.html" 2>/dev/null || true
+  fi
+  chmod -R a+rX "$root" 2>/dev/null || true
+  rm -rf "$tmp"
+  ok "Сайт ${SITE_DOMAIN}: новостей ${#n_slug[@]} (по одной примерно раз в ${nd} дн.), sitemap и rss.xml обновлены; nginx не трогали"
+}
+
+site_autorefresh_set() {
+  # site_autorefresh_set on|off — systemd-таймер обновления контента (раз в сутки, случайный час)
+  local mode="$1" svc=/etc/systemd/system/gorecshit-site-refresh.service tmr=/etc/systemd/system/gorecshit-site-refresh.timer
+  if [[ "$(id -u)" -ne 0 && "$DRY_RUN" -eq 0 ]]; then err "Нужен root"; return 1; fi
+  if [[ "$mode" == "off" ]]; then
+    [[ "$DRY_RUN" -eq 1 ]] && { echo "[DRY] disable + remove $tmr"; return 0; }
+    systemctl disable --now gorecshit-site-refresh.timer >/dev/null 2>&1 || true
+    rm -f "$svc" "$tmr"; systemctl daemon-reload 2>/dev/null || true
+    ok "Автообновление сайта выключено"
+    return 0
+  fi
+  if [[ ! -f "$SITE_STATE_FILE" ]]; then err "Сайт-маскировка не установлена (меню 10)"; return 1; fi
+  [[ "$DRY_RUN" -eq 1 ]] && { echo "[DRY] write $svc + $tmr (daily, RandomizedDelaySec=8h)"; return 0; }
+  cat >"$svc" <<UNIT
+[Unit]
+Description=gorecshit: обновление контента сайта-маскировки (новости/sitemap, без nginx)
+
+[Service]
+Type=oneshot
+Nice=10
+ExecStart=/usr/local/sbin/gorecshit --site-refresh --yes
+UNIT
+  cat >"$tmr" <<'UNIT'
+[Unit]
+Description=gorecshit: ежедневное обновление контента сайта
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=8h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+  systemctl daemon-reload
+  systemctl enable --now gorecshit-site-refresh.timer >/dev/null 2>&1 || true
+  ok "Автообновление сайта включено (раз в сутки в случайное время). Выключить: sudo gorecshit --site-autorefresh off"
+}
+
+# ---------- v2.9.0: профиль «обычный сайт» (opt-in): ping отвечает, закрытые порты → RST ----------
+
+_web_profile_strip() {
+  # убрать наши блоки из before.rules/after.rules (идемпотентно)
+  local f
+  for f in /etc/ufw/before.rules /etc/ufw/after.rules; do
+    [[ -f "$f" ]] || continue
+    if grep -q '# gorecshit-web-begin' "$f"; then
+      sed -i '/# gorecshit-web-begin/,/# gorecshit-web-end/d' "$f"
+    fi
+  done
+}
+
+web_profile_set() {
+  # Профиль «обычный сайт» через сами правила UFW (переживает reload/перезагрузку; ufw disable убирает его целиком)
+  local mode="$1" bdir="" f
+  if [[ "$(id -u)" -ne 0 && "$DRY_RUN" -eq 0 ]]; then err "Нужен root"; return 1; fi
+  step "Профиль «обычный сайт» (${mode})"
+  if ! command -v ufw >/dev/null 2>&1 || [[ ! -f /etc/ufw/before.rules || ! -f /etc/ufw/after.rules ]]; then
+    err "Нет UFW (/etc/ufw/before.rules, after.rules) — профиль работает только поверх защиты из меню 1"; return 1
+  fi
+  if [[ "$mode" == "off" ]]; then
+    if ! grep -qs '# gorecshit-web-begin' /etc/ufw/before.rules /etc/ufw/after.rules; then
+      ok "Профиль и так выключен"; return 0
+    fi
+    [[ "$DRY_RUN" -eq 1 ]] && { echo "[DRY] убрать блоки gorecshit-web из before/after.rules + ufw reload"; return 0; }
+    _web_profile_strip
+    if ufw status 2>/dev/null | grep -qiE 'Status:\s*active'; then
+      _ensure_scanner_ipset >/dev/null 2>&1 || true
+      ufw --force reload >/dev/null 2>&1 || warn "ufw reload вернул ошибку"
+      _reapply_gorecshit_fw_scripts
+    fi
+    ok "Профиль выключен: снова «тишина» (ping и закрытые порты — DROP)"
+    return 0
+  fi
+  if ! ufw status 2>/dev/null | grep -qiE 'Status:\s*active'; then
+    err "UFW не активен — профиль не включаю (сначала меню 1)"; return 1
+  fi
+  if ! grep -qE '^DEFAULT_INPUT_POLICY="?DROP' /etc/default/ufw 2>/dev/null; then
+    err "Политика UFW по умолчанию не DROP — профиль не нужен/не включаю"; return 1
+  fi
+  echo "Что изменится (только IPv4):"
+  echo "  • ping отвечает (не чаще 5/с), как у обычного веб-сервера;"
+  echo "  • закрытые TCP-порты отвечают RST (не чаще 50/с), а не молчат."
+  echo "Разрешённые порты (SSH, клиентские, панель), сканер-блок и anti-probe не трогаются:"
+  echo "RST ставится в ufw-after-input — туда попадает только то, что UFW и так отбрасывал."
+  if [[ "${CLI_ASSUME_YES:-0}" -eq 0 ]] && _tty_usable && ! _tty_ask_yn "Включить профиль «обычный сайт»?"; then
+    log "Отменено"; return 0
+  fi
+  if [[ "$DRY_RUN" -eq 1 ]]; then echo "[DRY] before.rules: echo-request ACCEPT (limit); after.rules: REJECT tcp-reset (limit); ufw reload"; return 0; fi
+  bdir="${BACKUP_ROOT:-/root/hardening-backups}/web-profile-$(date +%Y%m%d-%H%M%S)"
+  mkdir -p "$bdir"
+  cp -a /etc/ufw/before.rules /etc/ufw/after.rules "$bdir/"
+  _web_profile_strip
+  local ins_b ins_a tmp
+  ins_b="# gorecshit-web-begin ${VERSION} (профиль «обычный сайт»: ping отвечает)"$'\n'
+  ins_b+="-A ufw-before-input -p icmp --icmp-type echo-request -m limit --limit 5/sec --limit-burst 10 -j ACCEPT"$'\n'
+  ins_b+="# gorecshit-web-end"
+  ins_a="# gorecshit-web-begin ${VERSION} (профиль «обычный сайт»: закрытые порты → RST)"$'\n'
+  ins_a+="-A ufw-after-input -p tcp -m conntrack --ctstate NEW -m limit --limit 50/sec --limit-burst 100 -j REJECT --reject-with tcp-reset"$'\n'
+  ins_a+="# gorecshit-web-end"
+  tmp="$(mktemp)"
+  if grep -q '# gorecshit-managed-end' /etc/ufw/before.rules; then
+    awk -v ins="$ins_b" '{print} /# gorecshit-managed-end/ && !d {print ins; d=1}' /etc/ufw/before.rules >"$tmp"
+  else
+    awk -v ins="$ins_b" '{print} /ufw-before-input -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT/ && !d {print ins; d=1}' /etc/ufw/before.rules >"$tmp"
+  fi
+  if ! grep -q 'gorecshit-web-begin' "$tmp"; then
+    rm -f "$tmp"; err "Не нашёл место в before.rules — ничего не меняю"; return 1
+  fi
+  cat "$tmp" >/etc/ufw/before.rules
+  # after.rules: перед первым COMMIT (таблица filter)
+  awk -v ins="$ins_a" '/^COMMIT/ && !d {print ins; d=1} {print}' /etc/ufw/after.rules >"$tmp"
+  if ! grep -q 'gorecshit-web-begin' "$tmp"; then
+    cp -a "$bdir/before.rules" /etc/ufw/before.rules; rm -f "$tmp"
+    err "Не нашёл COMMIT в after.rules — ничего не меняю"; return 1
+  fi
+  cat "$tmp" >/etc/ufw/after.rules
+  rm -f "$tmp"
+  _ensure_scanner_ipset >/dev/null 2>&1 || true
+  if ! ufw --force reload >/dev/null 2>&1 || ! ufw status 2>/dev/null | grep -qiE 'Status:\s*active'; then
+    warn "ufw reload не прошёл — возвращаю правила из ${bdir}"
+    cp -a "$bdir/before.rules" /etc/ufw/before.rules; cp -a "$bdir/after.rules" /etc/ufw/after.rules
+    ufw --force reload >/dev/null 2>&1 || true
+    _reapply_gorecshit_fw_scripts
+    return 1
+  fi
+  _reapply_gorecshit_fw_scripts
+  ok "Профиль «обычный сайт» включён (бэкап: ${bdir}). Выключить: sudo gorecshit --web-profile off"
+}
+
+# ---------- v2.9.0: --find-sni — соседи по /24 с TLS1.3 + h2 + валидным сертификатом ----------
+
+_find_sni_one() {
+  # _find_sni_one IP → "IP|name|tls|alpn|verify|dns" или пусто
+  local ip="$1" out name sans v alpn proto a dns="-"
+  out="$(timeout 4 openssl s_client -connect "${ip}:443" -tls1_3 -alpn h2 </dev/null 2>/dev/null | tr -d '\0' || true)"
+  grep -q 'BEGIN CERTIFICATE' <<<"$out" || return 0
+  sans="$(printf '%s\n' "$out" | openssl x509 -noout -text 2>/dev/null | grep -oE 'DNS:[^, ]+' | sed 's/DNS://' | grep -v '^\*' | head -3 | paste -sd' ' - || true)"
+  name="${sans%% *}"
+  [[ -n "$name" ]] || return 0
+  LC_ALL=C grep -qiE "$GS_BRAND_SNI_RE|$SITE_DOMAIN_FORBIDDEN_RE|cloudflare|localhost|invalid|example" <<<"$name" && return 0
+  out="$(timeout 5 openssl s_client -connect "${ip}:443" -servername "$name" -tls1_3 -alpn h2 -verify_return_error </dev/null 2>&1 | tr -d '\0' || true)"
+  proto="$(grep -oE 'TLSv1\.3' <<<"$out" | head -1 || true)"
+  alpn="$(grep -iE '^ALPN protocol:' <<<"$out" | head -1 | sed 's/.*: *//' | tr -d '\r' || true)"
+  v="no"; grep -qE 'Verify return code: 0|Verification: OK' <<<"$out" && v="ok"
+  a="$(getent ahostsv4 "$name" 2>/dev/null | awk '{print $1}' | sort -u | paste -sd' ' - || true)"
+  [[ " $a " == *" $ip "* ]] && dns="ok"
+  printf '%s|%s|%s|%s|%s|%s\n' "$ip" "$name" "${proto:--}" "${alpn:--}" "$v" "$dns"
+}
+
+run_find_sni() {
+  step "Поиск SNI среди соседей по /24 (медленно, только чтение)"
+  command -v openssl >/dev/null 2>&1 || { err "нужен openssl"; return 1; }
+  local pub="${FIND_SNI_IP:-}"
+  [[ -n "$pub" ]] || pub="$(_audit_detect_public_ipv4 2>/dev/null || true)"
+  is_ipv4 "$pub" || { err "Не определён IPv4 ноды (укажите: --find-sni IP)"; return 1; }
+  local net="${pub%.*}" i ip tmp running=0
+  echo "Сеть ${net}.0/24 (нода ${pub}). Опрос по 4 адреса за раз, ~2–6 минут. Свой домен (меню 10) всё равно надёжнее."
+  [[ "$DRY_RUN" -eq 1 ]] && { echo "[DRY] TLS1.3+h2 опрос ${net}.1-254:443"; return 0; }
+  tmp="$(mktemp -d)"
+  for i in $(seq 1 254); do
+    ip="${net}.${i}"
+    [[ "$ip" == "$pub" ]] && continue
+    _find_sni_one "$ip" >"${tmp}/${i}" 2>/dev/null &
+    running=$((running + 1))
+    if [[ "$running" -ge 4 ]]; then wait || true; running=0; sleep 0.3; fi
+  done
+  wait || true
+  local rows
+  rows="$(cat "${tmp}"/* 2>/dev/null | grep -v '^$' || true)"
+  rm -rf "$tmp"
+  if [[ -z "$rows" ]]; then
+    warn "Подходящих соседей не нашлось. Вариант: свой домен + сайт (меню 10)"
+    return 0
+  fi
+  printf '%-16s %-40s %-8s %-5s %-7s %s\n' "IP" "имя" "TLS" "ALPN" "серт" "DNS→IP"
+  menu_sep
+  local good="" r ip2 name proto alpn v dns
+  while IFS='|' read -r ip2 name proto alpn v dns; do
+    printf '%-16s %-40s %-8s %-5s %-7s %s\n' "$ip2" "${name:0:40}" "$proto" "$alpn" "$v" "$dns"
+    if [[ "$proto" == "TLSv1.3" && "$alpn" == "h2" && "$v" == "ok" && "$dns" == "ok" && -z "$good" ]]; then good="$name"; fi
+  done <<<"$rows"
+  menu_sep
+  if [[ -n "$good" ]]; then
+    ok "Подходит: ${good} (TLS 1.3 + h2 + валидный сертификат + DNS указывает на этот же /24)"
+    echo "  В панели (REALITY): \"target\": \"${good}:443\", \"serverNames\": [\"${good}\"], Hosts → SNI = ${good};"
+    echo "  добавьте limitFallbackUpload/Download. Это чужой сайт — свой домен (меню 10) надёжнее."
+  else
+    warn "Полностью подходящих (TLS1.3 + h2 + валидный серт + DNS) нет — лучше свой домен (меню 10)"
+  fi
+}
+
+# ---------- v2.9.0: помощники транспортов (печатают JSON для панели; порт открывают только по согласию) ----------
+
+_gs_open_port() {
+  # _gs_open_port PORT tcp|udp COMMENT
+  local p="$1" proto="$2" c="$3"
+  command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qiE 'Status:\s*active' || { log "UFW не активен — порт открывать не нужно"; return 0; }
+  if ufw status 2>/dev/null | grep -qE "^${p}/${proto}[[:space:]]+ALLOW"; then ok "${p}/${proto} уже открыт"; return 0; fi
+  if [[ "${OPEN_PORTS:-0}" -eq 1 ]] || { [[ "${CLI_ASSUME_YES:-0}" -eq 0 ]] && _tty_usable && _tty_ask_yn "Открыть ${p}/${proto} в UFW сейчас?"; }; then
+    [[ "$DRY_RUN" -eq 1 ]] && { echo "[DRY] ufw allow ${p}/${proto}"; return 0; }
+    ufw allow "${p}/${proto}" comment "$c" >/dev/null 2>&1 && ok "UFW: ${p}/${proto} открыт" || warn "ufw allow ${p}/${proto} не удался"
+    echo "  Anti-probe на новом порту: sudo gorecshit --client-ports 443,${p} (полная установка, меню 1) — по желанию"
+  else
+    echo "  Открыть позже: sudo ufw allow ${p}/${proto}"
+  fi
+}
+
+_gs_site_or_placeholder() {
+  local d=""
+  [[ -f "$SITE_STATE_FILE" ]] && d="$(sed -n 's/^SITE_DOMAIN=//p' "$SITE_STATE_FILE" | head -1)"
+  printf '%s' "${d:-www.<ваш-домен>}"
+}
+
+helper_xhttp() {
+  local port="${HELPER_XHTTP_PORT:-8443}" d sid path tgt="127.0.0.1:9443"
+  is_port "$port" || { err "Неверный порт: ${port}"; return 1; }
+  step "Помощник: VLESS + xhttp (packet-up) + REALITY на порту ${port}"
+  d="$(_gs_site_or_placeholder)"
+  if [[ -f "$SITE_STATE_FILE" ]]; then
+    tgt="$(sed -n 's/^SITE_LISTEN=//p' "$SITE_STATE_FILE" | head -1):$(sed -n 's/^SITE_PORT=//p' "$SITE_STATE_FILE" | head -1)"
+    [[ "$tgt" == ":" ]] && tgt="127.0.0.1:9443"
+  fi
+  sid="$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+  path="/api/v2/$(od -An -N3 -tx1 /dev/urandom | tr -d ' \n')"
+  if ss -Hltn "( sport = :${port} )" 2>/dev/null | grep -q .; then
+    warn "Порт ${port} уже кем-то занят: $(ss -Hltnp "( sport = :${port} )" 2>/dev/null | sed -n 's/.*users:(("\([^"]*\)".*/\1/p' | head -1) — выберите другой: --helper-xhttp 2053"
+  fi
+  echo "Зачем: у части провайдеров ТСПУ рвёт долгие TLS-сессии Vision на 443; xhttp идёт множеством"
+  echo "обычных HTTP/2-запросов и на другом порту выживает (net4people #546). Это ЗАПАСНОЙ вход, 443 остаётся."
+  echo
+  echo "Панель → Config Profiles → профиль ноды → inbounds → добавить:"
+  cat <<JSON
+{
+  "tag": "VLESS-XHTTP-REALITY-${port}",
+  "listen": "0.0.0.0",
+  "port": ${port},
+  "protocol": "vless",
+  "settings": { "clients": [], "decryption": "none" },
+  "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] },
+  "streamSettings": {
+    "network": "xhttp",
+    "xhttpSettings": { "path": "${path}", "mode": "packet-up" },
+    "security": "reality",
+    "realitySettings": {
+      "target": "${tgt}",
+      "xver": 0,
+      "serverNames": ["${d}"],
+      "privateKey": "<тот же privateKey, что у inbound на 443>",
+      "shortIds": ["${sid}"],
+      "maxTimeDiff": 90000
+    }
+  }
+}
+JSON
+  echo
+  echo "Hosts → новый хост: адрес ${d}, порт ${port}, SNI ${d}, path ${path}, fingerprint chrome, БЕЗ flow."
+  _gs_open_port "$port" tcp "gorecshit-xhttp"
+}
+
+helper_hy2() {
+  local port="${HELPER_HY2_PORT:-443}" d obfs live
+  is_port "$port" || { err "Неверный порт: ${port}"; return 1; }
+  step "Помощник: Hysteria2 (UDP ${port}) + Salamander"
+  d="$(_gs_site_or_placeholder)"
+  live="/etc/letsencrypt/live/${d}"
+  obfs="$(od -An -N12 -tx1 /dev/urandom | tr -d ' \n')"
+  echo "Зачем: заморозка «16 КБ» и политика TLS-сессий бьют по TCP; QUIC/UDP часто проходит там,"
+  echo "где TCP режут. Минус: на части мобильных сетей UDP к зарубежным IP режут целиком."
+  echo "Нужен xray ≥ 26.3.27 в remnanode и настоящий сертификат (сайт из меню 10)."
+  [[ -s "${live}/fullchain.pem" ]] || warn "Нет ${live}/fullchain.pem — сначала сайт-маскировка (меню 10)"
+  if ! grep -qs '/etc/letsencrypt' /opt/remnanode/docker-compose.yml 2>/dev/null; then
+    echo
+    echo "⚠️  Контейнеру remnanode нужен доступ к сертификату. В /opt/remnanode/docker-compose.yml в volumes:"
+    echo "      - /etc/letsencrypt:/etc/letsencrypt:ro"
+    echo "    затем в окно обслуживания: cd /opt/remnanode && docker compose up -d (gorecshit сам Docker не трогает)"
+  fi
+  echo
+  echo "Панель → профиль ноды → inbounds → добавить:"
+  cat <<JSON
+{
+  "tag": "HYSTERIA2-${port}",
+  "listen": "0.0.0.0",
+  "port": ${port},
+  "protocol": "hysteria",
+  "settings": { "version": 2, "clients": [] },
+  "streamSettings": {
+    "network": "hysteria",
+    "security": "tls",
+    "tlsSettings": {
+      "alpn": ["h3"],
+      "certificates": [{ "certificateFile": "${live}/fullchain.pem", "keyFile": "${live}/privkey.pem" }]
+    },
+    "hysteriaSettings": { "version": 2 },
+    "finalmask": {
+      "udp": [{ "type": "salamander", "settings": { "password": "${obfs}" } }],
+      "quicParams": { "congestion": "bbr" }
+    }
+  }
+}
+JSON
+  echo
+  echo "Hosts → хост Hysteria2: адрес ${d}, порт ${port}, SNI ${d}, obfs salamander / пароль ${obfs}."
+  echo "(Пароль obfs — это не секрет пользователей; пользователи берутся из панели.) Клиенты: Happ, Hiddify, v2RayTun."
+  _gs_open_port "$port" udp "gorecshit-hy2"
+}
+
+# ---------- v2.9.0: тест заморозки 16 КБ из РФ (check-host HTTP) ----------
+
+_gs_checkhost_http() {
+  # _gs_checkhost_http URL NODE... → печатает «ok total» по ответам 200/3xx
+  local url="$1"; shift
+  local qs="" n body rid res
+  for n in "$@"; do qs="${qs}&node=${n}"; done
+  body="$(_audit_http_get "https://check-host.net/check-http?host=$(printf '%s' "$url" | sed 's/&/%26/g')${qs}" 20)"
+  rid="$(printf '%s' "$body" | grep -oE '"request_id"[[:space:]]*:[[:space:]]*"[^"]+"' | head -1 | sed -E 's/.*"([^"]+)"/\1/' || true)"
+  [[ -n "$rid" ]] || { echo "0 0"; return 0; }
+  res="$(_audit_checkhost_poll "$rid" $(( $(date +%s) + 40 )))"
+  if command -v python3 >/dev/null 2>&1; then
+    printf '%s' "$res" | python3 -c '
+import json,sys
+try: d=json.loads(sys.stdin.read() or "{}")
+except Exception: d={}
+o=t=0
+for k,v in (d or {}).items():
+  if v is None: continue
+  t+=1
+  try:
+    it=v[0]
+    if it and it[0]==1 and str(it[3] or "")[:1] in ("2","3"): o+=1
+  except Exception: pass
+print(o,t)' 2>/dev/null || echo "0 0"
+  else
+    echo "0 0"
+  fi
+}
+
+run_freeze_test() {
+  step "Тест заморозки «16 КБ» и доступности из РФ (check-host, точки в российских ДЦ)"
+  SITE_DOMAIN=""
+  _site_load_state >/dev/null 2>&1 || true
+  local d="${SITE_DOMAIN:-}" big
+  if [[ -z "$d" ]]; then
+    _audit_info "Нужен сайт-маскировка (меню 10): тест качает с ноды маленький и большой файл по её домену"
+    return 0
+  fi
+  big="$(_gs_site_big_asset 2>/dev/null || true)"
+  if [[ -z "$big" ]]; then
+    _audit_info "На сайте нет файла > 64 КБ — sudo gorecshit --site-refresh (добавит), затем повторите"
+    return 0
+  fi
+  AUDIT_RU_NODES=(); AUDIT_FOREIGN_NODES=()
+  _audit_pick_checkhost_nodes || true
+  if [[ ${#AUDIT_RU_NODES[@]} -eq 0 ]]; then _audit_warn "check-host: нет российских точек — пропуск"; return 0; fi
+  local -a ru=("${AUDIT_RU_NODES[@]:0:4}")
+  local small_r big_r so st bo bt
+  small_r="$(_gs_checkhost_http "https://${d}/robots.txt" "${ru[@]}")"
+  big_r="$(_gs_checkhost_http "https://${d}${big}" "${ru[@]}")"
+  read -r so st <<<"$small_r"; read -r bo bt <<<"$big_r"
+  _audit_info "Маленький файл (robots.txt, < 1 КБ): ${so}/${st} точек РФ"
+  _audit_info "Большой файл (${big}, $(stat -c %s "${SITE_ROOT}${big}" 2>/dev/null || echo '?') байт): ${bo}/${bt} точек РФ"
+  if [[ "${st:-0}" -eq 0 ]]; then
+    _audit_warn "check-host не дал результатов (лимит/сеть) — повторите позже"
+  elif [[ "$so" -eq 0 ]]; then
+    _audit_err "Из РФ не открывается даже маленький файл — IP недоступен из РФ (блок IP/подсети). Сервер это не исправит: смена IP, РФ-вход или CDN"
+  elif [[ "$bo" -lt "$so" ]]; then
+    _audit_err "Маленький файл проходит, большой — нет: похоже на заморозку «16 КБ» по IP/ASN хостера. Маскировка тут не поможет: РФ-вход (relay), CDN или другой хостер/AS"
+  else
+    _audit_ok "Большой файл проходит так же, как маленький — заморозки «16 КБ» с этих точек не видно"
+  fi
+  _audit_info "Точки check-host стоят в российских ДЦ; мобильные сети и белые списки строже — финальная проверка только с телефона"
+}
+
+# ---------- v2.9.0: самопроверка (--selfcheck) + таймер + Telegram (opt-in) ----------
+
+run_selfcheck() {
+  # Короткая проверка; rc 1 при проблемах. Сообщение в Telegram — только если настроено (GS_SELFCHECK_ENV).
+  local -a probs=() oks=()
+  local pub d live code np
+  pub="$(_audit_detect_public_ipv4 2>/dev/null || true)"
+  AUDIT_PUB_IP="$pub"
+  if ss -Hltn '( sport = :443 )' 2>/dev/null | grep -q .; then oks+=("443 слушается"); else probs+=("на 443 никто не слушает (Xray упал?)"); fi
+  SITE_DOMAIN=""
+  if _site_load_state >/dev/null 2>&1 && [[ -n "$SITE_DOMAIN" ]]; then
+    d="$SITE_DOMAIN"; live="/etc/letsencrypt/live/${d}/fullchain.pem"
+    if [[ -s "$live" ]] && openssl x509 -checkend $(( 14 * 86400 )) -noout -in "$live" >/dev/null 2>&1; then oks+=("сертификат ${d} > 14 дней")
+    else probs+=("сертификат ${d} истекает/нет"); fi
+    code="$(_site_local_get / -o /dev/null -w '%{http_code}' 2>/dev/null || true)"
+    [[ "$code" == "200" ]] && oks+=("сайт отвечает 200") || probs+=("сайт на ${SITE_LISTEN}:${SITE_PORT} ответил «${code:-нет}»")
+    if [[ -n "$pub" ]]; then
+      if _site_resolve A "$d" 2>/dev/null | grep -qx "$pub"; then oks+=("DNS ${d} → ${pub}"); else probs+=("DNS ${d} не указывает на ${pub}"); fi
+    fi
+  fi
+  np="$(_audit_node_port)"
+  if ss -Hltn "( sport = :${np} )" 2>/dev/null | grep -q .; then oks+=("порт ноды ${np}"); else probs+=("порт ноды ${np} не слушается (связь с панелью)"); fi
+  # доступность 443 из РФ (TCP, check-host)
+  if [[ -n "$pub" ]]; then
+    AUDIT_RU_NODES=(); AUDIT_FOREIGN_NODES=()
+    if _audit_pick_checkhost_nodes 2>/dev/null; then
+      local rid res ro rt fo ft
+      rid="$(_audit_checkhost_start tcp "${pub}:443" "${AUDIT_RU_NODES[@]:0:4}" "${AUDIT_FOREIGN_NODES[@]:0:2}" 2>/dev/null || true)"
+      if [[ -n "$rid" ]]; then
+        res="$(_audit_checkhost_poll "$rid" $(( $(date +%s) + 30 )))"
+        read -r ro rt fo ft <<<"$(printf '%s' "$res" | _audit_summarize_tcp_result "${AUDIT_RU_NODES[@]:0:4}" -- "${AUDIT_FOREIGN_NODES[@]:0:2}")"
+        if [[ "${rt:-0}" -gt 0 && "${ro:-0}" -eq 0 && "${fo:-0}" -gt 0 ]]; then probs+=("443 не открывается из РФ (${ro}/${rt}), из-за рубежа — да: блок IP")
+        elif [[ "${rt:-0}" -gt 0 ]]; then oks+=("443 из РФ ${ro}/${rt}"); fi
+      fi
+    fi
+  fi
+  _audit_node_country "$pub" 2>/dev/null || true
+  _gs_registry_write
+  local host msg
+  host="$(hostname 2>/dev/null || echo node)"
+  if [[ ${#probs[@]} -eq 0 ]]; then
+    ok "Самопроверка ${host} (${pub:-?}): всё в порядке — $(IFS=';'; echo "${oks[*]}")"
+  else
+    warn "Самопроверка ${host} (${pub:-?}): проблем ${#probs[@]}:"
+    printf '  - %s\n' "${probs[@]}"
+  fi
+  if _gs_tg_ready && { [[ ${#probs[@]} -gt 0 ]] || [[ "$GS_TG_ALWAYS" == "1" ]]; }; then
+    if [[ ${#probs[@]} -gt 0 ]]; then
+      msg="⚠️ ${host} ${pub:-}: $(IFS=';'; echo "${probs[*]}")"
+    else
+      msg="✅ ${host} ${pub:-}: $(IFS=';'; echo "${oks[*]}")"
+    fi
+    _gs_tg_send "$msg" || warn "Не удалось отправить отчёт в Telegram"
+  fi
+  [[ ${#probs[@]} -eq 0 ]]
+}
+
+selfcheck_install() {
+  local mode="$1" svc=/etc/systemd/system/gorecshit-selfcheck.service tmr=/etc/systemd/system/gorecshit-selfcheck.timer
+  if [[ "$(id -u)" -ne 0 && "$DRY_RUN" -eq 0 ]]; then err "Нужен root"; return 1; fi
+  if [[ "$mode" == "off" ]]; then
+    [[ "$DRY_RUN" -eq 1 ]] && { echo "[DRY] remove selfcheck timer"; return 0; }
+    systemctl disable --now gorecshit-selfcheck.timer >/dev/null 2>&1 || true
+    rm -f "$svc" "$tmr"; systemctl daemon-reload 2>/dev/null || true
+    ok "Ежедневная самопроверка выключена (файл ${GS_SELFCHECK_ENV} оставлен; удалить: rm -f ${GS_SELFCHECK_ENV})"
+    return 0
+  fi
+  [[ "$DRY_RUN" -eq 1 ]] && { echo "[DRY] write $svc + $tmr; optional $GS_SELFCHECK_ENV (0600)"; return 0; }
+  local tok="${GORECSHIT_TG_TOKEN:-}" chat="${GORECSHIT_TG_CHAT:-}"
+  if [[ -z "$tok" ]] && [[ "${CLI_ASSUME_YES:-0}" -eq 0 ]] && _tty_usable; then
+    if _tty_ask_yn "Присылать отчёты о проблемах в Telegram (нужен токен бота и chat_id)?"; then
+      read -r -s -p 'Токен бота (ввод скрыт): ' tok </dev/tty || true; echo
+      prompt_user 'chat_id: ' chat
+    fi
+  fi
+  if [[ -n "$tok" && -n "$chat" ]]; then
+    mkdir -p "$(dirname "$GS_SELFCHECK_ENV")"
+    ( umask 077; printf 'TG_TOKEN=%s\nTG_CHAT=%s\nTG_ALWAYS=0\n' "$tok" "$chat" >"$GS_SELFCHECK_ENV" )
+    chmod 600 "$GS_SELFCHECK_ENV"; chown root:root "$GS_SELFCHECK_ENV" 2>/dev/null || true
+    ok "Telegram: настройки в ${GS_SELFCHECK_ENV} (только root). Отчёт придёт только при проблеме (TG_ALWAYS=1 — каждый день)"
+  fi
+  cat >"$svc" <<'UNIT'
+[Unit]
+Description=gorecshit: ежедневная самопроверка ноды (443, сайт, сертификат, DNS, доступность из РФ)
+After=network-online.target
+
+[Service]
+Type=oneshot
+Nice=10
+ExecStart=/usr/local/sbin/gorecshit --selfcheck
+SuccessExitStatus=0 1
+UNIT
+  cat >"$tmr" <<'UNIT'
+[Unit]
+Description=gorecshit: ежедневная самопроверка
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=4h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+  systemctl daemon-reload
+  systemctl enable --now gorecshit-selfcheck.timer >/dev/null 2>&1 || true
+  ok "Ежедневная самопроверка включена. Сейчас вручную: sudo gorecshit --selfcheck  · выключить: --selfcheck-remove"
+}
+
+# ---------- v2.9.0: общие помощники — Telegram и systemd-таймеры ----------
+
+GS_CANARY_LIST=/etc/gorecshit/canary.list
+GS_TRAP_LOG=/var/log/nginx/gorecshit-site.log
+GS_TRAP_FMT_CONF=/etc/nginx/conf.d/gorecshit-trap.conf
+GS_BG_URLS_FILE=/etc/gorecshit/bg-traffic.urls
+GS_SPARE_DIR=/var/lib/gorecshit/spare
+
+_gs_tg_ready() {
+  # rc 0 — Telegram настроен (GS_SELFCHECK_ENV); заполняет GS_TG_TOKEN/GS_TG_CHAT/GS_TG_ALWAYS
+  GS_TG_TOKEN=""; GS_TG_CHAT=""; GS_TG_ALWAYS="0"
+  [[ -r "$GS_SELFCHECK_ENV" ]] || return 1
+  local k v
+  while IFS='=' read -r k v; do
+    v="${v%\"}"; v="${v#\"}"
+    case "$k" in TG_TOKEN) GS_TG_TOKEN="$v" ;; TG_CHAT) GS_TG_CHAT="$v" ;; TG_ALWAYS) GS_TG_ALWAYS="$v" ;; esac
+  done <"$GS_SELFCHECK_ENV"
+  [[ -n "$GS_TG_TOKEN" && -n "$GS_TG_CHAT" ]]
+}
+
+_gs_tg_send() {
+  # _gs_tg_send TEXT — токен только через stdin (-K -), в argv/ps его нет
+  _gs_tg_ready || return 1
+  printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "$GS_TG_TOKEN" \
+    | curl -fsS --max-time 10 -o /dev/null -K - \
+        --data-urlencode "chat_id=${GS_TG_CHAT}" --data-urlencode "text=${1}" 2>/dev/null
+}
+
+_gs_tg_setup() {
+  # спросить токен/chat_id (или GORECSHIT_TG_TOKEN/_CHAT) и сохранить в GS_SELFCHECK_ENV (0600, root)
+  _gs_tg_ready && return 0
+  local tok="${GORECSHIT_TG_TOKEN:-}" chat="${GORECSHIT_TG_CHAT:-}"
+  if [[ -z "$tok" ]] && [[ "${CLI_ASSUME_YES:-0}" -eq 0 ]] && _tty_usable; then
+    if _tty_ask_yn "Присылать уведомления в Telegram (нужен токен бота и chat_id)?"; then
+      read -r -s -p 'Токен бота (ввод скрыт): ' tok </dev/tty || true; echo
+      prompt_user 'chat_id: ' chat
+    fi
+  fi
+  [[ -n "$tok" && -n "$chat" ]] || return 1
+  mkdir -p "$(dirname "$GS_SELFCHECK_ENV")"
+  ( umask 077; printf 'TG_TOKEN=%s\nTG_CHAT=%s\nTG_ALWAYS=0\n' "$tok" "$chat" >"$GS_SELFCHECK_ENV" )
+  chmod 600 "$GS_SELFCHECK_ENV"; chown root:root "$GS_SELFCHECK_ENV" 2>/dev/null || true
+  ok "Telegram: настройки в ${GS_SELFCHECK_ENV} (только root)"
+}
+
+_gs_timer_set() {
+  # _gs_timer_set NAME on|off "Описание" "OnCalendar" "RandomizedDelaySec" "ExecStart"
+  local name="$1" mode="$2" desc="${3:-}" cal="${4:-daily}" delay="${5:-1h}" exec="${6:-}"
+  local svc="/etc/systemd/system/${name}.service" tmr="/etc/systemd/system/${name}.timer"
+  if [[ "$(id -u)" -ne 0 && "$DRY_RUN" -eq 0 ]]; then err "Нужен root"; return 1; fi
+  if [[ "$mode" == "off" ]]; then
+    [[ "$DRY_RUN" -eq 1 ]] && { echo "[DRY] disable + remove ${tmr}"; return 0; }
+    systemctl disable --now "${name}.timer" >/dev/null 2>&1 || true
+    rm -f "$svc" "$tmr"; systemctl daemon-reload 2>/dev/null || true
+    return 0
+  fi
+  [[ "$DRY_RUN" -eq 1 ]] && { echo "[DRY] write ${svc} + ${tmr} (${cal}, RandomizedDelaySec=${delay}): ${exec}"; return 0; }
+  printf '[Unit]\nDescription=gorecshit: %s\nAfter=network-online.target\n\n[Service]\nType=oneshot\nNice=10\nExecStart=%s\nSuccessExitStatus=0 1\n' \
+    "$desc" "$exec" >"$svc"
+  printf '[Unit]\nDescription=gorecshit: %s\n\n[Timer]\nOnCalendar=%s\nRandomizedDelaySec=%s\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n' \
+    "$desc" "$cal" "$delay" >"$tmr"
+  systemctl daemon-reload
+  systemctl enable --now "${name}.timer" >/dev/null 2>&1 || true
+}
+
+_gs_all_timers_off() {
+  # для --rollback: все v2.9.0-таймеры
+  local n
+  for n in gorecshit-site-refresh gorecshit-selfcheck gorecshit-bg-traffic gorecshit-probe-alert gorecshit-canary; do
+    systemctl disable --now "${n}.timer" >/dev/null 2>&1 || true
+    rm -f "/etc/systemd/system/${n}.service" "/etc/systemd/system/${n}.timer"
+  done
+  systemctl daemon-reload 2>/dev/null || true
+}
+
+# ---------- v2.9.0: «живой» сайт (--site-alive) ----------
+
+site_alive_set() {
+  # site_alive_set on|off — ежедневный таймер: свежая новость (шаг SITE_NEWS_DAYS), lastmod, sitemap.xml, rss.xml
+  local mode="$1" nd="${SITE_NEWS_DAYS:-3}"
+  [[ "$nd" =~ ^[0-9]+$ && "$nd" -ge 1 && "$nd" -le 60 ]] || nd=3
+  if [[ "$mode" == "off" ]]; then
+    _gs_timer_set gorecshit-site-refresh off || return 1
+    ok "«Живой» сайт выключен (уже опубликованные новости остаются)"
+    return 0
+  fi
+  if [[ ! -f "$SITE_STATE_FILE" && "$DRY_RUN" -eq 0 ]]; then err "Сайт-маскировка не установлена (меню 10)"; return 1; fi
+  echo "Раз в сутки в случайное время: новость примерно раз в ${nd} дн. (тексты нейтральные, без сети), lastmod в sitemap.xml, rss.xml."
+  echo "Каждый день новая запись у маленькой фирмы выглядит неестественно — по умолчанию шаг 3 дня (--site-news-days N)."
+  _gs_timer_set gorecshit-site-refresh on "«живой» сайт — новости, sitemap, rss (без nginx)" daily 8h \
+    "/usr/local/sbin/gorecshit --site-refresh --site-news-days ${nd} --yes" || return 1
+  [[ "$DRY_RUN" -eq 1 ]] && return 0
+  SITE_NEWS_DAYS="$nd" site_refresh_content || true
+  ok "«Живой» сайт включён. Выключить: sudo gorecshit --site-alive off"
+}
+
+# ---------- v2.9.0: фоновый «обычный» исходящий трафик (--bg-traffic, по умолчанию ВЫКЛ) ----------
+
+_bg_default_urls() {
+  cat <<'URLS'
+https://deb.debian.org/debian/dists/stable/InRelease
+https://security.debian.org/debian-security/dists/stable-security/InRelease
+https://archive.ubuntu.com/ubuntu/dists/noble/InRelease
+https://cdn.jsdelivr.net/npm/jquery@3.7.1/package.json
+https://cdnjs.cloudflare.com/ajax/libs/normalize/8.0.1/normalize.min.css
+https://fonts.googleapis.com/css2?family=Roboto:wght@400;700&display=swap
+https://www.wikipedia.org/
+https://letsencrypt.org/
+https://ntp.org/
+https://www.kernel.org/
+https://github.com/
+https://registry.npmjs.org/
+URLS
+}
+
+run_bg_traffic() {
+  # один «тик»: 1–3 случайных GET с паузами; лимит 2 МБ на ответ
+  local -a urls=()
+  if [[ -s "$GS_BG_URLS_FILE" ]]; then
+    mapfile -t urls < <(grep -E '^https://' "$GS_BG_URLS_FILE" || true)
+  fi
+  [[ ${#urls[@]} -gt 0 ]] || mapfile -t urls < <(_bg_default_urls)
+  local n i u
+  n=$(( (RANDOM % 3) + 1 ))
+  for (( i=0; i<n; i++ )); do
+    u="${urls[RANDOM % ${#urls[@]}]}"
+    curl -s -o /dev/null --max-time 20 --max-filesize 2097152 -A 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36' "$u" 2>/dev/null || true
+    sleep $(( (RANDOM % 40) + 5 ))
+  done
+  return 0
+}
+
+bg_traffic_set() {
+  local mode="$1"
+  if [[ "$mode" == "off" ]]; then
+    _gs_timer_set gorecshit-bg-traffic off || return 1
+    ok "Фоновый трафик выключен"
+    return 0
+  fi
+  warn "Фоновый трафик: раз в ~20–40 мин 1–3 HTTPS-запроса к обычным сайтам (зеркала обновлений, CDN, новости), < 10 МБ/сутки."
+  echo "  Зачем: «чистый» VPN-сервер почти не ходит в интернет сам — у обычного сервера есть свои обновления/CDN."
+  echo "  ⚠️  Проверьте правила хостера (ToS): часть хостеров запрещает «искусственный» трафик. Список сайтов: ${GS_BG_URLS_FILE}"
+  if [[ "${CLI_ASSUME_YES:-0}" -eq 0 && "$DRY_RUN" -eq 0 ]]; then
+    _tty_usable && ! _tty_ask_yn "Включить фоновый трафик?" && { warn "Не включаю"; return 0; }
+  fi
+  if [[ "$DRY_RUN" -eq 0 && ! -s "$GS_BG_URLS_FILE" ]]; then
+    mkdir -p "$(dirname "$GS_BG_URLS_FILE")"
+    { echo "# gorecshit --bg-traffic: по одному https:// URL в строке (маленькие ответы)"; _bg_default_urls; } >"$GS_BG_URLS_FILE"
+  fi
+  _gs_timer_set gorecshit-bg-traffic on "фоновый обычный трафик (опционально)" '*:0/30' 15m \
+    "/usr/local/sbin/gorecshit --bg-traffic-run" || return 1
+  ok "Фоновый трафик включён. Выключить: sudo gorecshit --bg-traffic off"
+}
+
+# ---------- v2.9.0: ловушка сканеров (--probe-alert): лог nginx-сайта → Telegram ----------
+
+GS_TRAP_UA_RE='zgrab|masscan|nmap|censys|shodan|python-requests|python-urllib|aiohttp|go-http-client|libwww|curl/|wget/|httpx|nuclei|sqlmap|nikto|expanse|l9explore|l9tcpid|zmeu|netcraft|internetmeasurement|palo alto|leakix|odin|binaryedge|criminalip|fofa|quake|xray-|v2ray|clash|okhttp|scanner|^-$|^$'
+GS_TRAP_PATH_RE='^/(\.env|\.git|wp-login|wp-admin|xmlrpc|phpmyadmin|pma|cgi-bin|actuator|boaform|HNAP1|owa|ecp|remote|vpn|vless|vmess|xray|v2ray|trojan|reality|ws|grpc|sub|api/v1/|panel|admin|manager|login\.action|\.well-known/security|server-status|solr|console|shell|setup\.cgi)'
+
+_trap_log_conf_write() {
+  # log_format в http-контексте (conf.d) — сам по себе ничего не логирует
+  local tmp
+  tmp="$(mktemp)"
+  cat >"$tmp" <<'NG'
+# Managed by gorecshit — формат лога ловушки сканеров (--probe-alert)
+log_format gs_trap '$remote_addr|$proxy_protocol_addr|$time_iso8601|$status|$request_method|$request_uri|$http_user_agent|$ssl_server_name|$server_port';
+NG
+  install -m 644 "$tmp" "$GS_TRAP_FMT_CONF"; rm -f "$tmp"
+}
+
+probe_alert_set() {
+  # opt-in: в nginx-конфиге сайта access_log off → лог ловушки (ответы nginx НЕ меняются); таймер каждые 10 мин
+  local mode="$1" conf="${SITE_NGINX_CONF}" bk=""
+  if [[ "$(id -u)" -ne 0 && "$DRY_RUN" -eq 0 ]]; then err "Нужен root"; return 1; fi
+  if [[ "$mode" == "off" ]]; then
+    [[ "$DRY_RUN" -eq 1 ]] && { echo "[DRY] access_log off в ${conf}, rm ${GS_TRAP_FMT_CONF}, таймер off"; return 0; }
+    _gs_timer_set gorecshit-probe-alert off || true
+    _gs_set_state_kv SITE_TRAP 0
+    if [[ -f "$conf" ]] && grep -q 'gs_trap' "$conf"; then
+      bk="${conf}.gs-trap.bak"; cp -a "$conf" "$bk"
+      sed -i -E 's#^([[:space:]]*)access_log [^;]* gs_trap;#\1access_log off;#' "$conf"
+      if nginx -t >/dev/null 2>&1; then systemctl reload nginx 2>/dev/null || true; rm -f "$bk"
+      else cp -a "$bk" "$conf"; err "nginx -t не прошёл — конфиг возвращён"; return 1; fi
+    fi
+    rm -f "$GS_TRAP_FMT_CONF" /etc/logrotate.d/gorecshit-trap
+    nginx -t >/dev/null 2>&1 && systemctl reload nginx 2>/dev/null || true
+    ok "Ловушка сканеров выключена (лог ${GS_TRAP_LOG} оставлен)"
+    return 0
+  fi
+  if [[ ! -f "$conf" ]] || ! command -v nginx >/dev/null 2>&1; then err "Нет nginx-сайта (${conf}) — сначала сайт-маскировка (меню 10)"; return 1; fi
+  echo "Ловушка: nginx сайта начнёт писать короткий лог (${GS_TRAP_LOG}, ротация 7 дней). Ответы сайта не меняются."
+  echo "Раз в 10 минут лог разбирается: сканерные User-Agent, «говорящие» пути (/.env, /vless, /sub…), адреса из блок-листа сканеров."
+  echo "В Telegram уходит подсеть /24 источника — не чаще раза в сутки на подсеть и не больше одного сообщения за проход."
+  if [[ "${SITE_PP:-0}" -ne 1 ]]; then
+    warn "Без proxy_protocol (xver) в REALITY зонды через 443 видны как 127.0.0.1 — реальные адреса будут только у :80. Полная картина: --site-proxy-protocol + xver 1 в панели"
+  fi
+  [[ "$DRY_RUN" -eq 1 ]] && { echo "[DRY] ${GS_TRAP_FMT_CONF}; ${conf}: access_log off → ${GS_TRAP_LOG} gs_trap; nginx -t; reload; таймер 10 мин"; return 0; }
+  _gs_tg_setup || warn "Telegram не настроен — находки будут только в выводе: sudo gorecshit --probe-scan"
+  bk="${conf}.gs-trap.bak"; cp -a "$conf" "$bk"
+  _trap_log_conf_write
+  sed -i -E "s#^([[:space:]]*)access_log off;#\\1access_log ${GS_TRAP_LOG} gs_trap;#" "$conf"
+  if ! nginx -t >/dev/null 2>&1; then
+    cp -a "$bk" "$conf"; rm -f "$GS_TRAP_FMT_CONF"
+    err "nginx -t не прошёл — всё возвращено:"; nginx -t 2>&1 | tail -3 >&2
+    return 1
+  fi
+  rm -f "$bk"
+  systemctl reload nginx 2>/dev/null || true
+  printf '%s {\n  daily\n  rotate 7\n  missingok\n  notifempty\n  compress\n  delaycompress\n  create 0640 root adm\n  postrotate\n    [ -s /run/nginx.pid ] && kill -USR1 "$(cat /run/nginx.pid)" 2>/dev/null || true\n  endscript\n}\n' \
+    "$GS_TRAP_LOG" >/etc/logrotate.d/gorecshit-trap
+  _gs_set_state_kv SITE_TRAP 1
+  _gs_timer_set gorecshit-probe-alert on "ловушка сканеров (разбор лога сайта)" '*:0/10' 2m \
+    "/usr/local/sbin/gorecshit --probe-scan --yes" || return 1
+  ok "Ловушка сканеров включена. Разбор вручную: sudo gorecshit --probe-scan · выключить: --probe-alert off"
+}
+
+_gs_set_state_kv() {
+  # _gs_set_state_kv KEY VAL — в state-файл сайта (для повторной генерации конфига)
+  [[ -f "$SITE_STATE_FILE" ]] || return 0
+  if grep -q "^${1}=" "$SITE_STATE_FILE"; then sed -i "s#^${1}=.*#${1}=${2}#" "$SITE_STATE_FILE"
+  else echo "${1}=${2}" >>"$SITE_STATE_FILE"; fi
+}
+
+_trap_classify() {
+  # stdin — строки лога gs_trap (с 1-го байта новых), stdout — «subnet|count|reason|sample»
+  local scan_ipset="${1:-}"
+  awk -F'|' -v uare="$GS_TRAP_UA_RE" -v pre="$GS_TRAP_PATH_RE" -v ipset="$scan_ipset" '
+    BEGIN { IGNORECASE = 1; n = split(ipset, a, " "); for (i = 1; i <= n; i++) blk[a[i]] = 1 }
+    {
+      if (NF < 7) next
+      ip = ($2 != "" && $2 != "-") ? $2 : $1
+      if (ip == "" || ip == "-") next
+      if (ip ~ /^(127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|::1$)/) next
+      r = ""
+      ua = $7; path = $6; m = $5
+      if (tolower(ua) ~ uare) r = "UA «" substr(ua, 1, 40) "»"
+      else if (path ~ pre) r = "путь " substr(path, 1, 40)
+      else if (m !~ /^(GET|HEAD|POST|OPTIONS)$/) r = "метод " m
+      else if ($8 == "" || $8 == "-") { if ($9 != "80") r = "TLS без SNI" }
+      split(ip, o, ".")
+      net = (ip ~ /:/) ? ip : o[1] "." o[2] "." o[3] ".0/24"
+      if (net in blk) r = (r == "" ? "подсеть из блок-листа сканеров" : r ", блок-лист")
+      if (r == "") next
+      cnt[net]++; if (!(net in why)) why[net] = r
+    }
+    END { for (k in cnt) print k "|" cnt[k] "|" why[k] }'
+}
+
+run_probe_scan() {
+  # разбор новых строк лога ловушки; Telegram — не чаще раза в сутки на подсеть, одно сообщение за проход
+  step "Ловушка сканеров: разбор ${GS_TRAP_LOG}"
+  [[ -r "$GS_TRAP_LOG" ]] || { _audit_info "Лога нет — ловушка не включена (--probe-alert on)"; return 0; }
+  local st="${GS_STATE_DIR}/trap.state" off=0 ino size cur_ino="" lines rows sentf="${GS_STATE_DIR}/trap.sent"
+  mkdir -p "$GS_STATE_DIR" 2>/dev/null || true
+  ino="$(stat -c %i "$GS_TRAP_LOG" 2>/dev/null || echo 0)"; size="$(stat -c %s "$GS_TRAP_LOG" 2>/dev/null || echo 0)"
+  [[ -r "$st" ]] && read -r cur_ino off <"$st" 2>/dev/null || true
+  [[ "$cur_ino" == "$ino" && "${off:-0}" =~ ^[0-9]+$ && "$off" -le "$size" ]] || off=0
+  lines="$(tail -c +"$(( off + 1 ))" "$GS_TRAP_LOG" 2>/dev/null | head -n 200000 || true)"
+  echo "$ino $size" >"$st" 2>/dev/null || true
+  local sets=""
+  if command -v ipset >/dev/null 2>&1; then
+    sets="$(ipset list scanner-block 2>/dev/null | grep -oE '^[0-9.]+/24' | head -20000 | paste -sd' ' - || true)"
+  fi
+  rows="$(_trap_classify "$sets" <<<"$lines" | sort -t'|' -k2,2nr || true)"
+  if [[ -z "$rows" ]]; then _audit_ok "Новых зондов не видно"; return 0; fi
+  local net cnt why msg="" now n=0 last
+  now="$(date +%s)"
+  touch "$sentf" 2>/dev/null || true
+  while IFS='|' read -r net cnt why; do
+    [[ -n "$net" ]] || continue
+    _audit_warn "${net}: ${cnt} запрос(ов) — ${why}"
+    last="$(awk -v k="$net" '$1 == k {print $2}' "$sentf" 2>/dev/null | tail -1 || true)"
+    if [[ -z "$last" || $(( now - last )) -gt 86400 ]] && [[ "$n" -lt 10 ]]; then
+      msg="${msg}${net} ×${cnt} (${why})"$'\n'; n=$((n + 1))
+      { grep -v "^${net//./\\.} " "$sentf" 2>/dev/null || true; echo "$net $now"; } >"${sentf}.tmp" && mv -f "${sentf}.tmp" "$sentf"
+    fi
+  done <<<"$rows"
+  if [[ -n "$msg" ]]; then
+    if _gs_tg_send "🔎 $(hostname 2>/dev/null || echo node): зонды по сайту-маскировке"$'\n'"${msg}Ответы — обычные страницы nginx."; then
+      _audit_info "Отправлено в Telegram подсетей: ${n}"
+    fi
+  fi
+  return 0
+}
+
+# ---------- v2.9.0: канарейка (--canary) — запускать на РФ-VPS, проверяет список нод ----------
+
+_canary_check_one() {
+  # _canary_check_one HOST PORT SNI → "ok|tcp|tls"
+  local h="$1" p="$2" sni="$3" out
+  if ! timeout 6 bash -c "exec 3<>/dev/tcp/${h}/${p}" 2>/dev/null; then echo tcp; return 0; fi
+  local hp="${h}:${p}"; [[ "$h" == *:* ]] && hp="[${h}]:${p}"
+  local -a sn=(-servername "$sni")
+  [[ "$sni" =~ ^[0-9.]+$ || "$sni" == *:* ]] && sn=(-noservername)
+  out="$(timeout 8 openssl s_client -connect "$hp" "${sn[@]}" -tls1_3 </dev/null 2>&1 | tr -d '\0' || true)"
+  if grep -q 'BEGIN CERTIFICATE' <<<"$out"; then echo ok; else echo tls; fi
+}
+
+canary_add() {
+  # canary_add "HOST[:PORT] [SNI] [имя]"
+  local line="$1" h
+  h="${line%% *}"
+  [[ -n "$h" ]] || { err "--canary-add HOST[:PORT] [SNI] [имя]"; return 1; }
+  [[ "$DRY_RUN" -eq 1 ]] && { echo "[DRY] + ${line} → ${GS_CANARY_LIST}"; return 0; }
+  mkdir -p "$(dirname "$GS_CANARY_LIST")"
+  [[ -f "$GS_CANARY_LIST" ]] || printf '# gorecshit --canary: HOST[:PORT] [SNI] [имя] — по одной ноде в строке\n' >"$GS_CANARY_LIST"
+  local hh="${h%%:*}"
+  if grep -qE "^${hh//./\\.}(:[0-9]+)?( |$)" "$GS_CANARY_LIST"; then warn "${hh} уже в списке"; return 0; fi
+  echo "$line" >>"$GS_CANARY_LIST"
+  chmod 600 "$GS_CANARY_LIST"
+  ok "Добавлено в ${GS_CANARY_LIST}: ${line}"
+}
+
+run_canary() {
+  # проверка всех нод из списка; алерт при смене состояния (down после 2 неудач подряд, затем «восстановлена»)
+  step "Канарейка: доступность нод (TCP + TLS с SNI)"
+  [[ -s "$GS_CANARY_LIST" ]] || { warn "Список пуст: sudo gorecshit --canary-add node.example.ru[:443] [SNI] [имя]"; return 0; }
+  local st="${GS_STATE_DIR}/canary.state" line hp h p sni name r prev fails msg="" down=0 total=0
+  mkdir -p "$GS_STATE_DIR" 2>/dev/null || true
+  touch "$st" 2>/dev/null || true
+  local tmp; tmp="$(mktemp)"
+  while read -r hp sni name; do
+    [[ -n "$hp" && "$hp" != \#* ]] || continue
+    total=$((total + 1))
+    h="${hp%:*}"; p="${hp##*:}"; [[ "$hp" == *:* && "$p" =~ ^[0-9]+$ ]] || { h="$hp"; p=443; }
+    h="${h#[}"; h="${h%]}"
+    [[ -n "$sni" && "$sni" != "-" ]] || sni="$h"
+    [[ -n "$name" ]] || name="$h"
+    r="$(_canary_check_one "$h" "$p" "$sni")"
+    [[ "$r" == ok ]] || { sleep 5; r="$(_canary_check_one "$h" "$p" "$sni")"; }
+    read -r prev fails <<<"$(awk -v k="${h}:${p}" '$1 == k {print $2, $3}' "$st" | tail -1)"
+    prev="${prev:-ok}"; fails="${fails:-0}"
+    if [[ "$r" == ok ]]; then
+      _audit_ok "${name} (${h}:${p}, SNI ${sni}): доступна"
+      [[ "$prev" == down ]] && msg="${msg}✅ ${name}: снова доступна"$'\n'
+      echo "${h}:${p} ok 0" >>"$tmp"
+    else
+      down=$((down + 1)); fails=$((fails + 1))
+      _audit_err "${name} (${h}:${p}): не отвечает (${r}) — попытка ${fails}"
+      if [[ "$fails" -ge 2 && "$prev" != down ]]; then
+        msg="${msg}❌ ${name} (${h}:${p}): недоступна из этой точки (${r}), 2 проверки подряд"$'\n'
+        echo "${h}:${p} down ${fails}" >>"$tmp"
+      else
+        echo "${h}:${p} ${prev/ok/fail} ${fails}" >>"$tmp"
+      fi
+    fi
+  done <"$GS_CANARY_LIST"
+  mv -f "$tmp" "$st"
+  if [[ -n "$msg" ]]; then
+    _gs_tg_send "🐤 Канарейка $(hostname 2>/dev/null || echo ru-vps):"$'\n'"${msg}" || warn "Telegram не настроен/не ответил"
+  fi
+  _audit_info "Нод: ${total}, недоступны сейчас: ${down}"
+  [[ "$down" -eq 0 ]]
+}
+
+canary_set() {
+  local mode="$1"
+  if [[ "$mode" == "off" ]]; then
+    _gs_timer_set gorecshit-canary off || return 1
+    ok "Канарейка выключена (список ${GS_CANARY_LIST} оставлен)"
+    return 0
+  fi
+  echo "Канарейка ставится на VPS В РОССИИ (лучше у домашнего/мобильного провайдера): раз в час проверяет TCP + TLS с SNI до каждой ноды."
+  echo "Ничего на ноды не ставит и к ним не подключается, кроме обычного TLS-рукопожатия как у клиента."
+  [[ "$DRY_RUN" -eq 0 ]] && { _gs_tg_setup || warn "Telegram не настроен — алертов не будет, только вывод: sudo gorecshit --canary-run"; }
+  _gs_timer_set gorecshit-canary on "канарейка — доступность нод из РФ" hourly 5m \
+    "/usr/local/sbin/gorecshit --canary-run --yes" || return 1
+  ok "Канарейка включена. Список: ${GS_CANARY_LIST} (--canary-add) · проверить сейчас: --canary-run · выключить: --canary off"
+}
+
+# ---------- v2.9.0: запасная нода (--spare-export / --spare-import) и уникальные домены ----------
+
+suggest_unique_site() {
+  # уникальный набор для новой ноды: нейтральные домены + случайные тема и сид (сайты нод не похожи друг на друга)
+  local th seed
+  th="$(_site_random_theme "${SITE_PREV_THEME:-}")"
+  seed="$(od -An -N4 -tu4 /dev/urandom 2>/dev/null | tr -d ' ' || echo $RANDOM$RANDOM)"
+  echo "Нейтральные имена (проверьте, что свободны; без vpn/proxy/…; лучше разные регистраторы для разных нод):"
+  _site_suggest_domains
+  echo "Тема сайта: ${th} · сид: ${seed} (у каждой ноды свои — шаблон не повторяется)"
+  echo "Команда: sudo gorecshit --site-domain www.<ваш-домен> --site-theme ${th} --site-seed ${seed}"
+  SPARE_THEME="$th"; SPARE_SEED="$seed"
+}
+
+spare_export() {
+  # архив для быстрого подъёма замены: настройки gorecshit без секретов и сертификатов
+  local out="${1:-}" ts tmp d
+  ts="$(date +%Y%m%d-%H%M%S)"
+  [[ -n "$out" ]] || out="${GS_SPARE_DIR}/gorecshit-spare-${ts}.tar.gz"
+  if [[ "$(id -u)" -ne 0 && "$DRY_RUN" -eq 0 ]]; then err "Нужен root"; return 1; fi
+  step "Запасной комплект ноды → ${out}"
+  [[ "$DRY_RUN" -eq 1 ]] && { echo "[DRY] tar: state сайта, реестр, список канарейки, sysctl/ufw-настройки gorecshit, bringup.sh (без ключей/сертификатов/токенов)"; return 0; }
+  tmp="$(mktemp -d)"; d="${tmp}/spare"; mkdir -p "$d"
+  SITE_DOMAIN=""; _site_load_state >/dev/null 2>&1 || true
+  [[ -f "$SITE_STATE_FILE" ]] && grep -vE '^(SITE_DOMAIN|SITE_EMAIL|SITE_SEED|SITE_ROOT|SITE_THEME|SITE_BRAND|SITE_CITY|SITE_EPOCH)=' "$SITE_STATE_FILE" >"${d}/site.env.template" 2>/dev/null || true
+  [[ -f "$GS_REGISTRY_FILE" ]] && cp -a "$GS_REGISTRY_FILE" "${d}/old-node.env" 2>/dev/null || true
+  [[ -f "$GS_CANARY_LIST" ]] && cp -a "$GS_CANARY_LIST" "${d}/canary.list" 2>/dev/null || true
+  [[ -f "$GS_BG_URLS_FILE" ]] && cp -a "$GS_BG_URLS_FILE" "${d}/bg-traffic.urls" 2>/dev/null || true
+  cp -a /etc/sysctl.d/*gorecshit* "${d}/" 2>/dev/null || true
+  command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null >"${d}/ufw-status.txt" || true
+  suggest_unique_site >"${d}/NEW-DOMAIN.txt"
+  cat >"${d}/bringup.sh" <<EOF
+#!/usr/bin/env bash
+# Подъём замены ноды (gorecshit ${VERSION}). Запуск на НОВОМ сервере под root:
+#   bash bringup.sh www.<новый-домен> [PANEL_IP]
+set -euo pipefail
+D="\${1:?нужен новый домен: bash bringup.sh www.example.ru [PANEL_IP]}"
+P="\${2:-}"
+command -v gorecshit >/dev/null 2>&1 || bash <(curl -fsSL https://raw.githubusercontent.com/gorecvpn/gorecshit/main/install.sh) --yes \${P:+--panel-ip "\$P"}
+gorecshit --site-domain "\$D" --site-theme ${SPARE_THEME} --site-seed ${SPARE_SEED} --yes
+[ -f canary.list ] && install -m 600 -D canary.list ${GS_CANARY_LIST} || true
+echo "Дальше: A-запись \$D → IP нового сервера; в панели новая нода + target/serverNames из вывода выше;"
+echo "        в Hosts замените адрес старой ноды на \$D (не IP). Потом: gorecshit --audit"
+EOF
+  chmod 700 "${d}/bringup.sh"
+  cat >"${d}/README.txt" <<EOF
+Запасной комплект gorecshit ${VERSION}, создан $(date '+%F %T %Z') на $(hostname 2>/dev/null).
+Внутри НЕТ приватных ключей REALITY, сертификатов, токенов Telegram и пользователей — их выдаёт панель/LE заново.
+1) Купите/подготовьте новый домен (NEW-DOMAIN.txt — варианты; не берите домен старой ноды: он уже в CT-логах рядом со старым IP).
+2) Новый сервер: скопируйте архив, tar xzf …; cd spare; bash bringup.sh www.<новый-домен> <IP панели>
+3) Или: sudo gorecshit --spare-import архив.tar.gz (распакует и покажет шаги)
+EOF
+  mkdir -p "$(dirname "$out")"
+  ( umask 077; tar -C "$tmp" -czf "$out" spare )
+  rm -rf "$tmp"
+  ok "Готово: ${out} (0600). Скопируйте его с ноды заранее — в день блокировки старый IP может быть недоступен"
+}
+
+spare_import() {
+  local f="${1:-}" dst="${GS_SPARE_DIR}/imported"
+  [[ -s "$f" ]] || { err "--spare-import ФАЙЛ.tar.gz"; return 1; }
+  if [[ "$(id -u)" -ne 0 && "$DRY_RUN" -eq 0 ]]; then err "Нужен root"; return 1; fi
+  tar -tzf "$f" 2>/dev/null | grep -qvE '^spare(/|$)' && { err "Архив не похож на запасной комплект gorecshit"; return 1; }
+  [[ "$DRY_RUN" -eq 1 ]] && { echo "[DRY] tar xzf ${f} → ${dst}"; return 0; }
+  rm -rf "$dst"; mkdir -p "$dst"
+  tar -C "$dst" -xzf "$f" --no-same-owner
+  ok "Распаковано в ${dst}/spare"
+  sed -n '1,40p' "${dst}/spare/README.txt" 2>/dev/null || true
+  [[ -f "${dst}/spare/NEW-DOMAIN.txt" ]] && cat "${dst}/spare/NEW-DOMAIN.txt"
+  echo "Запуск: cd ${dst}/spare && bash bringup.sh www.<новый-домен> [IP панели]"
+}
+
+# ---------- v2.9.0: меню 11 ----------
+
+anti_detect_menu() {
+  local c=""
+  while true; do
+    echo
+    printf '%b🧭 Защита от обнаружения — дополнительные инструменты:%b\n' "${C_BOLD}" "${C_RESET}"
+    echo "  1) 🔎 Найти SNI среди соседей по /24 (--find-sni, медленно, только чтение)"
+    echo "  2) 📰 Обновить контент сайта сейчас (новости, sitemap; --site-refresh)"
+    echo "  3) ⏱  Автообновление сайта раз в сутки: включить (--site-autorefresh on)"
+    echo "  4) ⏹  Автообновление сайта: выключить"
+    echo "  5) 🌍 Профиль «обычный сайт»: ping отвечает, закрытые порты → RST (--web-profile on)"
+    echo "  6) 🔇 Профиль «обычный сайт»: выключить (вернуть тишину)"
+    echo "  7) 🧩 Запасной вход xhttp + REALITY на другом порту (--helper-xhttp, JSON для панели)"
+    echo "  8) ⚡ Hysteria2 по UDP (--helper-hy2, JSON для панели)"
+    echo "  9) 🧊 Тест заморозки «16 КБ» и доступности из РФ (--freeze-test)"
+    echo "  10) ✅ Самопроверка сейчас (--selfcheck)"
+    echo "  11) 📅 Ежедневная самопроверка (+ Telegram по желанию): включить"
+    echo "  12) 🗑  Ежедневная самопроверка: выключить"
+    echo "  13) 🔗 Проверить подписку: не светится ли IP ноды (--sub-check, ссылка не сохраняется)"
+    echo "  14) 👥 Нагрузка на IP: пользователи и соединения сейчас (--conn-warn)"
+    echo "  15) 🌱 «Живой» сайт: новости, sitemap, rss по таймеру — включить / выключить (--site-alive)"
+    echo "  16) 🚗 Фоновый обычный трафик — включить / выключить (--bg-traffic, по умолчанию выкл)"
+    echo "  17) 🪤 Ловушка сканеров + Telegram — включить / выключить (--probe-alert)"
+    echo "  18) 🐤 Канарейка (ставить на РФ-VPS): добавить ноду / включить / выключить / проверить"
+    echo "  19) 🧳 Запасной комплект для замены ноды (--spare-export)"
+    echo "  20) 🎲 Идеи домена + уникальная тема/сид для новой ноды (--suggest-domains)"
+    echo "  0) ← Назад"
+    prompt_user 'Пункт [0-20]: ' c
+    case "$c" in
+      1) run_find_sni || true ;;
+      2) site_refresh_content || true ;;
+      3) site_autorefresh_set on || true ;;
+      4) site_autorefresh_set off || true ;;
+      5) web_profile_set on || true ;;
+      6) web_profile_set off || true ;;
+      7) local p=""; prompt_user 'Порт (Enter = 8443): ' p; HELPER_XHTTP_PORT="${p:-8443}"; helper_xhttp || true ;;
+      8) local p2=""; prompt_user 'UDP-порт (Enter = 443): ' p2; HELPER_HY2_PORT="${p2:-443}"; helper_hy2 || true ;;
+      9) run_freeze_test || true ;;
+      10) run_selfcheck || true ;;
+      11) selfcheck_install on || true ;;
+      12) selfcheck_install off || true ;;
+      13) local su=""
+          if _tty_usable; then read -r -s -p 'Ссылка подписки (ввод скрыт): ' su </dev/tty || true; echo; fi
+          SUB_CHECK_URL="$su"; run_sub_check || true; SUB_CHECK_URL="" ;;
+      14) _audit_conn_load || true ;;
+      15) local a15=""; prompt_user '1 — включить, 2 — выключить: ' a15
+          case "$a15" in 1) site_alive_set on || true ;; 2) site_alive_set off || true ;; esac ;;
+      16) local a16=""; prompt_user '1 — включить, 2 — выключить: ' a16
+          case "$a16" in 1) bg_traffic_set on || true ;; 2) bg_traffic_set off || true ;; esac ;;
+      17) local a17=""; prompt_user '1 — включить, 2 — выключить, 3 — разобрать лог сейчас: ' a17
+          case "$a17" in 1) probe_alert_set on || true ;; 2) probe_alert_set off || true ;; 3) run_probe_scan || true ;; esac ;;
+      18) local a18="" n18=""; prompt_user '1 — добавить ноду, 2 — включить, 3 — выключить, 4 — проверить сейчас: ' a18
+          case "$a18" in
+            1) prompt_user 'HOST[:PORT] [SNI] [имя]: ' n18; [[ -n "$n18" ]] && { canary_add "$n18" || true; } ;;
+            2) canary_set on || true ;; 3) canary_set off || true ;; 4) run_canary || true ;;
+          esac ;;
+      19) spare_export "" || true ;;
+      20) suggest_unique_site || true ;;
+      0|q|Q|"") return 0 ;;
+      *) warn "Неизвестный пункт: $c" ;;
+    esac
+  done
+}
+
 run_hardening() {
   system_upgrade
   install_packages
@@ -9209,6 +11317,42 @@ main() {
     if [[ "$(id -u)" -ne 0 && "$DRY_RUN" -eq 0 ]]; then err "Нужен root: sudo gorecshit --site-fix-443"; exit 1; fi
     site_fix_443 1 || exit 1
     exit 0
+  fi
+
+  # v2.9.0 one-shot инструменты (до миграций: ничего лишнего на живой ноде не запускают)
+  if [[ "$DO_FIND_SNI" -eq 1 ]]; then run_find_sni; exit $?; fi
+  if [[ "$DO_FREEZE_TEST" -eq 1 ]]; then run_freeze_test; exit 0; fi
+  if [[ "$DO_SUB_CHECK" -eq 1 && "$DO_AUDIT" -eq 0 ]]; then run_sub_check; exit $?; fi
+  if [[ "$DO_SUGGEST" -eq 1 ]]; then suggest_unique_site; exit 0; fi
+  if [[ "$DO_BG_RUN" -eq 1 ]]; then run_bg_traffic; exit 0; fi
+  if [[ -n "$SITE_ALIVE$BG_TRAFFIC$PROBE_ALERT$CANARY_MODE$CANARY_ADD$SPARE_IMPORT" || "$DO_PROBE_SCAN" -eq 1 || "$DO_CANARY_RUN" -eq 1 || "$DO_SPARE_EXPORT" -eq 1 ]]; then
+    if [[ "$(id -u)" -ne 0 && "$DRY_RUN" -eq 0 ]]; then err "Нужен root (sudo gorecshit …)"; exit 1; fi
+    local _rc2=0
+    if [[ -n "$SITE_ALIVE" ]]; then site_alive_set "$SITE_ALIVE" || _rc2=1; fi
+    if [[ -n "$BG_TRAFFIC" ]]; then bg_traffic_set "$BG_TRAFFIC" || _rc2=1; fi
+    if [[ -n "$PROBE_ALERT" ]]; then probe_alert_set "$PROBE_ALERT" || _rc2=1; fi
+    if [[ "$DO_PROBE_SCAN" -eq 1 ]]; then run_probe_scan || _rc2=1; fi
+    if [[ -n "$CANARY_ADD" ]]; then canary_add "$CANARY_ADD" || _rc2=1; fi
+    if [[ -n "$CANARY_MODE" ]]; then canary_set "$CANARY_MODE" || _rc2=1; fi
+    if [[ "$DO_CANARY_RUN" -eq 1 ]]; then run_canary || _rc2=1; fi
+    if [[ "$DO_SPARE_EXPORT" -eq 1 ]]; then spare_export "$SPARE_EXPORT" || _rc2=1; fi
+    if [[ -n "$SPARE_IMPORT" ]]; then spare_import "$SPARE_IMPORT" || _rc2=1; fi
+    exit "$_rc2"
+  fi
+  if [[ "$HELPER_XHTTP" -eq 1 || "$HELPER_HY2" -eq 1 ]]; then
+    [[ "$HELPER_XHTTP" -eq 1 ]] && { helper_xhttp || exit 1; }
+    [[ "$HELPER_HY2" -eq 1 ]] && { helper_hy2 || exit 1; }
+    exit 0
+  fi
+  if [[ "$DO_SITE_REFRESH" -eq 1 || -n "$SITE_AUTOREFRESH" || -n "$WEB_PROFILE" || "$DO_SELFCHECK" -eq 1 || -n "$SELFCHECK_MODE" ]]; then
+    if [[ "$(id -u)" -ne 0 && "$DRY_RUN" -eq 0 ]]; then err "Нужен root (sudo gorecshit …)"; exit 1; fi
+    local _rc=0
+    if [[ "$DO_SITE_REFRESH" -eq 1 ]]; then site_refresh_content || _rc=1; fi
+    if [[ -n "$SITE_AUTOREFRESH" ]]; then site_autorefresh_set "$SITE_AUTOREFRESH" || _rc=1; fi
+    if [[ -n "$WEB_PROFILE" ]]; then web_profile_set "$WEB_PROFILE" || _rc=1; fi
+    if [[ -n "$SELFCHECK_MODE" ]]; then selfcheck_install "$SELFCHECK_MODE" || _rc=1; fi
+    if [[ "$DO_SELFCHECK" -eq 1 ]]; then run_selfcheck || _rc=1; fi
+    exit "$_rc"
   fi
 
   # v2.8.1 one-time migration on existing nodes (not for read-only audit / dpi / rollback / dry-run)
